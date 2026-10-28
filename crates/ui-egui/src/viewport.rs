@@ -7163,7 +7163,9 @@ mod tests {
             .filter(|(i, _)| one.edge_pickable(*i) && one.shaded_edge_visible(*i))
             .map(|(_, e)| e.len().saturating_sub(1))
             .sum();
-        assert_eq!(merged.lines.len(), 3 * segments * crate::gpu::LINE_SIZE);
+        // Vertex markers are lines from a point to itself; count the edges' segments.
+        let edge_lines = merged.lines.as_chunks::<{ crate::gpu::LINE_SIZE }>().0.iter().filter(|r| r[..12] != r[12..24]).count();
+        assert_eq!(edge_lines, 3 * segments);
     }
 
     #[test]
@@ -8783,14 +8785,16 @@ mod tests {
         assert_eq!(mesh.smooth_edges.iter().filter(|f| **f).count(), 512);
         let smooth = mesh.smooth_edges.iter().position(|f| *f).unwrap();
         let expected = mesh.edges.iter().enumerate().filter(|(i, _)| mesh.shaded_edge_visible(*i)).map(|(_, e)| e.len() - 1).sum::<usize>();
+        // Vertex markers are lines from a point to itself; count the edges' segments.
+        let edge_lines = |bytes: &[u8]| bytes.as_chunks::<{ crate::gpu::LINE_SIZE }>().0.iter().filter(|r| r[..12] != r[12..24]).count();
         let shaded = build_scene(&app).merged();
-        assert_eq!(shaded.lines.len() / crate::gpu::LINE_SIZE, expected);
+        assert_eq!(edge_lines(&shaded.lines), expected);
         assert!(!shaded.tris.is_empty());
         app.ui.visual_style = 2;
         let wire = build_scene(&app).merged();
         let expected_wire =
             mesh.edges.iter().enumerate().filter(|(i, _)| !mesh.seams.get(*i).copied().unwrap_or(false)).map(|(_, e)| e.len() - 1).sum::<usize>();
-        assert_eq!(wire.lines.len() / crate::gpu::LINE_SIZE, expected_wire);
+        assert_eq!(edge_lines(&wire.lines), expected_wire);
         assert!(expected_wire > expected);
         assert!(wire.tris.is_empty());
         app.ui.visual_style = 0;
