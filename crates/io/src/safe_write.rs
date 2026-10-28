@@ -96,24 +96,46 @@ fn replace_synced(source: &Path, destination: &Path) -> std::io::Result<()> {
     rename_with_retry(|| fs::rename(source, destination), cfg!(windows), std::thread::sleep)
 }
 
+/// The waits between attempts at a rename Windows refuses: doubling from 1 ms, then 250 ms at a
+/// time, about 2 s in all. An antivirus or indexer scanning a file written a moment earlier can
+/// hold it for several hundred milliseconds when the machine is busy (#8104); 127 ms was too short.
+const RENAME_WAITS_MS: [u64; 15] = [1, 2, 4, 8, 16, 32, 64, 128, 250, 250, 250, 250, 250, 250, 250];
+
+/// Whether `error` is Windows refusing a rename because another program has the file open
+/// (access denied, os error 5, or a sharing violation, os error 32).
+fn held_by_another_program(error: &std::io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(5 | 32))
+}
+
 fn rename_with_retry(
     mut rename: impl FnMut() -> std::io::Result<()>,
     windows: bool,
     mut wait: impl FnMut(std::time::Duration),
 ) -> std::io::Result<()> {
     // Windows can refuse rename while an independently opened handle withholds
-    // FILE_SHARE_DELETE. Access denied may also be permanent, so keep both an
-    // attempt bound and the original last error. Requested sleeps total 127 ms;
-    // scheduling/OS operation time is not a wall-clock latency guarantee.
+    // FILE_SHARE_DELETE. Access denied may also be permanent, so keep an attempt
+    // bound. Requested sleeps total 2005 ms; scheduling/OS operation time is not
+    // a wall-clock latency guarantee.
     let mut result = rename();
-    for milliseconds in [1, 2, 4, 8, 16, 32, 64] {
-        if !windows || !result.as_ref().is_err_and(|error| matches!(error.raw_os_error(), Some(5 | 32))) {
+    if !windows {
+        return result;
+    }
+    for milliseconds in RENAME_WAITS_MS {
+        if !result.as_ref().is_err_and(held_by_another_program) {
             return result;
         }
         wait(std::time::Duration::from_millis(milliseconds));
         result = rename();
     }
-    result
+    // Still refused: most likely another program keeps the file open. Say so, rather than only
+    // the bare "Access is denied", and keep the system's own words.
+    result.map_err(|error| {
+        if held_by_another_program(&error) {
+            std::io::Error::new(error.kind(), format!("the file is in use by another program; close it there or try again ({error})"))
+        } else {
+            error
+        }
+    })
 }
 
 fn write_steps(path: &Path, bytes: &[u8], backup: bool, stop: Option<Step>) -> std::io::Result<()> {
@@ -488,10 +510,13 @@ mod rename_retry_tests {
                 |delay| waits.push(delay.as_millis()),
             )
             .unwrap_err();
-            assert_eq!(error.raw_os_error(), Some(code));
-            assert_eq!(calls.get(), 8);
-            assert_eq!(waits, [1, 2, 4, 8, 16, 32, 64]);
-            assert_eq!(waits.iter().sum::<u128>(), 127);
+            let system = std::io::Error::from_raw_os_error(code);
+            assert_eq!(error.kind(), system.kind());
+            assert!(error.to_string().contains("in use by another program"), "{error}");
+            assert!(error.to_string().contains(&system.to_string()), "{error}");
+            assert_eq!(calls.get(), 16);
+            assert_eq!(waits, [1, 2, 4, 8, 16, 32, 64, 128, 250, 250, 250, 250, 250, 250, 250]);
+            assert_eq!(waits.iter().sum::<u128>(), 2005);
         }
         for (windows, code) in [(false, 5), (false, 32), (true, 2), (true, 3), (true, 87), (true, 183)] {
             let calls = Cell::new(0);
@@ -547,9 +572,33 @@ mod rename_retry_tests {
             },
         )
         .unwrap();
-        assert!(calls.get() >= 2 && calls.get() <= 8);
+        assert!(calls.get() >= 2 && calls.get() <= 16);
         assert_eq!(fs::read(&old).unwrap(), b"new complete image");
         assert!(!pending.exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// #8104: a scanner (antivirus, indexer, thumbnailer) that opens the target without delete
+    /// sharing and keeps it for a few hundred milliseconds under load delays the replace; it does
+    /// not fail it, and the old file stays whole until the new one takes its place.
+    #[cfg(windows)]
+    #[test]
+    fn a_reader_holding_the_target_for_a_while_delays_the_replace_without_failing_it() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let directory = std::env::temp_dir().join(format!("solidcraft-rename-slow-reader-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("library.json");
+        fs::write(&path, b"old whole library").unwrap();
+        let reader = OpenOptions::new().read(true).share_mode(1).open(&path).unwrap();
+        let scanner = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            drop(reader);
+        });
+        write_atomic(&path, b"new whole library", false).unwrap();
+        scanner.join().unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"new whole library");
+        assert!(stale_temps(&path).is_empty());
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -563,7 +612,7 @@ mod rename_retry_tests {
         fs::write(&path, b"old whole raw master").unwrap();
         let reader = OpenOptions::new().read(true).share_mode(1).open(&path).unwrap();
         let error = write_atomic(&path, b"new whole raw master", false).unwrap_err();
-        assert!(matches!(error.raw_os_error(), Some(5 | 32)), "{error}");
+        assert!(error.to_string().contains("in use by another program"), "{error}");
         assert_eq!(fs::read(&path).unwrap(), b"old whole raw master");
         assert!(stale_temps(&path).is_empty());
         drop(reader);
