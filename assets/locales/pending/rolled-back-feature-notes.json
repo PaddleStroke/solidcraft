@@ -1,0 +1,14 @@
+{
+  "en": {
+    "timeline.edited_rolled_back": "{name} changed, but it is after the history marker, so it is not built: move the marker past it to see the result",
+    "timeline.feature_rolled_back": "Rolled back: after the history marker, so not built"
+  },
+  "de": {
+    "timeline.edited_rolled_back": "{name} geändert, liegt aber hinter der Verlaufsmarke und wird daher nicht erzeugt: Marke dahinter ziehen, um das Ergebnis zu sehen",
+    "timeline.feature_rolled_back": "Zurückgesetzt: hinter der Verlaufsmarke, daher nicht erzeugt"
+  },
+  "fr": {
+    "timeline.edited_rolled_back": "{name} modifié, mais il est après le marqueur d'historique et n'est donc pas construit : déplacez le marqueur au-delà pour voir le résultat",
+    "timeline.feature_rolled_back": "En retrait : après le marqueur d'historique, donc non construit"
+  }
+}
