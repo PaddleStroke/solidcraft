@@ -103,42 +103,82 @@ struct App {
     prefs_writer: PrefsWriter,
 }
 
-/// Settings written to the settings file in the frame they change (#8275). eframe saves them
+/// Settings written to the settings file soon after they change (#8275). eframe saves them
 /// only every 30 s and when the window closes normally, so a change was lost whenever the app
 /// did not get that far: ended from the Task Manager, stopped by a sign-out or shutdown, or
 /// crashed or hung in the graphics driver on the way out.
+///
+/// Some settings change continuously (a panel's width while its edge is dragged), so the file
+/// is written at most once per [`PrefsWriter::INTERVAL`], and a change made in between is written
+/// when that interval ends.
 #[derive(Default)]
 struct PrefsWriter {
     /// The settings written (or read at start) last.
     written: Option<String>,
-    /// The previous frame had input: what it changed shows in this frame's settings.
+    /// The previous frame had input that can change settings: what it changed shows in this
+    /// frame's settings.
     input_before: bool,
+    /// When the settings were last written by this writer.
+    last_write: Option<std::time::Instant>,
+    /// A change waits until then to be written.
+    pending_until: Option<std::time::Instant>,
 }
 
 impl PrefsWriter {
+    /// The least time between two writes of the settings file.
+    const INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
     /// The settings as they were read at start: they are on disk already.
     fn read(prefs: String) -> Self {
-        Self { written: Some(prefs), input_before: false }
+        Self { written: Some(prefs), ..Self::default() }
     }
 
-    /// Input changes settings, so a frame with none (nor in the frame before) isn't checked;
-    /// eframe's own save still catches anything else.
-    fn due(&mut self, input: bool) -> bool {
-        let due = input || self.input_before;
+    /// Whether this frame's settings are worth comparing: input that can change them came in this
+    /// frame or the one before, or a waiting change's time has come. Pointer motion alone isn't
+    /// such input; eframe's own save still catches anything else.
+    fn due(&mut self, input: bool, now: std::time::Instant) -> bool {
+        let due = input || self.input_before || self.pending_until.is_some_and(|at| now >= at);
         self.input_before = input;
         due
     }
 
-    /// Write `prefs` and flush them to disk if they are not the settings written last.
-    fn store(&mut self, storage: &mut dyn eframe::Storage, prefs: String) -> bool {
+    /// Write `prefs` and flush them to disk if they differ from the settings written last and the
+    /// last write is at least [`Self::INTERVAL`] old. Returns how long a change waits otherwise:
+    /// the caller asks for a frame then, so an idle app still writes it.
+    fn store(&mut self, storage: &mut dyn eframe::Storage, prefs: String, now: std::time::Instant) -> Option<std::time::Duration> {
         if self.written.as_deref() == Some(prefs.as_str()) {
-            return false;
+            self.pending_until = None;
+            return None;
+        }
+        if let Some(wait) = self.last_write.map(|at| Self::INTERVAL.saturating_sub(now.saturating_duration_since(at))).filter(|w| !w.is_zero()) {
+            self.pending_until = Some(now + wait);
+            return Some(wait);
         }
         storage.set_string(solidcraft_ui_egui::prefs::STORAGE_KEY, prefs.clone());
         storage.flush();
         self.written = Some(prefs);
-        true
+        self.last_write = Some(now);
+        self.pending_until = None;
+        None
     }
+}
+
+/// Input that can change a setting: a click, a key, typed or pasted text, a wheel or a pinch.
+/// Pointer motion, which comes every frame while the mouse moves, cannot by itself.
+fn changes_settings(event: &egui::Event) -> bool {
+    matches!(
+        event,
+        egui::Event::PointerButton { .. }
+            | egui::Event::Key { .. }
+            | egui::Event::Text(_)
+            | egui::Event::Paste(_)
+            | egui::Event::Cut
+            | egui::Event::Ime(_)
+            | egui::Event::MouseWheel { .. }
+            | egui::Event::Zoom(_)
+            | egui::Event::Rotate(_)
+            | egui::Event::AccessKitActionRequest(_)
+    )
 }
 
 impl eframe::App for App {
@@ -229,10 +269,12 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         content_ui(&mut self.solve, ui);
         // After the frame's UI, so a setting changed in it (Preferences' OK) is written now.
-        if self.prefs_writer.due(ui.input(|i| !i.events.is_empty()))
+        let now = std::time::Instant::now();
+        if self.prefs_writer.due(ui.input(|i| i.events.iter().any(changes_settings)), now)
             && let Some(storage) = frame.storage_mut()
+            && let Some(wait) = self.prefs_writer.store(storage, self.solve.prefs(), now)
         {
-            self.prefs_writer.store(storage, self.solve.prefs());
+            ui.ctx().request_repaint_after(wait);
         }
     }
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
@@ -1370,6 +1412,7 @@ mod prefs_writer_tests {
     use super::PrefsWriter;
     use solidcraft_ui_egui::prefs::{NavigatorStyle, STORAGE_KEY};
     use std::collections::HashMap;
+    use std::time::{Duration, Instant};
 
     /// eframe's settings file: what was flushed to disk is what the next start reads.
     #[derive(Default)]
@@ -1407,14 +1450,16 @@ mod prefs_writer_tests {
         let mut app = new_app();
         let mut disk = Disk::default();
         let mut writer = PrefsWriter::read(app.prefs());
-        assert!(!writer.store(&mut disk, app.prefs()), "the settings read at start are not written again");
+        let now = Instant::now();
+        assert_eq!(writer.store(&mut disk, app.prefs(), now), None);
+        assert_eq!(disk.flushes, 0, "the settings read at start are not written again");
         app.preferences.navigator_style = NavigatorStyle::Cube;
         app.preferences.display_quality = "fine".into();
-        assert!(writer.due(true), "a frame with input is checked");
-        assert!(writer.store(&mut disk, app.prefs()));
+        assert!(writer.due(true, now), "a frame with input is checked");
+        assert_eq!(writer.store(&mut disk, app.prefs(), now), None);
         assert_eq!(disk.flushes, 1, "flushed at once, not left for eframe's next save");
-        assert!(!writer.store(&mut disk, app.prefs()), "unchanged settings are not written again");
-        assert_eq!(disk.flushes, 1);
+        assert_eq!(writer.store(&mut disk, app.prefs(), now + Duration::from_secs(5)), None);
+        assert_eq!(disk.flushes, 1, "unchanged settings are not written again");
 
         // The next start reads them.
         let mut next = new_app();
@@ -1426,14 +1471,65 @@ mod prefs_writer_tests {
     }
 
     /// A frame without input is checked only right after one with input (whose clicks the UI
-    /// handled in that frame); after that, idle frames cost nothing.
+    /// handled in that frame); after that, idle frames cost nothing. Pointer motion, which comes
+    /// every frame while the mouse moves, doesn't count as input.
     #[test]
     fn frames_are_checked_with_input_and_once_after_it() {
+        let now = Instant::now();
         let mut writer = PrefsWriter::default();
-        assert!(!writer.due(false));
-        assert!(writer.due(true));
-        assert!(writer.due(false), "the frame after input");
-        assert!(!writer.due(false));
+        assert!(!writer.due(false, now));
+        assert!(writer.due(true, now));
+        assert!(writer.due(false, now), "the frame after input");
+        assert!(!writer.due(false, now));
+
+        let click = egui::Event::PointerButton {
+            pos: egui::Pos2::ZERO,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        assert!(super::changes_settings(&click));
+        assert!(super::changes_settings(&egui::Event::Text("5".into())));
+        assert!(!super::changes_settings(&egui::Event::PointerMoved(egui::Pos2::ZERO)));
+        assert!(!super::changes_settings(&egui::Event::MouseMoved(egui::Vec2::X)));
+    }
+
+    /// A setting that changes in every frame (a panel's width while its edge is dragged) doesn't
+    /// write the file in every frame: at most once a second, and the last change is on disk at
+    /// most a second after it was made, with a frame asked for then so an idle app writes it.
+    #[test]
+    fn a_continuous_change_is_written_once_a_second_and_its_end_soon_after() {
+        let mut app = new_app();
+        let mut disk = Disk::default();
+        let mut writer = PrefsWriter::read(app.prefs());
+        let start = Instant::now();
+        let frame = Duration::from_millis(16);
+        let mut asked = None;
+        // 1.5 s of dragging at 60 frames a second, with input in every frame.
+        for n in 0..94u32 {
+            let now = start + frame * n;
+            app.preferences.browser_width = 200.0 + n as f32;
+            assert!(writer.due(true, now));
+            asked = writer.store(&mut disk, app.prefs(), now);
+        }
+        assert_eq!(disk.flushes, 2, "the first change at once, then one a second later");
+        let wait = asked.expect("the last width waits, and a frame is asked for when it can be written");
+        assert!(wait <= PrefsWriter::INTERVAL);
+
+        // The drag ends: no more input. Frames before the wait is over don't even look.
+        let end = start + frame * 93;
+        assert!(writer.due(false, end + frame), "the frame right after input");
+        assert!(!writer.due(false, end + frame * 2), "an idle frame before the wait is over");
+        // The frame asked for writes the last width.
+        let then = end + wait;
+        assert!(writer.due(false, then));
+        assert_eq!(writer.store(&mut disk, app.prefs(), then), None);
+        assert_eq!(disk.flushes, 3);
+        let mut next = new_app();
+        let stored = solidcraft_ui_egui::prefs::stored(|k| disk.flushed.get(k).cloned()).expect("settings on disk");
+        next.load_prefs(&stored);
+        assert_eq!(next.preferences.browser_width, 293.0, "the width the drag ended at");
+        assert!(!writer.due(false, then + frame), "nothing waits any more");
     }
 }
 
