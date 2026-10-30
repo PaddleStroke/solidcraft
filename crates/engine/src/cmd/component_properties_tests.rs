@@ -425,9 +425,9 @@ fn configurations_switch_to_a_user_defined_material() {
 
 /// #8706: Properties of a large assembly took minutes because every placed copy of a body was
 /// transformed and measured again (three fine tessellations each). Every placement of a body now
-/// reuses one measurement of it: measured again, 41 placements tessellate no more than one does
-/// (each body's inertia spread, #8095, is one tessellation however often it is placed), and the
-/// answer is the same.
+/// reuses one measurement of it: 41 placements measure no placed copy afresh and tessellate
+/// each distinct body's inertia spread (#8095) once, exactly as one placement does, and the
+/// answer is the same when measured again.
 #[test]
 fn repeated_placements_reuse_one_measurement_of_their_body() {
     let mut s = Session::default();
@@ -440,12 +440,14 @@ fn repeated_placements_reuse_one_measurement_of_their_body() {
     run(&mut s, "occurrence.move", json!({"occurrence": turned["occurrence"], "translate": [0, 0, 0], "axis": [1, 1, 1], "angle": "30 deg"}));
     let first = run(&mut s, "component.properties", json!({"component": "root"}));
     assert_eq!(first["body_count"], 82, "{first}");
-    let (again, all) = solidcraft_kernel::profile::capture(|| run(&mut s, "component.properties", json!({"component": "root"})));
+    let (again, all) = super::work::capture(|| run(&mut s, "component.properties", json!({"component": "root"})));
     assert_eq!(first, again);
-    let (block, one) = solidcraft_kernel::profile::capture(|| run(&mut s, "occurrence.properties", json!({"occurrence": turned["occurrence"]})));
-    // Measuring every placed copy afresh took three fine tessellations per copy (over a hundred
-    // times one placement's); now only the bodies' shared spread is tessellated.
-    assert!(all.tessellate_ms <= 4.0 * one.tessellate_ms + 20.0, "41 placements {all:?}, one {one:?}");
+    let (block, one) = super::work::capture(|| run(&mut s, "occurrence.properties", json!({"occurrence": turned["occurrence"]})));
+    // Before, every placed copy was transformed and tessellated afresh (82 here); now no copy
+    // is, and the work is the same for 41 placements as for one: one spread per distinct body.
+    let per_body = super::work::Work { placed_measures: 0, spreads: 2 };
+    assert_eq!(all, per_body, "41 placements");
+    assert_eq!(one, per_body, "one placement");
     close(&first["total"]["volume_mm3"], 41.0 * block["total"]["volume_mm3"].as_f64().unwrap());
 }
 

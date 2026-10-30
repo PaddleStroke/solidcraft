@@ -188,6 +188,8 @@ fn measure_placed(body: &solidcraft_doc::ModelBody, transform: Mat) -> Result<Pl
             vertices: m.merged.vertices,
         });
     }
+    #[cfg(test)]
+    work::count(|w| w.placed_measures += 1);
     let placed = solidcraft_kernel::transform_matrix(&body.body, transform)?;
     let m = solidcraft_kernel::measure(&placed)?;
     Ok(Placed {
@@ -233,6 +235,8 @@ fn properties(s: &Session, doc: &Document, selected: &[u64], descendants: bool, 
         .filter(|(_, b)| crate::cmd::inspect::encloses_volume(&b.body))
         .map(|(i, _)| *i)
         .collect();
+    #[cfg(test)]
+    work::count(|w| w.spreads += spread_bodies.len());
     let spreads = solidcraft_kernel::map_on_threads(&spread_bodies, 16, |&i| {
         state.bodies.get(i).and_then(|b| solidcraft_io::mass_properties(&b.body).ok().flatten()).and_then(|m| m.gyration())
     });
@@ -319,6 +323,46 @@ fn properties(s: &Session, doc: &Document, selected: &[u64], descendants: bool, 
         out["total"]["inertia_about"] = json!({"point": point, "inertia_g_mm2": shifted});
     }
     Ok(out)
+}
+
+/// The tessellating work a properties command did on this thread, for tests: placed copies
+/// measured afresh (transformed, then tessellated) and bodies whose inertia spread was
+/// tessellated. Counted where the work is asked for, on the command's own thread.
+#[cfg(test)]
+pub(super) mod work {
+    use std::cell::Cell;
+
+    #[derive(Clone, Copy, Debug, Default, PartialEq)]
+    pub struct Work {
+        pub placed_measures: usize,
+        pub spreads: usize,
+    }
+
+    thread_local! {
+        static WORK: Cell<Work> = const { Cell::new(Work { placed_measures: 0, spreads: 0 }) };
+    }
+
+    pub(super) fn count(f: impl FnOnce(&mut Work)) {
+        WORK.with(|w| {
+            let mut work = w.get();
+            f(&mut work);
+            w.set(work);
+        });
+    }
+
+    /// `f`'s result and the work it did.
+    pub fn capture<T>(f: impl FnOnce() -> T) -> (T, Work) {
+        let before = WORK.with(Cell::get);
+        let out = f();
+        let after = WORK.with(Cell::get);
+        (
+            out,
+            Work {
+                placed_measures: after.placed_measures.saturating_sub(before.placed_measures),
+                spreads: after.spreads.saturating_sub(before.spreads),
+            },
+        )
+    }
 }
 
 #[cfg(test)]
