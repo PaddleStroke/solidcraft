@@ -1529,6 +1529,7 @@ fn analysis_status_preferences_restore_false_keeps_underlying_dialog_through_the
     assert!(h.app.session.analysis.is_some());
     h.step(&json!({"key":"Escape"})).unwrap();
     assert!(h.app.session.analysis.is_some(), "the restored legacy policy keeps shading on idle Escape");
+}
 
 /// The countdown ring around a toast's × (#7971) is the share of its time left: whole when it
 /// starts, half at half time, gone when it is over, and whole for times no clock gives.
