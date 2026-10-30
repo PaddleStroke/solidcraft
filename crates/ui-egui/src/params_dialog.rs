@@ -250,7 +250,7 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
             false,
             true,
             |ui| {
-                ui_kit::text(ui, crate::i18n::tr("manage.parameters_hint"), ui_kit::Text::Hint("manage"));
+                ui_kit::text(ui, hint(live), ui_kit::Text::Hint("manage"));
                 apply_live_checkbox(app, ui, &mut d, &all);
                 ui_kit::row(ui, "Filter", |ui| {
                     let id = ui.make_persistent_id("parameter_filter");
@@ -653,6 +653,11 @@ fn enter_for(ui: &mut egui::Ui, focused: bool) -> bool {
 /// The expression edits waiting for Apply (#9279): each draft that differs from the design.
 fn held(d: &ParamsDialog, rows: &[Row]) -> serde_json::Map<String, Value> {
     rows.iter().filter_map(|r| d.editing.get(&r.name).filter(|e| **e != r.expression).map(|e| (r.name.clone(), json!(e)))).collect()
+}
+
+/// The hint at the top of the dialog: when edits apply, as the check box under it says.
+fn hint(live: bool) -> &'static str {
+    crate::i18n::tr(if live { "manage.parameters_hint" } else { "parameters.held_hint" })
 }
 
 /// The footer's note of the edits waiting for Apply, if any.
@@ -1223,6 +1228,10 @@ mod tests {
     #[test]
     fn the_apply_live_choice_is_remembered_and_turning_it_on_applies_what_waits() {
         assert!(crate::prefs::Prefs::default().parameters_apply_live, "live updates stay the default");
+        // The hint above the check box says when edits apply, whichever way it is set.
+        assert_eq!(hint(true), crate::i18n::tr("manage.parameters_hint"));
+        assert_ne!(hint(false), hint(true));
+        assert!(hint(false).contains("Apply") && !hint(false).contains("leaving"), "{}", hint(false));
         let mut h = held_dialog();
         hold(&mut h, "w", "30 mm");
         h.step(&json!({"click":{"handle":"params:apply_live"}})).unwrap();
