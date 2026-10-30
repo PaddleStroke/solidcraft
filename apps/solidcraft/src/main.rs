@@ -99,6 +99,46 @@ struct App {
     nav_bridge: nav_bridge::NavBridge,
     /// Where the next file dialog opens: it follows the open design (#7756).
     dialog_folder: DialogFolder,
+    /// Settings go to `app.ron` in the frame they change (#8275).
+    prefs_writer: PrefsWriter,
+}
+
+/// Settings written to the settings file in the frame they change (#8275). eframe saves them
+/// only every 30 s and when the window closes normally, so a change was lost whenever the app
+/// did not get that far: ended from the Task Manager, stopped by a sign-out or shutdown, or
+/// crashed or hung in the graphics driver on the way out.
+#[derive(Default)]
+struct PrefsWriter {
+    /// The settings written (or read at start) last.
+    written: Option<String>,
+    /// The previous frame had input: what it changed shows in this frame's settings.
+    input_before: bool,
+}
+
+impl PrefsWriter {
+    /// The settings as they were read at start: they are on disk already.
+    fn read(prefs: String) -> Self {
+        Self { written: Some(prefs), input_before: false }
+    }
+
+    /// Input changes settings, so a frame with none (nor in the frame before) isn't checked;
+    /// eframe's own save still catches anything else.
+    fn due(&mut self, input: bool) -> bool {
+        let due = input || self.input_before;
+        self.input_before = input;
+        due
+    }
+
+    /// Write `prefs` and flush them to disk if they are not the settings written last.
+    fn store(&mut self, storage: &mut dyn eframe::Storage, prefs: String) -> bool {
+        if self.written.as_deref() == Some(prefs.as_str()) {
+            return false;
+        }
+        storage.set_string(solidcraft_ui_egui::prefs::STORAGE_KEY, prefs.clone());
+        storage.flush();
+        self.written = Some(prefs);
+        true
+    }
 }
 
 impl eframe::App for App {
@@ -186,11 +226,19 @@ impl eframe::App for App {
         solidcraft_ui_egui::space_mouse::buttons_hook(&mut self.solve, ctx, self.space_mouse.buttons(), raw);
         self.solve.raw_input_hook(raw);
     }
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         content_ui(&mut self.solve, ui);
+        // After the frame's UI, so a setting changed in it (Preferences' OK) is written now.
+        if self.prefs_writer.due(ui.input(|i| !i.events.is_empty()))
+            && let Some(storage) = frame.storage_mut()
+        {
+            self.prefs_writer.store(storage, self.solve.prefs());
+        }
     }
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
-        storage.set_string(solidcraft_ui_egui::prefs::STORAGE_KEY, self.solve.prefs());
+        let prefs = self.solve.prefs();
+        storage.set_string(solidcraft_ui_egui::prefs::STORAGE_KEY, prefs.clone());
+        self.prefs_writer.written = Some(prefs);
     }
     fn on_exit(&mut self) {
         // The agent chat's agent and everything it started end with the app.
@@ -1122,6 +1170,8 @@ fn main() -> eframe::Result {
             mark("app created");
             solidcraft_engine::crash::phase("first frame");
             Ok(Box::new(App {
+                // Before `app` moves: the settings as read, already on disk.
+                prefs_writer: PrefsWriter::read(app.prefs()),
                 solve: app,
                 starting,
                 frames: 0,
@@ -1312,6 +1362,78 @@ mod backend_tests {
         // Wayland chosen on GNOME keeps native Wayland; X11 chosen on niri goes through XWayland.
         assert!(!prefer_x11(true, true, Some("GNOME"), over(Some("wayland"))));
         assert!(prefer_x11(true, true, Some("niri"), over(Some("x11"))));
+    }
+}
+
+#[cfg(test)]
+mod prefs_writer_tests {
+    use super::PrefsWriter;
+    use solidcraft_ui_egui::prefs::{NavigatorStyle, STORAGE_KEY};
+    use std::collections::HashMap;
+
+    /// eframe's settings file: what was flushed to disk is what the next start reads.
+    #[derive(Default)]
+    struct Disk {
+        pending: HashMap<String, String>,
+        flushed: HashMap<String, String>,
+        flushes: usize,
+    }
+
+    impl eframe::Storage for Disk {
+        fn get_string(&self, key: &str) -> Option<String> {
+            self.pending.get(key).cloned()
+        }
+        fn set_string(&mut self, key: &str, value: String) {
+            self.pending.insert(key.into(), value);
+        }
+        fn remove_string(&mut self, key: &str) {
+            self.pending.remove(key);
+        }
+        fn flush(&mut self) {
+            self.flushed = self.pending.clone();
+            self.flushes += 1;
+        }
+    }
+
+    fn new_app() -> solidcraft_ui_egui::SolveApp {
+        solidcraft_ui_egui::SolveApp::new(solidcraft_engine::Session::default(), solidcraft_ui_egui::Services::default())
+    }
+
+    /// #8275: Preferences' View navigator and Display quality, changed and confirmed, are on disk
+    /// in that frame, so the next start has them even when this one never closes normally (ended
+    /// from the Task Manager, a sign-out, a hang or crash in the graphics driver on the way out).
+    #[test]
+    fn changed_settings_reach_the_disk_in_the_frame_they_change() {
+        let mut app = new_app();
+        let mut disk = Disk::default();
+        let mut writer = PrefsWriter::read(app.prefs());
+        assert!(!writer.store(&mut disk, app.prefs()), "the settings read at start are not written again");
+        app.preferences.navigator_style = NavigatorStyle::Cube;
+        app.preferences.display_quality = "fine".into();
+        assert!(writer.due(true), "a frame with input is checked");
+        assert!(writer.store(&mut disk, app.prefs()));
+        assert_eq!(disk.flushes, 1, "flushed at once, not left for eframe's next save");
+        assert!(!writer.store(&mut disk, app.prefs()), "unchanged settings are not written again");
+        assert_eq!(disk.flushes, 1);
+
+        // The next start reads them.
+        let mut next = new_app();
+        let stored = solidcraft_ui_egui::prefs::stored(|k| disk.flushed.get(k).cloned()).expect("settings on disk");
+        next.load_prefs(&stored);
+        assert_eq!(next.preferences.navigator_style, NavigatorStyle::Cube);
+        assert_eq!(next.preferences.display_quality, "fine");
+        assert!(disk.flushed.contains_key(STORAGE_KEY));
+    }
+
+    /// A frame without input is checked only right after one with input (whose clicks the UI
+    /// handled in that frame); after that, idle frames cost nothing.
+    #[test]
+    fn frames_are_checked_with_input_and_once_after_it() {
+        let mut writer = PrefsWriter::default();
+        assert!(!writer.due(false));
+        assert!(writer.due(true));
+        assert!(writer.due(false), "the frame after input");
+        assert!(!writer.due(false));
     }
 }
 
