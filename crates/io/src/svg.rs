@@ -539,11 +539,7 @@ pub fn decode_svg(bytes: &[u8]) -> Result<String> {
         ));
     }
     let utf16 = |rest: &[u8], le: bool| -> String {
-        let units = rest.chunks_exact(2).map(|c| match c {
-            [a, b] if le => u16::from_le_bytes([*a, *b]),
-            [a, b] => u16::from_be_bytes([*a, *b]),
-            _ => 0xFFFD,
-        });
+        let units = rest.as_chunks::<2>().0.iter().map(|&pair| if le { u16::from_le_bytes(pair) } else { u16::from_be_bytes(pair) });
         char::decode_utf16(units).map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER)).collect()
     };
     Ok(match bytes {
