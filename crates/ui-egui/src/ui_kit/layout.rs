@@ -194,11 +194,11 @@ pub(crate) fn status_line(ui: &mut Ui, text: &str, tone: StatusTone) -> Response
 }
 
 /// Declarative expression row; retains the field's completion and accepted Enter. Tokens: `row, field`.
-/// Dragging the label sideways changes a literal value (`super::scrub`).
+/// Dragging the label sideways changes a literal value (`fields::scrub`).
 pub(crate) fn expr_row(ui: &mut Ui, label: &str, value: &mut String) -> bool {
     scrub_row(ui, label, |ui, scrub| {
         if let Some(scrub) = scrub {
-            super::scrub(ui, scrub, value);
+            super::fields::scrub(ui, scrub, value);
         }
         super::field(ui, value)
     })
@@ -214,7 +214,7 @@ pub(crate) fn count_row(ui: &mut Ui, label: &str, value: &mut String, limits: &s
 pub(crate) fn hint_row(ui: &mut Ui, label: &str, value: &mut String, hint: &str) -> bool {
     scrub_row(ui, label, |ui, scrub| {
         if let Some(scrub) = scrub {
-            super::scrub(ui, scrub, value);
+            super::fields::scrub(ui, scrub, value);
         }
         super::hint_field(ui, value, hint)
     })
