@@ -1,0 +1,10 @@
+{
+  "cap": 4,
+  "preserved_base": true,
+  "mode": "face",
+  "walls": 4,
+  "edge": null,
+  "drag_ms": 316,
+  "single_undo": true,
+  "saved_and_reopened": true
+}

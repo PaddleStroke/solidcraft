@@ -1,0 +1,10 @@
+{
+  "drag_ms": 317,
+  "walls": 8,
+  "cap": 16,
+  "mode": "mirror",
+  "single_undo": true,
+  "saved_and_reopened": true,
+  "edge": null,
+  "preserved_base": true
+}

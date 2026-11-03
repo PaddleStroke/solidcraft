@@ -1,0 +1,13 @@
+{
+  "cap": null,
+  "preserved_base": true,
+  "mode": "edge",
+  "walls": 2,
+  "edge": [
+    1,
+    4
+  ],
+  "drag_ms": 300,
+  "single_undo": true,
+  "saved_and_reopened": true
+}
