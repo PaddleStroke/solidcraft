@@ -865,10 +865,18 @@ fn without_t_junctions(c: Canonical, offsets: &Offsets, tol: f64) -> Result<Cano
         // Only vertices within a chord's reach of the edge's samples can lie on it.
         let [a, z] = edge.interval;
         let samples: Vec<Vec3> = (0..=SAMPLES).filter_map(|k| curve.point(a + (z - a) * k as f64 / SAMPLES as f64)).collect();
-        let chord = samples.windows(2).map(|w| w[0].dist(w[1])).fold(0.0, f64::max);
+        let reach = samples.windows(2).map(|w| w[0].dist(w[1])).fold(0.0, f64::max) + tol;
+        // The distance to the enclosing box is a lower bound on the
+        // distance to every sample. Retain the same narrow tests and order.
+        let envelope =
+            (!samples.is_empty() && samples.iter().all(|p| p.is_finite())).then(|| samples.iter().copied().collect::<solidcraft_geom::Aabb3>());
         for (v, kv) in input_of_vertex.iter().enumerate() {
             let Some(p) = point(index(v)?) else { continue };
-            if kv == ke || ends.iter().any(|q| q.dist(p) <= tol) || samples.iter().all(|q| q.dist(p) > chord + tol) {
+            if kv == ke
+                || (p.is_finite() && envelope.is_some_and(|bounds| p.dist(p.max(bounds.min).min(bounds.max)) > reach))
+                || ends.iter().any(|q| q.dist(p) <= tol)
+                || samples.iter().all(|q| q.dist(p) > reach)
+            {
                 continue;
             }
             if let Some(t) = nearest_parameter(&curve, edge.interval, p).filter(|(_, d)| *d <= tol).map(|(t, _)| t) {
@@ -965,6 +973,53 @@ pub fn thicken(body: &Body, thickness: f64, symmetric: bool) -> Result<Body> {
     let sides = face_sides(body.record());
     let turned = !sides.is_empty() && sides.iter().all(|forward| !forward);
     imp::thicken(body, if turned { -thickness } else { thickness }, symmetric)
+}
+
+/// Form a symmetric wall by joining two one-sided half walls. Require the join
+/// to keep both offset skins whole and remove the common source skin.
+pub fn thicken_opposite_sides(body: &Body, thickness: f64) -> Result<(Body, History)> {
+    use crate::history::BodyHistory as _;
+
+    let half = thickness.abs() / 2.0;
+    let front = thicken(body, half, false)?;
+    let back = thicken(body, -half, false)?;
+    let joined = crate::boolean(&front, &back, crate::BoolOp::Union)?.ok_or_else(|| failed("symmetric Thicken did not join the two half walls"))?;
+    if joined.is_surface() || joined.shell_count() != 1 || joined.record().material_regions().len() != 1 {
+        return Err(failed("symmetric Thicken did not join the two half walls into one solid"));
+    }
+
+    let missing_history = || failed("symmetric Thicken could not retain the offset face history");
+    let histories = [front.history().ok_or_else(missing_history)?, back.history().ok_or_else(missing_history)?];
+    let join_history = joined.history().ok_or_else(missing_history)?;
+    join_history.check(&joined, &[&front, &back])?;
+
+    // Keep the side's operand number until both sets of offset faces have
+    // been verified. The common skin must have no descendant in the union.
+    let mut history = join_history.clone();
+    for (side, half_history) in histories.into_iter().enumerate().rev() {
+        history.substitute(side, half_history)?;
+    }
+    history.check(&joined, &[body, body])?;
+    let mut skins = BTreeSet::new();
+    for (face, joined_face) in history.faces.iter().zip(&join_history.faces) {
+        for origin in &face.origins {
+            match *origin {
+                FaceOrigin::Face { .. } => return Err(failed("symmetric Thicken kept part of the common skin")),
+                FaceOrigin::Offset { operand, face } if joined_face.change == Change::Kept => {
+                    skins.insert((operand, face));
+                }
+                _ => {}
+            }
+        }
+    }
+    if skins.len() != 2 * body.face_count() {
+        return Err(failed("symmetric Thicken could not keep both offset skins whole"));
+    }
+    // The document needs the side-aware history to distinguish the paired faces
+    // by origin even when they share the same source face and neighboring names.
+    let mut normalized = history.clone();
+    normalized.renumber(&[Some(0), Some(0)], 1)?;
+    Ok((joined.with_history(normalized, &[body])?, history))
 }
 
 /// The faces `picked` of `body` (indices in its face order) offset one by one by SMLib, each onto

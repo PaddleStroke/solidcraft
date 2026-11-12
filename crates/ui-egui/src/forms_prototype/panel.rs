@@ -28,7 +28,13 @@ pub(super) fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
         .resizable(true)
         .frame(frame)
         .show(ui, |ui| {
-            ui_kit::scope(ui, |ui| {
+            // The resizable panel allocates this width. Keep any child's
+            // oversized minimum rectangle from moving the viewport boundary.
+            let rect = ui.available_rect_before_wrap();
+            ui.take_available_space();
+            let mut content = ui.new_child(egui::UiBuilder::new().max_rect(rect));
+            content.set_clip_rect(ui.clip_rect().intersect(rect));
+            ui_kit::scope(&mut content, |ui| {
                 let profile = app.session.forms_prototype.as_ref().is_some_and(|f| f.profile.is_some());
                 let pipe = app.session.forms_prototype.as_ref().is_some_and(|f| f.pipe.is_some());
                 let imported = app.session.forms_prototype.as_ref().is_some_and(|f| f.imported.is_some());
@@ -41,14 +47,44 @@ pub(super) fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
                 } else {
                     "forms.prototype.edit_title"
                 }));
-                header(app, ui);
+                header_actions(app, ui);
                 if app.session.forms_prototype.is_none() {
                     return;
                 }
+                let compact = app.preferences.forms_compact_editor;
+                let modal = tool_panel::active(app);
+                diagnostics::prepare(app, ui.ctx());
+                diagnostics::tick(app);
+                let busy = app.forms_prototype.pending.is_some()
+                    || app.forms_prototype.interchange.is_some()
+                    || extrusion::active(app)
+                    || transform_job::active(app);
+                if !modal && app.session.forms_prototype.as_ref().is_none_or(|form| form.repair.is_none()) {
+                    // Keep picking and sculpting modes above asynchronous
+                    // status rows and outside scrolling tool settings.
+                    ui.add_enabled_ui(!busy, |ui| {
+                        selection(app, ui);
+                        controls::transform_mode(app, ui);
+                        if compact && !profile {
+                            tools::show_switches(app, ui, true);
+                        }
+                    });
+                }
+                header_status(app, ui);
+                if !compact || !modal {
+                    diagnostics::show_status(app, ui);
+                }
+                if !compact {
+                    diagnostics::show_legacy_details(app, ui);
+                }
                 ui.separator();
-                let busy = app.forms_prototype.pending.is_some() || app.forms_prototype.interchange.is_some() || extrusion::active(app);
                 ui.add_enabled_ui(!busy, |ui| {
-                    egui::ScrollArea::vertical().id_salt("forms_panel_scroll").auto_shrink([false, false]).show(ui, |ui| {
+                    let scroll = match (compact, modal) {
+                        (true, true) => "forms_active_tool_scroll",
+                        (true, false) => "forms_compact_panel_scroll",
+                        _ => "forms_panel_scroll",
+                    };
+                    egui::ScrollArea::vertical().id_salt(scroll).auto_shrink([false, false]).show(ui, |ui| {
                         if tool_panel::active(app) {
                             tool_panel::show(app, ui);
                             return;
@@ -56,6 +92,13 @@ pub(super) fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
                         if app.session.forms_prototype.as_ref().is_some_and(|f| f.repair.is_some()) {
                             repair_settings(app, ui);
                             return;
+                        }
+                        if compact && !profile {
+                            tools::show_options(app, ui, true);
+                            if tools::active(app) {
+                                return;
+                            }
+                            ui.separator();
                         }
                         if profile {
                             surface_settings(app, ui);
@@ -65,11 +108,10 @@ pub(super) fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
                             if let Some(source) = app.session.forms_prototype.as_ref().and_then(|f| f.imported.as_ref()) {
                                 ui.strong(&source.object);
                             }
-                        } else {
+                        } else if !compact {
                             section(app, ui, "forms.prototype.primitive_section", true, primitive);
                         }
                         ui.separator();
-                        selection(app, ui);
                         ui.horizontal(|ui| {
                             let has_edges = app.forms_prototype.elements.iter().any(|e| matches!(e, Element::Edge(_)));
                             let r = crate::ui_kit::button(ui, app.tr("forms.prototype.edge_loop"), crate::ui_kit::Button::Enabled(has_edges));
@@ -88,7 +130,9 @@ pub(super) fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
                             }
                         });
                         ui.separator();
-                        controls::transform_controls(app, ui);
+                        soft_selection::show(app, ui);
+                        controls::transform_frame(app, ui);
+                        translation_snap::show(app, ui);
                         ui.horizontal(|ui| {
                             if crate::ui_kit::button(ui, app.tr("forms.prototype.fit"), crate::ui_kit::Button::Normal).clicked() {
                                 fit(app);
@@ -96,15 +140,7 @@ pub(super) fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
                             if crate::ui_kit::button(ui, app.tr("forms.prototype.select_all"), crate::ui_kit::Button::Normal).clicked() {
                                 select_all(app);
                             }
-                            let (undo, redo) = app
-                                .session
-                                .forms_prototype
-                                .as_ref()
-                                .map(|f| {
-                                    let v = f.inspect();
-                                    (v["undo"].as_u64().unwrap_or(0) > 0, v["redo"].as_u64().unwrap_or(0) > 0)
-                                })
-                                .unwrap_or_default();
+                            let (undo, redo) = app.session.forms_prototype.as_ref().map(|f| f.history_available()).unwrap_or_default();
                             if crate::ui_kit::button(ui, app.tr("forms.prototype.undo"), crate::ui_kit::Button::Enabled(undo)).clicked() {
                                 run(app, "form.prototype.undo", json!({}));
                             }
@@ -113,9 +149,10 @@ pub(super) fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
                             }
                         });
                         ui.separator();
-                        if !profile {
+                        if !compact && !profile {
                             ui.strong(app.tr("forms.prototype.local_refinement"));
-                            tools::show(app, ui);
+                            tools::show_switches(app, ui, false);
+                            tools::show_options(app, ui, false);
                             if !pipe && !imported {
                                 section(app, ui, "forms.prototype.parameters", false, controls::parameters);
                             }
@@ -128,7 +165,17 @@ pub(super) fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
                         if !profile {
                             section(app, ui, "forms.prototype.symmetry_pivot", false, controls::symmetry);
                         }
+                        if compact && !profile && !pipe && !imported {
+                            // Keep the legacy disclosure open by default when switching layouts.
+                            ui.push_id("forms_compact_primitive", |ui| {
+                                section(app, ui, "forms.prototype.primitive_section", false, primitive);
+                            });
+                            section(app, ui, "forms.prototype.parameters", false, controls::parameters);
+                        }
                         section(app, ui, "forms.prototype.cad_section", false, controls::output);
+                        if compact {
+                            section(app, ui, "forms.diagnostics.details", false, diagnostics::show_check);
+                        }
                         section(app, ui, "forms.prototype.display_section", false, display);
                         section(app, ui, "forms.prototype.interchange", false, interchange::show);
                         ui.separator();
@@ -138,15 +185,6 @@ pub(super) fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
                         );
                         if app.forms_prototype.setting_pivot {
                             ui.colored_label(t.accent, app.tr("forms.prototype.pivot_help"));
-                        }
-                        if let Some(error) = &app.forms_prototype.live.error {
-                            ui.add(egui::Label::new(egui::RichText::new(error).color(t.warning)).wrap());
-                        }
-                        if let Some(error) = &app.forms_prototype.context.error {
-                            ui.add(egui::Label::new(egui::RichText::new(error).color(t.warning)).wrap());
-                        }
-                        if let Some((text, _, true)) = &app.status {
-                            ui.add(egui::Label::new(egui::RichText::new(text).color(t.error)).wrap());
                         }
                     });
                 });
@@ -166,15 +204,7 @@ fn repair_settings(app: &mut SolveApp, ui: &mut egui::Ui) {
         tool_panel::start(app, mode);
     }
     ui.horizontal(|ui| {
-        let (undo, redo) = app
-            .session
-            .forms_prototype
-            .as_ref()
-            .map(|f| {
-                let state = f.inspect();
-                (state["undo"].as_u64().unwrap_or(0) > 0, state["redo"].as_u64().unwrap_or(0) > 0)
-            })
-            .unwrap_or_default();
+        let (undo, redo) = app.session.forms_prototype.as_ref().map(|f| f.history_available()).unwrap_or_default();
         if ui_kit::button(ui, app.tr("forms.prototype.undo"), ui_kit::Button::Enabled(undo)).clicked() {
             run(app, "form.prototype.undo", json!({}));
         }
@@ -184,12 +214,13 @@ fn repair_settings(app: &mut SolveApp, ui: &mut egui::Ui) {
     });
 }
 
-fn header(app: &mut SolveApp, ui: &mut egui::Ui) {
+fn header_actions(app: &mut SolveApp, ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
         let busy = app.forms_prototype.pending.is_some()
             || app.forms_prototype.interchange.is_some()
             || tool_panel::active(app)
             || extrusion::active(app)
+            || transform_job::active(app)
             || app.session.forms_prototype.as_ref().is_some_and(|f| f.repair.is_some());
         let r = ui.add_enabled_ui(!busy, |ui| ui_kit::button(ui, app.tr("forms.prototype.finish"), ui_kit::Button::Primary)).inner;
         crate::scenario::publish_handle("forms_finish", r.rect.center());
@@ -205,7 +236,9 @@ fn header(app: &mut SolveApp, ui: &mut egui::Ui) {
             run(app, "form.prototype.close", json!({}));
         }
     });
-    if app.forms_prototype.pending.is_some() || extrusion::active(app) {
+}
+fn header_status(app: &mut SolveApp, ui: &mut egui::Ui) {
+    if app.forms_prototype.pending.is_some() || extrusion::active(app) || transform_job::waiting(app) {
         ui.horizontal(|ui| {
             ui.spinner();
             ui.label(app.tr(finish::pending_label(app)));
@@ -218,25 +251,53 @@ fn header(app: &mut SolveApp, ui: &mut egui::Ui) {
         });
     }
     curves::show_status(app, ui);
+    selection::show_region_status(app, ui);
     if tool_panel::active(app) {
         return;
     }
-    let count = app.forms_prototype.selected.len().to_string();
     if let Some(form) = &app.session.forms_prototype
         && !form.parts.is_empty()
     {
         ui.label(crate::i18n::format("forms.prototype.parts_count", &[("count", &form.parts.len().to_string())]));
     }
     ui.horizontal(|ui| {
-        if count == "1" {
-            ui.label(app.tr("forms.prototype.one_point_selected"));
-        } else {
-            ui.label(crate::i18n::format("forms.prototype.selected_count", &[("count", &count)]));
-        }
+        let response = ui.label(selection_summary(app));
+        crate::scenario::publish_target("forms_selection_summary", response.rect);
         if live_cad::busy(app) || context::busy(app) || combine_preview::busy(app) {
             ui.spinner().on_hover_text(app.tr("forms.prototype.fitting"));
         }
     });
+}
+/// Count selected entities, independently of the filter used for the next pick.
+pub(super) fn selection_summary(app: &SolveApp) -> String {
+    let locale = crate::i18n::Locale::for_language(&app.preferences.language);
+    let mut counts = [0_usize; 4];
+    for element in &app.forms_prototype.elements {
+        let index = match element {
+            Element::Vertex(_) => 0,
+            Element::Edge(_) => 1,
+            Element::Face(_) => 2,
+            Element::Surface => 3,
+        };
+        counts[index] += 1;
+    }
+    let messages = [
+        ("forms.selection.point_one", "forms.selection.points"),
+        ("forms.selection.edge_one", "forms.selection.edges"),
+        ("forms.selection.face_one", "forms.selection.faces"),
+        ("forms.selection.surface_one", "forms.selection.surfaces"),
+    ];
+    let parts: Vec<_> = counts
+        .into_iter()
+        .zip(messages)
+        .filter(|(count, _)| *count > 0)
+        .map(|(count, (one, many))| locale.format(if count == 1 { one } else { many }, &[("count", &count.to_string())]))
+        .collect();
+    if parts.is_empty() {
+        locale.text("forms.selection.none").to_owned()
+    } else {
+        locale.format("forms.selection.summary", &[("items", &parts.join(locale.text("forms.selection.separator")))])
+    }
 }
 fn section(app: &mut SolveApp, ui: &mut egui::Ui, key: &'static str, open: bool, content: fn(&mut SolveApp, &mut egui::Ui)) {
     let title = app.tr(key).to_owned();
@@ -246,7 +307,7 @@ fn section(app: &mut SolveApp, ui: &mut egui::Ui, key: &'static str, open: bool,
     }
 }
 fn selection(app: &mut SolveApp, ui: &mut egui::Ui) {
-    ui.label(app.tr("forms.prototype.selection_filter"));
+    ui.label(app.tr("forms.prototype.selection_filter")).on_hover_text(app.tr("forms.prototype.region_help"));
     ui.horizontal(|ui| {
         for (mode, key, handle) in [
             (Pick::All, "forms.prototype.all", "forms_pick_all"),
@@ -259,13 +320,21 @@ fn selection(app: &mut SolveApp, ui: &mut egui::Ui) {
                 app.tr(key),
                 if app.forms_prototype.pick == mode { crate::ui_kit::Button::SmallSelected } else { crate::ui_kit::Button::Small },
             );
-            crate::scenario::publish_handle(handle, r.rect.center());
+            crate::scenario::publish_target(handle, r.rect);
             if r.clicked() {
+                let changed = app.forms_prototype.pick != mode;
                 app.forms_prototype.pick = mode;
-                app.forms_prototype.selected.clear();
-                app.forms_prototype.elements.clear();
-                app.forms_prototype.selection = Default::default();
-                app.forms_prototype.pivot = None;
+                if changed || !app.preferences.forms_preserve_selection {
+                    // Fence old region results and discard range/press anchors;
+                    // the filter describes future picks, not the current set.
+                    selection::cancel_region_work(app);
+                    app.forms_prototype.selection = Default::default();
+                }
+                if !app.preferences.forms_preserve_selection {
+                    app.forms_prototype.selected.clear();
+                    app.forms_prototype.elements.clear();
+                    app.forms_prototype.pivot = None;
+                }
             }
         }
     });

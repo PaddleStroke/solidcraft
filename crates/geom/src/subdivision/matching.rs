@@ -286,7 +286,10 @@ fn stations(domain: Domain<'_>, ring: &[usize], config: &Config, samples: &[f64]
 }
 fn jets(cage: &Cage, order: usize, basis: &RootBasis, stations: &[Station]) -> Result<Vec<SurfaceJet>> {
     let eval = evaluator(cage, order)?;
-    let surfaces: Vec<_> = basis.fit(&eval)?.iter().map(EvalSurface::from).collect();
+    jets_in_patches(&basis.fit(&eval)?, stations)
+}
+fn jets_in_patches(patches: &[crate::bspline::NurbsSurface], stations: &[Station]) -> Result<Vec<SurfaceJet>> {
+    let surfaces: Vec<_> = patches.iter().map(EvalSurface::from).collect();
     stations
         .iter()
         .map(|s| surfaces.get(s.root).and_then(|surface| surface.jet(s.uv[0], s.uv[1])).ok_or_else(|| bad("Match has no analytic boundary jet")))
@@ -403,6 +406,39 @@ fn measure<F: Fn(f64) -> Result<Target>>(jets: &[SurfaceJet], check: &CheckConte
     }
     Ok(out)
 }
+/// Qualify already fitted tensors at the same independent Match stations as
+/// the solver. The supplied patches are in the evaluator's ordered unit charts.
+pub fn measure_fitted_match(
+    domain: Domain<'_>,
+    config: &Config,
+    patches: &[crate::bspline::NurbsSurface],
+    target: impl Fn(f64) -> Result<Target>,
+) -> Result<Report> {
+    config.validate_domain(domain)?;
+    if patches.len() != domain.cage().faces.len() {
+        return Err(bad("fitted Match measurement needs one tensor per source cell"));
+    }
+    let ring = domain.opening(config.edge)?;
+    let checks = stations(domain, &ring, config, &[0.0, 0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875])?;
+    let targets = checks.iter().map(|station| target(station.fraction)).collect::<Result<Vec<_>>>()?;
+    if targets.iter().any(|t| !t.point.is_finite() || !t.tangent.is_finite() || !t.normal.is_finite()) {
+        return Err(bad("fitted Match targets must be finite"));
+    }
+    let bounds: crate::Aabb3 = targets.iter().map(|t| t.point).collect();
+    let diagonal = bounds.size().len();
+    if !diagonal.is_finite() || diagonal < 1e-6 {
+        return Err(bad("fitted Match target has no bounded extent"));
+    }
+    let context = CheckContext { stations: &checks, targets: &targets, at: &target, config, diagonal, controls: 0 };
+    measure(&jets_in_patches(patches, &checks)?, &context, 0)
+}
+
+impl Report {
+    pub fn meets_tolerances(&self, config: &Config) -> bool {
+        qualifies(self, config)
+    }
+}
+
 /// Solve only nearby editable controls. The callback supplies exact support geometry;
 /// acceptance is measured at stations that are absent from the constraint system.
 pub fn match_opening(cage: &Cage, config: &Config, target: impl Fn(f64) -> Result<Target>, fit_tolerance: f64) -> Result<Solution> {

@@ -437,6 +437,27 @@ struct ComputedCommand {
 }
 
 impl ComputedCommands {
+    /// Read-only Forms feedback from this exact, still-unaccepted transaction.
+    /// Displaying it does not change the source design or its recovery journal.
+    pub fn form_preview(&self) -> Option<&forms_prototype::Form> {
+        self.computed.forms_prototype.as_ref()
+    }
+
+    /// Exact logical seam IDs from this still-unaccepted hierarchical loop.
+    /// The original and computed leaf slots are both owned by the transaction.
+    pub fn form_loop_seams(&self) -> Result<Vec<[usize; 2]>> {
+        let [step] = self.steps.as_slice() else { return Err(EngineError::Other("expected one Form Insert Loop transaction".into())) };
+        if step.id != "form.prototype.insert_loop" {
+            return Err(EngineError::Other("expected a Form Insert Loop transaction".into()));
+        }
+        let before = self.source.forms_prototype.as_ref().and_then(|form| form.hierarchy.as_ref());
+        let after = self.computed.forms_prototype.as_ref().and_then(|form| form.hierarchy.as_ref());
+        let (Some(before), Some(after)) = (before, after) else {
+            return Err(EngineError::Other("Insert Loop lost its original or edited hierarchy".into()));
+        };
+        after.inserted_loop_edges(before).map_err(|error| EngineError::Other(error.to_string()))
+    }
+
     /// Whether the source design and authoring context still match this result.
     pub fn is_current(&self, session: &Session) -> bool {
         let source = &self.source;
@@ -958,7 +979,7 @@ impl Session {
 
     /// Ask the host's check, if any, whether `spec` may run with `params`. A check that panics
     /// refuses the command as an internal error instead of taking the session down.
-    fn check_command(&self, spec: &CommandSpec, params: &Value) -> Result<()> {
+    pub fn check_command(&self, spec: &CommandSpec, params: &Value) -> Result<()> {
         let Some(check) = &self.command_check else { return Ok(()) };
         // The check sees the parameters as the command will (no parameters: an empty object).
         let empty = Value::Object(Default::default());
@@ -973,10 +994,7 @@ impl Session {
     /// The design has changes not in its file: in the document, in what is hidden, or a
     /// component moved and not captured yet (#9736).
     pub fn is_dirty(&self) -> bool {
-        self.forms_prototype.is_some()
-            || self.document_differs()
-            || self.visibility != self.saved_visibility
-            || self.moved_uncaptured()
+        self.forms_prototype.is_some() || self.document_differs() || self.visibility != self.saved_visibility || self.moved_uncaptured()
     }
 
     /// A component was moved and its position not captured yet (#9736). The placements of an
@@ -1684,7 +1702,7 @@ impl Session {
         (spec.enabled)(self).map_err(|why| EngineError::Disabled(spec.id.to_string(), why))?;
         // Before anything changes: a refusal leaves the session exactly as it was.
         self.check_command(spec, params)?;
-        if spec.id.starts_with("form.") && !matches!(spec.id, "form.prototype.inspect" | "form.blend.export") {
+        if spec.id.starts_with("form.") && !matches!(spec.id, "form.prototype.inspect" | "form.prototype.validate" | "form.blend.export") {
             self.remember_form_at_checkpoints();
         }
         let before = Snapshot {
@@ -1866,7 +1884,11 @@ impl Session {
         if self.checkpoints.last().is_none_or(|checkpoint| checkpoint.form.is_some()) {
             return;
         }
-        let form = Arc::new(self.forms_prototype.clone());
+        self.store_form_at_checkpoints(self.forms_prototype.clone());
+    }
+
+    fn store_form_at_checkpoints(&mut self, form: Option<forms_prototype::Form>) {
+        let form = Arc::new(form);
         for checkpoint in self.checkpoints.iter_mut().rev().take_while(|checkpoint| checkpoint.form.is_none()) {
             checkpoint.form = Some(form.clone());
         }

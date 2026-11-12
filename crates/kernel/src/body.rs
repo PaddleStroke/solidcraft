@@ -542,6 +542,11 @@ impl Body {
         &self.record
     }
 
+    /// Share this immutable record with a query that outlives the body handle.
+    pub fn shared_record(&self) -> std::sync::Arc<Brep> {
+        self.record.clone()
+    }
+
     /// The body in SMLib, built from its record the first time it is asked for. The record is
     /// SMLib's own form (`SmBrepData`), imported as given: a record SMLib refuses is an error that
     /// names why, never repaired here.

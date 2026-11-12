@@ -1742,6 +1742,9 @@ fn redefine(s: &mut Session, p: &Value) -> Result<Value> {
     let mut params = p.get("params").cloned().unwrap_or_else(|| json!({}));
     let idx = s.doc.feature_index(id).ok_or_else(|| bad(cmd, "feature"))?;
     let old = s.doc.feature(id).cloned().ok_or_else(|| bad(cmd, "feature"))?;
+    if matches!(old.kind, FeatureKind::Stitch { form_seam: Some(_), .. }) {
+        return Err(bad(cmd, "remove the refined Weld and create a new seam to change its source rims"));
+    }
     if let FeatureKind::Extrude { extent, .. } | FeatureKind::SurfaceExtrude { extent, .. } = &old.kind
         && matches!(cid, "solid.extrude" | "surface.extrude")
         && let Some(parameters) = params.as_object_mut()
@@ -1818,6 +1821,16 @@ fn redefine(s: &mut Session, p: &Value) -> Result<Value> {
         && before.at.dist(after.at.0) < 1e-8
     {
         *after = before.clone();
+    }
+    // A thickness edit keeps the saved construction when its source list stays the same.
+    if let (
+        FeatureKind::Thicken { bodies: previous, symmetric: true, form_half_walls: Some(saved), form_planar_walls: before, .. },
+        FeatureKind::Thicken { bodies: current, symmetric: true, form_half_walls, form_planar_walls: after, .. },
+    ) = (&old.kind, &mut new.kind)
+        && previous == current
+        && before == after
+    {
+        *form_half_walls = Some(saved.clone());
     }
     // A perforation keeps its outline through an edit that names no sketch (the Perforate dialog has no outline).
     if let (FeatureKind::SheetPerforate { sketch: Some(before), profiles: picked, .. }, FeatureKind::SheetPerforate { sketch, profiles, .. }) =

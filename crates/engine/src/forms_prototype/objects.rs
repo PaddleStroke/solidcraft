@@ -72,29 +72,34 @@ impl Form {
         *self = candidate;
         Ok(())
     }
-    pub fn unweld_parts(&mut self, edges: &[[usize; 2]], separate: bool, name: &str) -> Result<Option<u64>> {
-        if self.hierarchy.is_some() {
-            return Err(error("Unweld requires a standalone base cage"));
-        }
+    pub fn unweld_parts(&mut self, edges: &[[usize; 2]], separate: bool, name: &str, tolerance: f64) -> Result<Option<u64>> {
         if self.parts.len() >= 16 || name.is_empty() || name.len() > 256 || name.contains('\0') {
             return Err(error("Unweld requires a bounded part count and name"));
         }
-        let [a, b] = self.cage.split_seam(edges).map_err(error)?;
         let mut definition = self.definition();
-        if let Some(pipe) = &mut definition.pipe {
-            pipe.follow_path = false;
-        }
-        definition.symmetry = None;
-        if !separate {
-            definition.cage = a.disjoint_union(&b).map_err(error)?;
-            self.adopt_definition(definition, true)?;
-            return Ok(None);
-        }
+        let [definition, other] = if self.hierarchy.is_some() {
+            if !separate || !self.parts.is_empty() || !self.consumed.is_empty() {
+                return Err(error("refined Unweld requires two separate Forms and no other staged objects"));
+            }
+            crate::doc::forms::prepare_refined_unweld(&definition, edges, tolerance)?
+        } else {
+            let [a, b] = self.cage.split_seam(edges).map_err(error)?;
+            if let Some(pipe) = &mut definition.pipe {
+                pipe.follow_path = false;
+            }
+            definition.symmetry = None;
+            if !separate {
+                definition.cage = a.disjoint_union(&b).map_err(error)?;
+                self.adopt_definition(definition, true)?;
+                return Ok(None);
+            }
+            let mut other = definition.clone();
+            other.cage = b;
+            definition.cage = a;
+            [definition, other]
+        };
         let id = self.next_part;
         let next = id.checked_add(1).ok_or_else(|| error("Form part identity budget exceeded"))?;
-        let mut other = definition.clone();
-        other.cage = b;
-        definition.cage = a;
         self.adopt_definition(definition, true)?;
         self.parts.insert(id, Part { name: name.to_owned(), definition: Arc::new(other) });
         self.next_part = next;

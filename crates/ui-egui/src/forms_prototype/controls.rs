@@ -1,11 +1,21 @@
 //! Forms editor fields and topology actions. Geometry changes go through engine commands.
 use super::*;
+use crate::ui_kit::BackingTooltipExt as _;
 use solidcraft_engine::doc::expr::Kind;
 use solidcraft_engine::schema::forms_prototype::FinishOptions;
 
 const OPERATIONS: [&str; 4] = ["new", "join", "cut", "intersect"];
 
+#[derive(Clone, Copy)]
+struct Closure {
+    source: (u64, u64, u64),
+    closed: Option<bool>,
+}
+
 pub(super) struct Fields {
+    closure: std::cell::Cell<Option<Closure>>,
+    #[cfg(test)]
+    closure_scans: std::cell::Cell<usize>,
     dimensions: [String; 3],
     segments: [String; 3],
     radii: [String; 2],
@@ -22,6 +32,9 @@ pub(super) struct Fields {
 impl Default for Fields {
     fn default() -> Self {
         Self {
+            closure: Default::default(),
+            #[cfg(test)]
+            closure_scans: Default::default(),
             dimensions: ["40".into(), "40".into(), "40".into()],
             segments: ["2".into(), "2".into(), "2".into()],
             radii: ["20".into(), "7".into()],
@@ -36,6 +49,25 @@ impl Default for Fields {
             projection_controls: false,
         }
     }
+}
+// Known topology eligibility is queried for several buttons each frame. Keep
+// the exact boundary result until the live Form identity or source changes.
+// An invalid source remains unknown and is qualified by the engine on entry.
+pub(super) fn source_closed(app: &SolveApp) -> Option<bool> {
+    let form = app.session.forms_prototype.as_ref()?;
+    let (identity, revision) = form.source_revision();
+    let source = (app.session.uid, identity, revision);
+    let fields = &app.forms_prototype.controls;
+    if let Some(cached) = fields.closure.get()
+        && cached.source == source
+    {
+        return cached.closed;
+    }
+    let closed = form.cage.boundary_loops().ok().map(|loops| loops.is_empty());
+    fields.closure.set(Some(Closure { source, closed }));
+    #[cfg(test)]
+    fields.closure_scans.set(fields.closure_scans.get().saturating_add(1));
+    closed
 }
 pub(super) fn number(app: &SolveApp, value: &str, kind: Kind) -> Option<f64> {
     let parsed = if let Ok(v) = value.parse::<f64>() {
@@ -88,15 +120,15 @@ fn inputs(ui: &mut egui::Ui, labels: &[String; 3], values: &mut [String; 3]) {
         crate::ui_kit::expr_row(ui, label, value);
     }
 }
-pub(super) fn transform_controls(app: &mut SolveApp, ui: &mut egui::Ui) {
+pub(super) fn transform_mode(app: &mut SolveApp, ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
-        if crate::ui_kit::button(
+        let response = crate::ui_kit::button(
             ui,
             app.tr("forms.prototype.move_mode"),
             if !app.forms_prototype.scale { crate::ui_kit::Button::SmallSelected } else { crate::ui_kit::Button::Small },
-        )
-        .clicked()
-        {
+        );
+        crate::scenario::publish_target("forms_move_mode", response.rect);
+        if response.clicked() {
             app.forms_prototype.scale = false;
         }
         let response = crate::ui_kit::button(
@@ -104,11 +136,13 @@ pub(super) fn transform_controls(app: &mut SolveApp, ui: &mut egui::Ui) {
             app.tr("forms.prototype.scale_mode"),
             if app.forms_prototype.scale { crate::ui_kit::Button::SmallSelected } else { crate::ui_kit::Button::Small },
         );
-        crate::scenario::publish_handle("forms_scale_mode", response.rect.center());
+        crate::scenario::publish_target("forms_scale_mode", response.rect);
         if response.clicked() {
             app.forms_prototype.scale = true;
         }
     });
+}
+pub(super) fn transform_frame(app: &mut SolveApp, ui: &mut egui::Ui) {
     let labels: [String; 3] = ["forms.prototype.global", "forms.prototype.view", "forms.prototype.selection"].map(|s| app.tr(s).to_owned());
     let name = app.tr("forms.prototype.orientation").to_owned();
     crate::ui_kit::choice_row(
@@ -118,6 +152,12 @@ pub(super) fn transform_controls(app: &mut SolveApp, ui: &mut egui::Ui) {
         &mut app.forms_prototype.orientation,
         &labels.iter().map(String::as_str).collect::<Vec<_>>(),
     );
+    if app.forms_prototype.orientation == 2
+        && !app.forms_prototype.elements.is_empty()
+        && let Err(key) = basis(app)
+    {
+        ui.colored_label(Tokens::get().warning, app.tr(key));
+    }
     let labels: [String; 4] =
         ["forms.prototype.view_plane", "forms.prototype.x", "forms.prototype.y", "forms.prototype.z"].map(|s| app.tr(s).to_owned());
     let name = app.tr("forms.prototype.drag_constraint").to_owned();
@@ -241,6 +281,10 @@ fn parameter_rows(kind: &str) -> (ParameterRows, ParameterRows, ParameterRows) {
     }
 }
 pub(super) fn numeric(app: &mut SolveApp, ui: &mut egui::Ui) {
+    if surface::cap_selected(app) {
+        ui.add(egui::Label::new(app.tr("forms.fill.cap_rim_editing")).wrap());
+        return;
+    }
     let labels = labels(app);
     let titles: [String; 3] = ["forms.prototype.translation", "forms.prototype.rotation", "forms.prototype.scale"].map(|s| app.tr(s).to_owned());
     let apply = app.tr("forms.prototype.transform").to_owned();
@@ -287,6 +331,20 @@ pub(super) fn output(app: &mut SolveApp, ui: &mut egui::Ui) {
         app.set_status(error.to_string(), true);
     }
 }
+/// A cap removal rebuilds and validates CAD on the same worker as Finish.
+pub(super) fn delete_selected_cap(app: &mut SolveApp, ctx: &egui::Context) -> bool {
+    let Some(cap) = surface::selected_cap(app) else { return false };
+    if let Some(reason) = tool_panel::topology_unavailable(app, "delete_faces") {
+        app.set_status(app.tr(reason).to_owned(), true);
+        return true;
+    }
+    let Some(tolerance) = tolerance(app) else {
+        app.set_status(app.tr("forms.prototype.invalid_tolerance").to_owned(), true);
+        return true;
+    };
+    finish::command(app, ctx, "form.prototype.topology", json!({"tool":"delete_faces","faces":[cap],"tolerance":tolerance}));
+    true
+}
 pub(super) fn topology(app: &mut SolveApp, ui: &mut egui::Ui) {
     let distance = app.tr("forms.prototype.distance").to_owned();
     let sharpness = app.tr("forms.prototype.sharpness").to_owned();
@@ -311,27 +369,27 @@ pub(super) fn topology(app: &mut SolveApp, ui: &mut egui::Ui) {
             ("crease", "forms.prototype.crease"),
             ("uncrease", "forms.prototype.uncrease"),
         ] {
-            let r = crate::ui_kit::button(ui, app.tr(key), crate::ui_kit::Button::Normal);
-            crate::scenario::publish_handle(&format!("forms_topology_{tool}"), r.rect.center());
+            let reason = tool_panel::topology_unavailable(app, tool);
+            // The button must take part in this row's wrap calculation.
+            // An enabled child scope allocates only after drawing its content.
+            let r = ui.add_enabled(reason.is_none(), |ui: &mut egui::Ui| crate::ui_kit::button(ui, app.tr(key), crate::ui_kit::Button::Normal));
+            let r = if let Some(reason) = reason { r.backing_on_disabled_hover_text(app.tr(reason)) } else { r };
+            crate::scenario::publish_target(&format!("forms_topology_{tool}"), r.rect);
             if r.clicked() {
                 action = Some(tool);
             }
         }
     });
     if let Some(tool) = action {
-        let preview = match tool {
-            "thicken" => Some(tool_panel::Mode::Thicken),
-            "match" => Some(tool_panel::Mode::Match),
-            "fill_hole" => Some(tool_panel::Mode::Fill),
-            "bridge" => Some(tool_panel::Mode::Bridge),
-            "weld" => Some(tool_panel::Mode::Weld),
-            "unweld" => Some(tool_panel::Mode::Unweld),
-            "collapse" => Some(tool_panel::Mode::Collapse),
-            "erase_and_fill" => Some(tool_panel::Mode::EraseFill),
-            _ => None,
-        };
-        if let Some(mode) = preview {
+        if let Some(reason) = tool_panel::topology_unavailable(app, tool) {
+            app.set_status(app.tr(reason).to_owned(), true);
+            return;
+        }
+        if let Some(mode) = tool_panel::topology_mode(tool) {
             tool_panel::start(app, mode);
+            return;
+        }
+        if tool == "delete_faces" && delete_selected_cap(app, ui.ctx()) {
             return;
         }
         let faces: Vec<_> = surface::selected_faces(app).into_iter().collect();
@@ -343,12 +401,32 @@ pub(super) fn topology(app: &mut SolveApp, ui: &mut egui::Ui) {
         };
         let value = if tool == "crease" { &app.forms_prototype.controls.sharpness } else { &app.forms_prototype.controls.distance };
         if let Some(distance) = number(app, value, if matches!(tool, "crease" | "uncrease") { Kind::Unitless } else { Kind::Length }) {
-            let d = app.forms_prototype.axis.vector().unwrap_or(basis(app)[2]) * distance;
-            if run(
-                app,
-                "form.prototype.topology",
-                json!({"tool":tool,"faces":faces,"edges":edges,"vertices":vertices,"distance":distance,"displacement":[d.x,d.y,d.z]}),
-            ) {
+            if matches!(tool, "extrude_faces" | "extrude_edges") {
+                let dirs = match basis(app) {
+                    Ok(dirs) => dirs,
+                    Err(key) => {
+                        app.set_status(app.tr(key).to_owned(), true);
+                        return;
+                    }
+                };
+                let d = app.forms_prototype.axis.vector(constraint_axes(app, dirs)).unwrap_or(dirs[2]) * distance;
+                // Numeric extrusion has the same evaluated-surface displacement
+                // contract as dragging. Keep legacy raw topology commands intact.
+                let (faces, edges) = if tool == "extrude_faces" { (faces, Vec::new()) } else { (Vec::new(), edges) };
+                finish::command(
+                    app,
+                    ui.ctx(),
+                    "form.prototype.extrude_drag",
+                    json!({"faces":faces,"edges":edges,"displacement":[d.x,d.y,d.z],"surface":true,"checkpoint":true}),
+                );
+                return;
+            }
+            let params = json!({"tool":tool,"faces":faces,"edges":edges,"vertices":vertices,"distance":distance});
+            if matches!(tool, "crease" | "uncrease") && app.session.forms_prototype.as_ref().is_some_and(|form| form.hierarchy.is_some()) {
+                finish::command(app, ui.ctx(), "form.prototype.topology", params);
+                return;
+            }
+            if run(app, "form.prototype.topology", params) {
                 app.forms_prototype.selected.clear();
                 app.forms_prototype.elements.clear();
                 app.forms_prototype.pivot = None;
@@ -431,37 +509,35 @@ fn transform(app: &mut SolveApp) {
     let Some(triad) = triad(app) else {
         return;
     };
-    let dirs = basis(app);
-    let center = triad.center;
-    let Some(form) = &app.session.forms_prototype else {
-        return;
-    };
-    let indices: Vec<_> = app.forms_prototype.selected.iter().copied().collect();
-    let control = form.hierarchy.is_none() && indices.len() == form.cage.points.len();
-    let controls;
-    let points = if control {
-        controls = form.control_positions();
-        &controls
-    } else {
-        &form.surface.vertices
-    };
-    let mut positions = Vec::new();
-    for &i in &indices {
-        let Some(p) = points.get(i) else {
+    let dirs = match basis(app) {
+        Ok(dirs) => dirs,
+        Err(key) => {
+            app.set_status(app.tr(key).to_owned(), true);
             return;
-        };
-        let p = *p - center;
-        let mut q = dirs.iter().zip(s).fold(Vec3::ZERO, |q, (&a, s)| q + a * (p.dot(a) * s));
-        for (axis, angle) in dirs.iter().zip(r) {
-            q = crate::gizmo::apply(&crate::gizmo::rotation(*axis, angle), q);
         }
-        q += center + dirs.iter().zip(t).fold(Vec3::ZERO, |q, (&a, t)| q + a * t);
+    };
+    let center = triad.center;
+    let targets = match soft_selection::targets(app, false) {
+        Ok(targets) => targets,
+        Err(error) => {
+            app.set_status(error, true);
+            return;
+        }
+    };
+    let translation = dirs.iter().zip(t).fold(Vec3::ZERO, |q, (&axis, distance)| q + axis * distance);
+    let mut positions = Vec::with_capacity(targets.points.len());
+    for (&point, &weight) in targets.points.iter().zip(&targets.weights) {
+        let mut q = soft_selection::scale(point, center, dirs, s, weight);
+        for (axis, angle) in dirs.iter().zip(r) {
+            q = soft_selection::rotate(q, center, *axis, angle, weight);
+        }
+        q = soft_selection::translate(q, translation, weight);
         positions.push([q.x, q.y, q.z]);
     }
     run(
         app,
-        if control { "form.prototype.set_vertices" } else { "form.prototype.set_surface_vertices" },
-        json!({"vertices":indices,"positions":positions}),
+        if targets.control { "form.prototype.set_vertices" } else { "form.prototype.set_surface_vertices" },
+        json!({"vertices":targets.indices,"positions":positions}),
     );
 }
 
@@ -469,6 +545,324 @@ fn transform(app: &mut SolveApp) {
 mod tests {
     use super::*;
 
+    fn click_topology(app: &mut SolveApp, ctx: &egui::Context, tool: &str) {
+        let mut draw = |events| {
+            let _ = crate::test_support::frame(
+                ctx,
+                egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(Pos2::ZERO, egui::vec2(900.0, 700.0))), events, ..Default::default() },
+                |ui| topology(app, ui),
+            );
+        };
+        draw(Vec::new());
+        let pos = crate::scenario::handle_at(&format!("forms_topology_{tool}")).unwrap();
+        draw(vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE },
+        ]);
+        draw(vec![egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE }]);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn opening_topology_keeps_the_panel_width_and_the_refined_fill_button_clickable() {
+        let mut app = SolveApp::new(Default::default(), Default::default());
+        app.preferences.language = "en".into();
+        app.run("form.prototype.create", json!({"primitive":"face","dimensions":[9,9,1],"segments":[3,3,1],"levels":0})).unwrap();
+        app.run("form.prototype.refine", json!({"faces":[4],"counts":[2,2]})).unwrap();
+        let f = app.session.forms_prototype.as_ref().unwrap();
+        let leaf = f.hierarchy.as_ref().unwrap().leaves.iter().position(|leaf| leaf.active && leaf.root == 4).unwrap();
+        app.run("form.prototype.topology", json!({"tool":"delete_faces","faces":[leaf]})).unwrap();
+        let hole = app.session.forms_prototype.as_ref().unwrap().definition();
+        let rims = solidcraft_engine::doc::forms::match_openings(&hole.cage, hole.hierarchy.as_ref()).unwrap();
+        let rim = rims.iter().find(|rim| rim.len() == 4).unwrap();
+        let edge = [rim[0].min(rim[1]), rim[0].max(rim[1])];
+        app.forms_prototype.elements.insert(Element::Edge(edge));
+        selection::sync(&mut app);
+        assert!(tool_panel::topology_unavailable(&app, "fill_hole").is_none());
+
+        let ctx = egui::Context::default();
+        crate::fonts::setup_bundled_fonts(&ctx);
+        let draw = |app: &mut SolveApp, events| {
+            crate::scenario::clear_handles();
+            let mut viewport = egui::Rect::NOTHING;
+            let _ = crate::test_support::frame(
+                &ctx,
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(Pos2::ZERO, egui::vec2(1600.0, 1150.0))),
+                    focused: true,
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    panel::show(app, ui);
+                    viewport = ui.available_rect_before_wrap();
+                },
+            );
+            viewport
+        };
+        draw(&mut app, Vec::new());
+        let closed = draw(&mut app, Vec::new());
+        let header = crate::scenario::handle_at("forms.prototype.topology_section").unwrap();
+        draw(&mut app, crate::test_support::pointer(header, true));
+        draw(&mut app, crate::test_support::pointer(header, false));
+        let opened = draw(&mut app, Vec::new());
+        assert!((opened.right() - closed.right()).abs() < 1.0, "opening Topology must keep the allocated panel width");
+        let actions: std::collections::BTreeMap<_, _> = crate::scenario::rects("forms_topology_").into_iter().collect();
+        assert_eq!(actions.len(), 15);
+        assert!(actions.values().all(|rect| rect.left() >= opened.right() - 1.0 && rect.right() <= 1600.0));
+        let first_row = actions.values().next().unwrap().top();
+        assert!(actions.values().any(|rect| (rect.top() - first_row).abs() > 1.0));
+
+        let fill = crate::scenario::handle_at("forms_topology_fill_hole").unwrap();
+        draw(&mut app, crate::test_support::pointer(fill, true));
+        draw(&mut app, crate::test_support::pointer(fill, false));
+        assert_eq!(tool_panel::inspect(&app)["mode"], "forms.prototype.fill_hole");
+        tool_panel::cancel(&mut app);
+        assert_eq!(app.session.forms_prototype.as_ref().unwrap().definition(), hole);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn numeric_extrude_face_buttons_target_evaluated_points_like_drag_with_one_undo() {
+        for fixture in ["box", "face", "placed", "refined_mirror"] {
+            let mut app = SolveApp::new(Default::default(), Default::default());
+            let primitive = if fixture == "box" { "box" } else { "face" };
+            app.session
+                .execute("form.prototype.create", &json!({"primitive":primitive,"dimensions":[16,12,10],"segments":[4,3,3],"levels":1}))
+                .unwrap();
+            if fixture == "placed" {
+                app.session
+                    .execute(
+                        "form.prototype.transform",
+                        &json!({"matrix":solidcraft_engine::doc::rigid(Vec3::new(11.0,-7.0,3.0),Vec3::ZERO,Vec3::Y,0.4)}),
+                    )
+                    .unwrap();
+            }
+            if fixture == "refined_mirror" {
+                app.session.execute("form.prototype.symmetry", &json!({"axis":0})).unwrap();
+                let root = {
+                    let form = app.session.forms_prototype.as_ref().unwrap();
+                    form.logical.faces.iter().position(|face| face.iter().all(|&v| form.logical.points[v].x >= 4.0)).unwrap()
+                };
+                app.session.execute("form.prototype.refine", &json!({"faces":[root],"counts":[2,2]})).unwrap();
+            }
+            let form = app.session.forms_prototype.as_ref().unwrap();
+            let source = form.definition();
+            let face = if fixture == "refined_mirror" {
+                form.logical
+                    .faces
+                    .iter()
+                    .enumerate()
+                    .skip(source.hierarchy.as_ref().unwrap().base.faces.len())
+                    .find(|(_, face)| !face.is_empty() && face.iter().all(|&v| form.logical.points[v].x > 3.5))
+                    .map(|(id, _)| id)
+                    .unwrap()
+            } else {
+                form.logical
+                    .faces
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, face)| face.len() == 4)
+                    .max_by(|(_, a), (_, b)| {
+                        let center = |face: &&Vec<usize>| face.iter().map(|&i| form.surface.vertices[i].z).sum::<f64>() / 4.0;
+                        center(a).total_cmp(&center(b))
+                    })
+                    .map(|(id, _)| id)
+                    .unwrap()
+            };
+            let original: Vec<_> = form.logical.faces[face].iter().map(|&id| form.surface.vertices[id]).collect();
+            let undo = form.inspect()["undo"].as_u64().unwrap();
+            let mut drag = app.session.scratch();
+            drag.execute("form.prototype.extrude_drag", &json!({"faces":[face],"displacement":[0,0,2],"surface":true,"checkpoint":true})).unwrap();
+            app.forms_prototype.elements.insert(Element::Face(face));
+            selection::sync(&mut app);
+            app.forms_prototype.pivot = Some(Vec3::new(3.0, 4.0, 5.0));
+            app.forms_prototype.axis = Axis::Z;
+            app.forms_prototype.controls.distance = "0.2 cm".into();
+            let before = solidcraft_engine::recovery::capture_bytes(&app.session).unwrap();
+            click_topology(&mut app, &egui::Context::default(), "extrude_faces");
+            assert!(app.forms_prototype.pending.is_some(), "{fixture}: {:?}", app.status);
+            assert_eq!(solidcraft_engine::recovery::capture_bytes(&app.session).unwrap(), before, "queued work cannot author a partial source");
+            finish::flush_for_test(&mut app).unwrap();
+            let form = app.session.forms_prototype.as_ref().unwrap();
+            assert_eq!(form.definition(), drag.forms_prototype.as_ref().unwrap().definition(), "{fixture}: numeric/drag parity");
+            assert!(!form.has_tool_preview(), "one-shot extrusion must not leave an Apply/Cancel preview open");
+            assert_eq!(form.inspect()["undo"].as_u64(), Some(undo + 1));
+            for (&id, original) in form.logical.faces[face].iter().zip(original) {
+                assert!(form.surface.vertices[id].dist(original + Vec3::Z * 2.0) < 1e-6, "{fixture}: cap must move evaluated2mm");
+            }
+            if let Some(symmetry) = &form.symmetry {
+                symmetry.validate_reflection(&form.cage).unwrap();
+            }
+            let extruded = form.definition();
+            assert!(app.forms_prototype.elements.is_empty());
+            assert!(app.forms_prototype.selected.is_empty());
+            assert!(app.forms_prototype.pivot.is_none());
+            app.session.execute("form.prototype.undo", &json!({})).unwrap();
+            assert_eq!(app.session.forms_prototype.as_ref().unwrap().definition(), source);
+            app.session.execute("form.prototype.redo", &json!({})).unwrap();
+            assert_eq!(app.session.forms_prototype.as_ref().unwrap().definition(), extruded);
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn numeric_edge_buttons_use_evaluated_boundary_and_trim_rim_targets() {
+        for trimmed in [false, true] {
+            let mut app = SolveApp::new(Default::default(), Default::default());
+            app.session.execute("form.prototype.create", &json!({"primitive":"face","dimensions":[20,20,1],"segments":[4,4,1],"levels":1})).unwrap();
+            let edge = if trimmed {
+                app.session.execute("form.prototype.refine", &json!({"faces":[5],"counts":[2,2]})).unwrap();
+                let old = app.session.forms_prototype.as_ref().unwrap().logical.faces[16].clone();
+                app.session.execute("form.prototype.topology", &json!({"tool":"delete_faces","faces":[16]})).unwrap();
+                let form = app.session.forms_prototype.as_ref().unwrap();
+                let h = form.hierarchy.as_ref().unwrap();
+                old.iter()
+                    .copied()
+                    .zip(old.iter().copied().cycle().skip(1))
+                    .take(old.len())
+                    .find_map(|(a, b)| h.trim_attachments(&[[a, b]]).ok()?.into_iter().find(|t| t.root == 5).map(|t| t.edge))
+                    .unwrap()
+            } else {
+                let ring = app.session.forms_prototype.as_ref().unwrap().cage.boundary_loops().unwrap().remove(0);
+                [ring[0], ring[1]]
+            };
+            let edge = [edge[0].min(edge[1]), edge[0].max(edge[1])];
+            let form = app.session.forms_prototype.as_ref().unwrap();
+            let source = form.definition();
+            let undo = form.inspect()["undo"].as_u64().unwrap();
+            let original = form.surface.vertices.clone();
+            let mut drag = app.session.scratch();
+            drag.execute("form.prototype.extrude_drag", &json!({"edges":[edge],"displacement":[0,0,2],"surface":true})).unwrap();
+            app.forms_prototype.elements.insert(Element::Edge(edge));
+            selection::sync(&mut app);
+            app.forms_prototype.axis = Axis::Z;
+            app.forms_prototype.controls.distance = "2 mm".into();
+            click_topology(&mut app, &egui::Context::default(), "extrude_edges");
+            finish::flush_for_test(&mut app).unwrap();
+            let form = app.session.forms_prototype.as_ref().unwrap();
+            assert_eq!(form.definition(), drag.forms_prototype.as_ref().unwrap().definition(), "trimmed={trimmed}: {:?}", app.status);
+            let wall = form.logical.faces.last().unwrap();
+            for (old, new) in [(wall[0], wall[3]), (wall[1], wall[2])] {
+                assert!(form.surface.vertices[new].dist(original[old] + Vec3::Z * 2.0) < 1e-6);
+            }
+            assert_eq!(form.inspect()["undo"].as_u64(), Some(undo + 1));
+            let extruded = form.definition();
+            app.session.execute("form.prototype.undo", &json!({})).unwrap();
+            assert_eq!(app.session.forms_prototype.as_ref().unwrap().definition(), source);
+            app.session.execute("form.prototype.redo", &json!({})).unwrap();
+            assert_eq!(app.session.forms_prototype.as_ref().unwrap().definition(), extruded);
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn numeric_extrusion_invalid_distance_and_interior_edges_keep_source_selection_and_pivot() {
+        let mut app = SolveApp::new(Default::default(), Default::default());
+        app.session.execute("form.prototype.create", &json!({"primitive":"face","dimensions":[20,20,1],"segments":[4,4,1],"levels":1})).unwrap();
+        let face = app.session.forms_prototype.as_ref().unwrap().logical.faces[5].clone();
+        app.forms_prototype.elements.insert(Element::Face(5));
+        selection::sync(&mut app);
+        app.forms_prototype.pivot = Some(Vec3::new(3.0, 4.0, 5.0));
+        app.forms_prototype.controls.distance = "invalid distance".into();
+        let source = solidcraft_engine::recovery::capture_bytes(&app.session).unwrap();
+        let selected = app.forms_prototype.selected.clone();
+        let elements = app.forms_prototype.elements.clone();
+        let pivot = app.forms_prototype.pivot;
+        click_topology(&mut app, &egui::Context::default(), "extrude_faces");
+        assert!(app.forms_prototype.pending.is_none());
+        assert!(app.status.as_ref().is_some_and(|(_, _, error)| *error));
+        assert_eq!(solidcraft_engine::recovery::capture_bytes(&app.session).unwrap(), source);
+        assert_eq!(app.forms_prototype.selected, selected);
+        assert_eq!(app.forms_prototype.elements, elements);
+        assert_eq!(app.forms_prototype.pivot, pivot);
+        app.forms_prototype.elements = BTreeSet::from([Element::Edge([face[0].min(face[1]), face[0].max(face[1])])]);
+        selection::sync(&mut app);
+        app.forms_prototype.controls.distance = "2 mm".into();
+        let selected = app.forms_prototype.selected.clone();
+        let elements = app.forms_prototype.elements.clone();
+        click_topology(&mut app, &egui::Context::default(), "extrude_edges");
+        assert!(app.forms_prototype.pending.is_some());
+        finish::flush_for_test(&mut app).unwrap();
+        assert!(app.status.as_ref().is_some_and(|(_, _, error)| *error));
+        assert_eq!(solidcraft_engine::recovery::capture_bytes(&app.session).unwrap(), source);
+        assert_eq!(app.forms_prototype.selected, selected);
+        assert_eq!(app.forms_prototype.elements, elements);
+        assert_eq!(app.forms_prototype.pivot, pivot);
+    }
+
+    #[test]
+    fn closure_cache_tracks_the_live_tool_candidate_and_cancel_without_changing_source_history() {
+        let mut app = SolveApp::new(Default::default(), Default::default());
+        app.session.execute("form.prototype.create", &json!({"primitive":"face","segments":[1,1,1],"levels":0})).unwrap();
+        let before = app.session.forms_prototype.as_ref().unwrap().definition();
+        assert_eq!(source_closed(&app), Some(false));
+        assert_eq!(app.forms_prototype.controls.closure_scans.get(), 1);
+        app.session.execute("form.prototype.tool.begin", &json!({})).unwrap();
+        app.session.execute("form.prototype.tool.preview", &json!({"topology":{"tool":"thicken","distance":1}})).unwrap();
+        assert_eq!(source_closed(&app), Some(true), "the accepted editor's open source cannot stand in for the live closed candidate");
+        assert_eq!(app.forms_prototype.controls.closure_scans.get(), 2);
+        app.session.execute("form.prototype.tool.cancel", &json!({})).unwrap();
+        assert_eq!(source_closed(&app), Some(false));
+        assert_eq!(app.forms_prototype.controls.closure_scans.get(), 3);
+        assert_eq!(app.session.forms_prototype.as_ref().unwrap().definition(), before);
+        assert_eq!(app.session.forms_prototype.as_ref().unwrap().inspect()["undo"], 0);
+    }
+    #[test]
+    fn repeated_topology_eligibility_reuses_exact_closure_and_invalidates_after_source_history_or_replacement() {
+        let mut app = SolveApp::new(Default::default(), Default::default());
+        app.session.execute("form.prototype.create", &json!({"segments":[1,1,1],"levels":0})).unwrap();
+        let before = app.session.forms_prototype.as_ref().unwrap().inspect();
+        for _ in 0..20 {
+            assert_eq!(tool_panel::topology_unavailable(&app, "thicken"), Some("forms.prototype.open_surface_required"));
+            assert_eq!(tool_panel::topology_unavailable(&app, "unweld"), Some("forms.prototype.unweld_seam_required"));
+        }
+        assert_eq!(app.forms_prototype.controls.closure_scans.get(), 1);
+        assert_eq!(app.session.forms_prototype.as_ref().unwrap().inspect(), before);
+        app.session.execute("form.prototype.close", &json!({})).unwrap();
+        app.session.execute("form.prototype.create", &json!({"primitive":"face","segments":[1,1,1],"levels":0})).unwrap();
+        assert!(tool_panel::topology_unavailable(&app, "thicken").is_none());
+        assert_eq!(app.forms_prototype.controls.closure_scans.get(), 2, "a replacement Form can have the same public revision");
+        let point = app.session.forms_prototype.as_ref().unwrap().cage.points[0] + Vec3::Z;
+        app.session.execute("form.prototype.set_vertices", &json!({"vertices":[0],"positions":[[point.x,point.y,point.z]]})).unwrap();
+        assert!(tool_panel::topology_unavailable(&app, "thicken").is_none());
+        assert_eq!(app.forms_prototype.controls.closure_scans.get(), 3);
+        app.session.execute("form.prototype.undo", &json!({})).unwrap();
+        assert!(tool_panel::topology_unavailable(&app, "thicken").is_none());
+        assert_eq!(app.forms_prototype.controls.closure_scans.get(), 4);
+        app.session.execute("form.prototype.close", &json!({})).unwrap();
+        app.session.execute("form.prototype.create", &json!({"segments":[1,1,1],"levels":0})).unwrap();
+        assert_eq!(tool_panel::topology_unavailable(&app, "thicken"), Some("forms.prototype.open_surface_required"));
+        assert_eq!(app.forms_prototype.controls.closure_scans.get(), 5);
+    }
+    #[test]
+    fn topology_entry_reasons_follow_the_selection_without_blocking_whole_form_tools() {
+        let mut app = SolveApp::new(Default::default(), Default::default());
+        assert_eq!(tool_panel::topology_unavailable(&app, "thicken"), Some("forms.prototype.active_form_required"));
+        app.session.execute("form.prototype.create", &json!({"primitive":"face","dimensions":[4,6,1],"segments":[1,1,1],"levels":1})).unwrap();
+        let before = app.session.forms_prototype.as_ref().unwrap().definition();
+        for tool in ["extrude_faces", "delete_faces", "subdivide", "erase_and_fill"] {
+            assert_eq!(tool_panel::topology_unavailable(&app, tool), Some("forms.prototype.select_faces_for_tool"), "{tool}");
+        }
+        assert_eq!(tool_panel::topology_unavailable(&app, "extrude_edges"), Some("forms.prototype.select_boundary_edges_for_tool"));
+        for tool in ["thicken", "fill_hole", "match", "bridge"] {
+            assert!(tool_panel::topology_unavailable(&app, tool).is_none(), "{tool} can choose its inputs after entry");
+        }
+        app.forms_prototype.elements.insert(Element::Face(0));
+        selection::sync(&mut app);
+        for tool in ["extrude_faces", "delete_faces", "subdivide", "erase_and_fill"] {
+            assert!(tool_panel::topology_unavailable(&app, tool).is_none(), "{tool}");
+        }
+        let face = &before.cage.faces[0];
+        app.forms_prototype.elements.clear();
+        app.forms_prototype.elements.insert(Element::Edge([face[0].min(face[1]), face[0].max(face[1])]));
+        selection::sync(&mut app);
+        assert!(tool_panel::topology_unavailable(&app, "extrude_edges").is_none());
+        assert_eq!(tool_panel::topology_unavailable(&app, "extrude_faces"), Some("forms.prototype.select_faces_for_tool"));
+        assert_eq!(app.session.forms_prototype.as_ref().unwrap().definition(), before);
+        assert_eq!(app.session.forms_prototype.as_ref().unwrap().inspect()["undo"], 0);
+        assert!(app.session.doc.features.is_empty());
+    }
     #[test]
     fn plane_alias_and_programmatic_parameters_keep_the_primitive_and_numeric_controls_in_sync() {
         for kind in ["plane", "face", "tube"] {
@@ -511,6 +905,114 @@ mod tests {
                     (&fields.0, &fields.1, &fields.2)
                 );
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod soft_transform_tests {
+    use super::*;
+
+    fn plane() -> SolveApp {
+        let mut app = SolveApp::new(Default::default(), Default::default());
+        app.session.execute("form.prototype.create", &json!({"primitive":"face","dimensions":[20,20,1],"segments":[4,4,1],"levels":0})).unwrap();
+        let form = app.session.forms_prototype.as_ref().unwrap();
+        let seed = form.surface.vertices.iter().enumerate().min_by(|(_, a), (_, b)| a.len2().total_cmp(&b.len2())).unwrap().0;
+        app.forms_prototype.selected.insert(seed);
+        app.forms_prototype.elements.insert(Element::Vertex(seed));
+        app.forms_prototype.soft.enabled = true;
+        app.forms_prototype.soft.radius = "9 mm".into();
+        app.forms_prototype.controls.translation = ["0".into(), "0".into(), "2 mm".into()];
+        app
+    }
+
+    #[test]
+    fn numeric_soft_translation_keeps_logical_selection_and_one_undo_checkpoint() {
+        let mut app = plane();
+        app.session.execute("form.prototype.refine", &json!({"faces":[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15],"counts":[2,2]})).unwrap();
+        let form = app.session.forms_prototype.as_ref().unwrap();
+        let before = form.definition();
+        let undo = form.inspect()["undo"].as_u64().unwrap();
+        let selected = app.forms_prototype.selected.clone();
+        let elements = app.forms_prototype.elements.clone();
+        let targets = soft_selection::targets(&app, false).unwrap();
+        assert!(targets.weights.iter().any(|&w| w > 0.0 && w < 1.0));
+        assert!(targets.weights.contains(&1.0));
+        transform(&mut app);
+        let form = app.session.forms_prototype.as_ref().unwrap();
+        for ((&id, &p), &weight) in targets.indices.iter().zip(&targets.points).zip(&targets.weights) {
+            assert!(form.surface.vertices[id].dist(p + Vec3::Z * (2.0 * weight)) < 1e-6);
+        }
+        assert!(form.hierarchy.is_some());
+        assert_eq!(form.hierarchy.as_ref().unwrap().leaves, before.hierarchy.as_ref().unwrap().leaves);
+        assert_eq!(form.inspect()["undo"].as_u64(), Some(undo + 1));
+        assert_eq!(app.forms_prototype.selected, selected);
+        assert_eq!(app.forms_prototype.elements, elements);
+        let after = form.definition();
+        assert_ne!(before, after);
+        assert!(app.session.doc.features.is_empty());
+        app.session.execute("form.prototype.undo", &json!({})).unwrap();
+        assert_eq!(app.session.forms_prototype.as_ref().unwrap().definition(), before);
+        app.session.execute("form.prototype.redo", &json!({})).unwrap();
+        assert_eq!(app.session.forms_prototype.as_ref().unwrap().definition(), after);
+    }
+
+    #[test]
+    fn invalid_soft_numeric_edit_is_atomic_and_disabled_soft_preserves_sharp_editing() {
+        let mut app = plane();
+        app.forms_prototype.soft.radius = "-1 mm".into();
+        let before = app.session.forms_prototype.as_ref().unwrap().definition();
+        let undo = app.session.forms_prototype.as_ref().unwrap().inspect()["undo"].clone();
+        transform(&mut app);
+        assert_eq!(app.session.forms_prototype.as_ref().unwrap().definition(), before);
+        assert_eq!(app.session.forms_prototype.as_ref().unwrap().inspect()["undo"], undo);
+        app.forms_prototype.soft.enabled = false;
+        let seed = *app.forms_prototype.selected.first().unwrap();
+        let p = app.session.forms_prototype.as_ref().unwrap().surface.vertices[seed];
+        transform(&mut app);
+        assert!(app.session.forms_prototype.as_ref().unwrap().surface.vertices[seed].dist(p + Vec3::Z * 2.0) < 1e-6);
+    }
+
+    #[test]
+    fn numeric_rotation_scale_translation_share_the_authored_pivot_and_falloff() {
+        for soft in [true, false] {
+            let mut app = plane();
+            app.forms_prototype.soft.enabled = soft;
+            if !soft {
+                let n = app.session.forms_prototype.as_ref().unwrap().cage.points.len();
+                app.forms_prototype.selected = (0..n).collect();
+                app.forms_prototype.elements = (0..n).map(Element::Vertex).collect();
+            }
+            let center = Vec3::new(0.3, -0.7, 1.0);
+            app.forms_prototype.pivot = Some(center);
+            app.forms_prototype.orientation = 0;
+            app.forms_prototype.controls.scale = ["2".into(), "0.5".into(), "1.5".into()];
+            app.forms_prototype.controls.rotation = ["0".into(), "0".into(), "90".into()];
+            app.forms_prototype.controls.translation = ["1 mm".into(), "2 mm".into(), "3 mm".into()];
+            let targets = soft_selection::targets(&app, false).unwrap();
+            assert_eq!(targets.control, !soft);
+            let before = app.session.forms_prototype.as_ref().unwrap().definition();
+            let expected: Vec<_> = targets
+                .points
+                .iter()
+                .zip(&targets.weights)
+                .map(|(&p, &w)| {
+                    let d = p - center;
+                    let (a, b, z) = (d.x * (1.0 + w), d.y * (1.0 - 0.5 * w), d.z * (1.0 + 0.5 * w));
+                    let (sin, cos) = (std::f64::consts::FRAC_PI_2 * w).sin_cos();
+                    center + Vec3::new(a * cos - b * sin, a * sin + b * cos, z) + Vec3::new(1.0, 2.0, 3.0) * w
+                })
+                .collect();
+            transform(&mut app);
+            let form = app.session.forms_prototype.as_ref().unwrap();
+            let positions = if targets.control { form.control_positions() } else { form.surface.vertices.clone() };
+            for (&id, expected) in targets.indices.iter().zip(expected) {
+                assert!(positions[id].dist(expected) < 1e-6, "soft={soft}, logical vertex {id}");
+            }
+            assert_eq!(form.inspect()["undo"], 1);
+            assert_eq!(app.forms_prototype.pivot, Some(center));
+            app.session.execute("form.prototype.undo", &json!({})).unwrap();
+            assert_eq!(app.session.forms_prototype.as_ref().unwrap().definition(), before);
         }
     }
 }

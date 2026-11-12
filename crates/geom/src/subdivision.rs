@@ -498,6 +498,442 @@ pub fn primitive(kind: &str, size: f64, spans: usize) -> Result<Cage> {
 mod tests {
     use super::*;
     #[test]
+    fn hierarchy_replay_bound_covers_early_walls_and_later_subdivision() {
+        use hierarchy::Hierarchy;
+        let cage = primitive("plane", 10.0, 2).unwrap();
+        let rim = cage.boundary_loops().unwrap().remove(0);
+        let base = Hierarchy::new(cage).unwrap();
+        assert_eq!(base.replay_face_bound(), Some(4));
+
+        let (wall, _) = base.extrude_edges(&[[rim[0], rim[1]]], Vec3::Z).unwrap();
+        assert_eq!(wall.replay_face_bound(), Some(5));
+        let refined = wall.subdivide(&[0], [2, 2]).unwrap();
+        assert_eq!(refined.replay_face_bound(), Some(20));
+        assert_eq!(refined.evaluate().unwrap().faces.len(), 20);
+
+        let cap = base.subdivide(&[0], [2, 2]).unwrap().extrude_faces(&[4], Vec3::Z).unwrap();
+        assert_eq!(cap.replay_face_bound(), Some(20));
+        assert_eq!(cap.evaluate().unwrap().faces.len(), 20);
+        let mut forged = serde_json::to_value(&cap).unwrap();
+        forged["depth"] = serde_json::json!(usize::MAX);
+        assert!(serde_json::from_value::<Hierarchy>(forged).unwrap().replay_face_bound().is_none());
+    }
+
+    #[test]
+    fn quad_cap_rim_reverses_retained_winding_and_covers_every_evaluator_segment() {
+        use hierarchy::Hierarchy;
+        let cage = primitive("box", 10.0, 1).unwrap();
+        let removed = &cage.faces[0];
+        let opposite = cage.faces.iter().position(|face| face.iter().all(|v| !removed.contains(v))).unwrap();
+        let h = Hierarchy::new(cage).unwrap().subdivide(&[opposite], [2, 2]).unwrap();
+        let before = h.layout().unwrap();
+        let mut expected = before.faces[0].clone();
+        let minimum = expected.iter().enumerate().min_by_key(|(_, v)| *v).unwrap().0;
+        expected.rotate_left(minimum);
+        let trimmed = h.delete_faces(&[0]).unwrap();
+        let rim = trimmed.quad_cap_rim(&[[expected[0], expected[1]]], &[]).unwrap();
+        assert!(rim.closes_skin);
+        let layout = trimmed.layout().unwrap();
+        for (i, side) in rim.sides.iter().enumerate() {
+            let [a, b] = [expected[i], expected[(i + 1) % 4]];
+            assert_eq!(side.edge, [a, b]);
+            assert!(
+                layout.faces[side.owner]
+                    .iter()
+                    .copied()
+                    .zip(layout.faces[side.owner].iter().copied().cycle().skip(1))
+                    .take(layout.faces[side.owner].len())
+                    .any(|pair| pair == (b, a))
+            );
+            let (_, path) = layout.paths.iter().find(|(edge, _)| *edge == [a.min(b), a.max(b)]).unwrap();
+            assert_eq!(path.len(), 3, "each logical side owns two evaluator segments");
+        }
+        assert_eq!(rim, trimmed.quad_cap_rim(&[], &[expected[3]]).unwrap());
+        let interior = layout
+            .paths
+            .iter()
+            .find(|(edge, _)| !rim.sides.iter().any(|side| key(side.edge[0], side.edge[1]) == key(edge[0], edge[1])))
+            .map(|(edge, _)| *edge)
+            .unwrap();
+        assert!(trimmed.quad_cap_rim(&[[expected[0], expected[1]], interior], &[]).is_err());
+        assert!(trimmed.quad_cap_rim(&[], &[usize::MAX]).is_err());
+        assert_eq!(trimmed.evaluate().unwrap(), h.evaluate().unwrap());
+
+        let original_opening = Hierarchy::new(h.base.delete_faces(&[0]).unwrap()).unwrap().subdivide(&[opposite - 1], [2, 2]).unwrap();
+        let cage = original_opening.evaluate().unwrap();
+        let opening = cage.boundary_loops().unwrap().remove(0);
+        let vertex = *opening.iter().find(|id| original_opening.controls.contains_key(id)).unwrap();
+        assert!(original_opening.restore_deleted_holes(&[], &[vertex], false).is_err());
+        assert!(original_opening.quad_cap_rim(&[], &[vertex]).unwrap().closes_skin);
+    }
+
+    #[test]
+    fn separate_quad_caps_close_all_box_openings_and_keep_retired_slots() {
+        use hierarchy::Hierarchy;
+        let base = primitive("box", 10.0, 1).unwrap();
+        let opposite = base.faces.iter().position(|face| face.iter().all(|v| !base.faces[0].contains(v))).unwrap();
+        let [a, b] = [0, opposite].map(|face| [base.faces[face][0], base.faces[face][1]]);
+        let mut hierarchy = Hierarchy::new(base).unwrap().delete_faces(&[0, opposite]).unwrap();
+        let first = hierarchy.reserve_quad_cap(&[a], &[]).unwrap();
+        assert!(!hierarchy.validated_quad_caps().unwrap()[0].1.closes_skin);
+        let second = hierarchy.reserve_quad_cap(&[b], &[]).unwrap();
+        let both = hierarchy.validated_quad_caps().unwrap();
+        assert_eq!([both[0].0, both[1].0], [first, second]);
+        assert!(both.iter().all(|(_, rim)| rim.closes_skin));
+        assert!(hierarchy.reserve_quad_cap(&[b], &[]).is_err());
+        let mut reopened = hierarchy.delete_faces(&[second]).unwrap();
+        assert!(!reopened.validated_quad_caps().unwrap()[0].1.closes_skin);
+        let third = reopened.reserve_quad_cap(&[b], &[]).unwrap();
+        assert!(third > second);
+        let reopened = reopened.delete_faces(&[first]).unwrap();
+        let layout = reopened.layout().unwrap();
+        assert!(layout.faces[first].is_empty());
+        assert!(layout.faces[second].is_empty());
+        assert_eq!(layout.faces[third].len(), 4);
+        let saved: Hierarchy = serde_json::from_value(serde_json::to_value(&reopened).unwrap()).unwrap();
+        assert_eq!(saved, reopened);
+
+        let valid = serde_json::to_value(&hierarchy).unwrap();
+        let mut no_primary = valid.clone();
+        no_primary.as_object_mut().unwrap().remove("quad_cap");
+        let invalid: Hierarchy = serde_json::from_value(no_primary).unwrap();
+        assert!(invalid.layout().is_err());
+        let mut too_many = valid;
+        let sample = too_many["additional_quad_caps"][0].clone();
+        too_many["additional_quad_caps"] = serde_json::json!(
+            (0..8)
+                .map(|face| {
+                    let mut cap = sample.clone();
+                    cap["face"] = serde_json::json!(face + 10);
+                    cap
+                })
+                .collect::<Vec<_>>()
+        );
+        assert!(serde_json::from_value::<Hierarchy>(too_many).is_err());
+    }
+
+    #[test]
+    fn refined_boundary_collapse_selects_only_exclusive_endpoints_and_keeps_leaf_ids() {
+        use hierarchy::Hierarchy;
+        let base = Hierarchy::new(primitive("plane", 8.0, 1).unwrap()).unwrap();
+        let plane = base.subdivide(&[0], [2, 1]).unwrap().subdivide(&[2], [2, 1]).unwrap();
+        let layout = plane.layout().unwrap();
+        let [a, b, c, d] = layout.faces[1].as_slice() else { panic!("left leaf quad") };
+        let collapse = plane.boundary_collapse([*d, *a]).unwrap();
+        assert_eq!(plane.boundary_collapse([*a, *d]).unwrap(), collapse);
+        assert_eq!([collapse.face, collapse.retained_neighbor], [1, 3]);
+        assert_eq!(collapse.boundary, [collapse.point, *b, *c]);
+        assert_eq!(collapse.parameters, [[0.0, 0.5], [0.5, 0.0], [0.5, 1.0]]);
+        assert!(layout.faces.iter().all(|face| !face.contains(&collapse.point)));
+        assert!(plane.boundary_collapse([*b, *c]).is_err());
+        assert!(plane.boundary_collapse([*a, usize::MAX]).is_err());
+        assert!(plane.boundary_collapse([*a, *a]).is_err());
+        let split_neighbor = base.subdivide(&[0], [2, 1]).unwrap().subdivide(&[2], [1, 2]).unwrap();
+        assert!(split_neighbor.boundary_collapse([*a, *d]).is_err(), "a T-junction on the opposite edge needs a separate chart policy");
+    }
+
+    #[test]
+    fn saved_boundary_collapse_preserves_evaluator_and_exposes_only_exact_diagonals() {
+        use hierarchy::Hierarchy;
+        let mut source =
+            Hierarchy::new(primitive("plane", 8.0, 1).unwrap()).unwrap().subdivide(&[0], [2, 1]).unwrap().subdivide(&[2], [2, 1]).unwrap();
+        let raw = source.layout().unwrap();
+        let quad = &raw.faces[1];
+        let endpoints = [quad[3], quad[0]];
+        let cage = source.evaluate().unwrap();
+        source.reserve_boundary_collapse(endpoints).unwrap();
+        let layout = source.layout().unwrap();
+        let site = layout.collapse.unwrap();
+        assert_eq!(layout.faces[site.face], site.boundary);
+        assert_eq!(layout.faces[site.retained_neighbor], raw.faces[site.retained_neighbor]);
+        assert_eq!(source.evaluate().unwrap(), cage);
+        assert!(source.controls.contains_key(&site.point));
+        assert!(endpoints.iter().all(|&id| source.is_retired_collapse_control(id)));
+        assert!(layout.visible_edges().all(|edge| !edge.iter().any(|id| endpoints.contains(id))));
+        for edge in site.diagonal_edges() {
+            assert!(layout.visible_edges().any(|candidate| candidate == edge));
+            assert!(!layout.paths.iter().any(|(candidate, _)| *candidate == edge));
+            let charts = source.edge_charts(edge, true).unwrap();
+            assert_eq!(charts.len(), 1);
+            assert_eq!(charts[0].face, site.root);
+            assert!(charts[0].uv[0][0] != charts[0].uv[1][0] && charts[0].uv[0][1] != charts[0].uv[1][1]);
+            assert!(source.edge_charts(edge, false).is_err());
+        }
+        let (surface, logical) = source.surface(&cage, 1).unwrap();
+        assert_eq!(logical.faces[site.face], site.boundary);
+        assert!(!surface.mesh.tri_face.contains(&(site.face as u32)));
+        assert!(surface.mesh.tri_face.contains(&(site.retained_neighbor as u32)));
+        let frozen = source.clone();
+        assert!(source.add_deltas(&endpoints, &[Vec3::X, Vec3::X]).is_err());
+        assert_eq!(source, frozen);
+        let reopened: Hierarchy = serde_json::from_value(serde_json::to_value(&source).unwrap()).unwrap();
+        assert_eq!(reopened, source);
+        assert_eq!(reopened.validated_boundary_collapse().unwrap(), Some(site));
+    }
+
+    #[test]
+    fn refined_unweld_keeps_mixed_depth_seam_stations_and_disables_automatic_restoration() {
+        use hierarchy::Hierarchy;
+        let source = Hierarchy::new(primitive("box", 10.0, 1).unwrap()).unwrap().subdivide(&[0], [2, 2]).unwrap();
+        let layout = source.layout().unwrap();
+        let fine: Vec<_> = source.leaves.iter().enumerate().filter_map(|(id, leaf)| (leaf.active && leaf.root == 0).then_some(id)).collect();
+        let mut uses = BTreeMap::new();
+        for &id in &fine {
+            let face = &layout.faces[id];
+            for (&a, &b) in face.iter().zip(face.iter().cycle().skip(1)).take(face.len()) {
+                *uses.entry(key(a, b)).or_insert(0) += 1;
+            }
+        }
+        let seam = uses.into_iter().filter_map(|((a, b), count)| (count == 1).then_some([a, b])).collect::<Vec<_>>();
+        assert_eq!(seam.len(), 8);
+        assert!(source.split_logical_seam(&seam[..7]).is_err());
+        let split = source.split_logical_seam(&seam).unwrap();
+        let mut combined = BTreeSet::new();
+        for (index, half) in split.halves.iter().enumerate() {
+            assert!(half.has_detached_material());
+            assert_eq!(half.evaluate().unwrap(), source.evaluate().unwrap());
+            let kept = half.layout().unwrap();
+            for (id, face) in kept.faces.iter().enumerate().filter(|(_, face)| !face.is_empty()) {
+                assert!(combined.insert(id));
+                assert_eq!(face, &layout.faces[id]);
+            }
+            for pair in &split.rim {
+                let side = &pair[index];
+                let [a, b] = side.edge;
+                let sorted = [a.min(b), a.max(b)];
+                let path = kept.paths.iter().find(|(edge, _)| *edge == sorted).unwrap();
+                assert_eq!(path.1, if a < b { side.path.clone() } else { side.path.iter().rev().copied().collect() });
+            }
+            let seed = split.rim[0][index].edge;
+            let error = half.restore_deleted_holes(&[seed], &[], false).unwrap_err().to_string();
+            assert!(error.contains("detached by Unweld"), "{error}");
+            let saved: Hierarchy = serde_json::from_value(serde_json::to_value(half).unwrap()).unwrap();
+            assert_eq!(&saved, half);
+            assert_eq!(saved.layout().unwrap().faces, kept.faces);
+            let mut forged = serde_json::to_value(half).unwrap();
+            forged["detached_leaves"] = serde_json::json!([split.rim[0][index].owner]);
+            let forged: Hierarchy = serde_json::from_value(forged).unwrap();
+            assert!(forged.layout().is_err());
+        }
+        assert_eq!(combined.len(), layout.faces.iter().filter(|face| !face.is_empty()).count());
+    }
+
+    #[test]
+    fn refined_weld_rims_pair_opposite_owner_winding_without_rebasing_sculpt() {
+        use hierarchy::Hierarchy;
+
+        fn half(low: f64, high: f64, top: bool, count: usize) -> Hierarchy {
+            let mut points = Vec::new();
+            for z in [low, high] {
+                for (x, y) in [(-4.0, -4.0), (4.0, -4.0), (4.0, 4.0), (-4.0, 4.0)] {
+                    points.push(Vec3::new(x, y, z));
+                }
+            }
+            let mut faces = (0..4)
+                .map(|a| {
+                    let b = (a + 1) % 4;
+                    vec![a, b, b + 4, a + 4]
+                })
+                .collect::<Vec<_>>();
+            faces.push(if top { vec![4, 5, 6, 7] } else { vec![3, 2, 1, 0] });
+            let mut h = Hierarchy::new(Cage { points, faces, ..Default::default() }).unwrap().subdivide(&[4], [count, count]).unwrap();
+            let cage = h.evaluate().unwrap();
+            let center = h
+                .controls
+                .iter()
+                .find(|&(&v, &level)| {
+                    let p = cage.points[v];
+                    level == 1 && p.x == 0.0 && p.y == 0.0
+                })
+                .map(|(&v, _)| v)
+                .unwrap();
+            h.add_deltas(&[center], &[Vec3::Z * 0.25]).unwrap();
+            assert_ne!(h.evaluate().unwrap(), cage);
+            assert_eq!(h.details[1].len(), 1);
+            h
+        }
+
+        let lower = half(-5.0, 0.0, false, 2);
+        let upper = half(0.0, 5.0, true, 4);
+        let old_lower = lower.clone();
+        let old_upper = upper.clone();
+        let pairs = lower.refined_weld_rims(&upper, [4, 5], [0, 1]).unwrap();
+        let expected = [[[5, 4], [0, 1]], [[4, 7], [3, 0]], [[7, 6], [2, 3]], [[6, 5], [1, 2]]];
+        assert_eq!(pairs.len(), expected.len());
+        let lower_eval = lower.evaluate().unwrap().refined(1).unwrap();
+        let upper_eval = upper.evaluate().unwrap();
+        let first_path = &pairs[0][0].path;
+        assert_eq!(
+            first_path.iter().map(|&v| lower_eval.points[v]).collect::<Vec<_>>(),
+            vec![Vec3::new(2.75, -2.75, 0.0), Vec3::new(0.0, -3.75, 0.0), Vec3::new(-2.75, -2.75, 0.0)]
+        );
+        for ([a, b], edges) in pairs.iter().zip(expected) {
+            assert_eq!([a.edge, b.edge], edges);
+            assert_eq!(a.path.len(), 3);
+            assert_eq!(b.path.len(), 5);
+            assert_eq!(a.owner, b.owner);
+            assert_eq!(lower_eval.points[a.path[0]], upper_eval.points[b.path[4]]);
+            assert_eq!(lower_eval.points[a.path[1]], upper_eval.points[b.path[2]]);
+            assert_eq!(lower_eval.points[a.path[2]], upper_eval.points[b.path[0]]);
+        }
+        assert_eq!(lower.refined_weld_rims(&upper, [5, 4], [1, 0]).unwrap(), pairs);
+        assert!(lower.refined_weld_rims(&upper, [0, 4], [0, 1]).is_err());
+        assert!(lower.refined_weld_rims(&upper, [usize::MAX, 4], [0, 1]).is_err());
+        let split = upper.subdivide(&[0], [2, 1]).unwrap();
+        assert!(lower.refined_weld_rims(&split, [5, 6], [1, 2]).is_err());
+        let closed = Hierarchy::new(primitive("box", 10.0, 1).unwrap()).unwrap().subdivide(&[0], [2, 2]).unwrap();
+        let leaf = closed.leaf_corners().unwrap().iter().rposition(Option::is_some).unwrap();
+        let cut = closed.delete_faces(&[leaf]).unwrap();
+        let corners = closed.leaf_corners().unwrap()[leaf].unwrap();
+        let error = lower.refined_weld_rims(&cut, [4, 5], [corners[0], corners[1]]).unwrap_err();
+        assert!(error.to_string().contains("original free rim"));
+        assert_eq!(lower, old_lower);
+        assert_eq!(upper, old_upper);
+    }
+
+    #[test]
+    fn retired_quad_cap_slots_stay_empty_across_refinement_restoration_and_recapping() {
+        use hierarchy::Hierarchy;
+        let cage = primitive("box", 10.0, 1).unwrap();
+        let opposite = cage.faces.iter().position(|face| face.iter().all(|v| !cage.faces[0].contains(v))).unwrap();
+        let hierarchy = Hierarchy::new(cage).unwrap().subdivide(&[opposite], [2, 2]).unwrap();
+        let raw = hierarchy.layout().unwrap();
+        let edge: [usize; 2] = raw.faces[0][..2].try_into().unwrap();
+        let hole = hierarchy.delete_faces(&[0]).unwrap();
+        let mut capped = hole.clone();
+        let first = capped.leaves.len();
+        capped.reserve_quad_cap(&[edge], &[]).unwrap();
+        let (_, rim) = capped.validated_quad_cap().unwrap().unwrap();
+        assert!(capped.delete_faces(&[first, opposite]).is_err());
+        assert_eq!(capped.quad_cap_face(), Some(first));
+        let removed = capped.delete_faces(&[first]).unwrap();
+        let layout = removed.layout().unwrap();
+        assert_eq!(layout.faces[..first], hole.layout().unwrap().faces);
+        assert!(layout.faces[first].is_empty());
+        assert_eq!(layout.owners, hole.layout().unwrap().owners);
+        assert_eq!(removed.evaluate().unwrap(), capped.evaluate().unwrap());
+        assert_eq!(removed.controls, capped.controls);
+        assert_eq!(removed.details, capped.details);
+        assert!(removed.delete_faces(&[first]).is_err());
+        assert_eq!(removed.quad_cap_rim(&[edge], &[]).unwrap(), rim);
+        let restored = removed.restore_deleted_holes(&[edge], &[], true).unwrap();
+        assert_eq!(restored.layout().unwrap().faces[0], raw.faces[0]);
+        assert!(restored.layout().unwrap().faces[first].is_empty());
+
+        let mut saved: Hierarchy = serde_json::from_value(serde_json::to_value(&removed).unwrap()).unwrap();
+        assert_eq!(saved, removed);
+        let child = saved.leaves.iter().position(|leaf| leaf.active && leaf.root == opposite).unwrap();
+        saved = saved.subdivide(&[child], [2, 2]).unwrap();
+        let second = saved.leaves.len();
+        assert!(second > first + 1);
+        saved.reserve_quad_cap(&[edge], &[]).unwrap();
+        assert_eq!(saved.validated_quad_cap().unwrap(), Some((second, rim)));
+        assert!(saved.layout().unwrap().faces[first].is_empty());
+        assert_eq!(saved.layout().unwrap().faces[second].len(), 4);
+
+        let mut invalid = serde_json::to_value(&removed).unwrap();
+        invalid["retired_quad_caps"] = serde_json::json!([first, first]);
+        assert!(serde_json::from_value::<Hierarchy>(invalid).is_err());
+        let mut invalid = serde_json::to_value(&removed).unwrap();
+        invalid["retired_quad_caps"] = serde_json::json!([0]);
+        let invalid: Hierarchy = serde_json::from_value(invalid).unwrap();
+        assert!(invalid.layout().is_err());
+        assert!(invalid.evaluate().is_err());
+    }
+
+    #[test]
+    fn refined_erase_and_cap_uses_the_complete_new_interface_and_preserves_older_openings() {
+        use hierarchy::Hierarchy;
+        let parameters = primitives::Parameters { kind: "face".into(), dimensions: [12.0; 3], segments: [6, 6, 1], ..Default::default() };
+        let old = Hierarchy::new(parameters.build().unwrap()).unwrap();
+        let mut source = old.subdivide(&[28], [4, 4]).unwrap().delete_faces(&[7]).unwrap();
+        let selected: Vec<_> = source.leaves.iter().enumerate().filter_map(|(id, leaf)| (leaf.active && leaf.root == 28).then_some(id)).collect();
+        assert_eq!(selected.len(), 16);
+        let corners = source.leaf_corners().unwrap();
+        let center = corners[selected[5]].unwrap()[2];
+        source.add_deltas(&[center], &[Vec3::Z * 0.25]).unwrap();
+        let old_skin = source.evaluate().unwrap();
+        let layout = source.layout().unwrap();
+        let old_openings = old_skin.boundary_loops_where(|cell| layout.owners[cell].is_some()).unwrap();
+        assert_eq!(old_openings.len(), 2, "the sheet perimeter and an earlier hole are both free");
+        let mut disconnected = selected.clone();
+        disconnected.push(10);
+        for invalid in [vec![0], vec![8], vec![15, 16], vec![usize::MAX], vec![selected[0]; 2], disconnected] {
+            assert!(source.erase_and_cap(&invalid).is_err(), "{invalid:?}");
+        }
+        let replaced = source.erase_and_cap(&selected).unwrap();
+        let (cap, rim) = replaced.validated_quad_cap().unwrap().unwrap();
+        assert_eq!(cap, source.leaves.len());
+        assert!(!rim.closes_skin);
+        assert_eq!(replaced.evaluate().unwrap(), old_skin);
+        assert_eq!(replaced.details, source.details);
+        assert_eq!(replaced.base, source.base);
+        let next = replaced.layout().unwrap();
+        assert!(next.faces[7].is_empty());
+        assert!(selected.iter().all(|&id| next.faces[id].is_empty()));
+        assert!(next.faces[cap].iter().all(|v| source.base.faces[28].contains(v)));
+        for (cell, owner) in layout.owners.iter().enumerate() {
+            assert_eq!(next.owners[cell], owner.filter(|id| !selected.contains(id)));
+        }
+        let reopened = replaced.delete_faces(&[cap]).unwrap();
+        let skin = reopened.layout().unwrap();
+        let openings = old_skin.boundary_loops_where(|cell| skin.owners[cell].is_some()).unwrap();
+        assert_eq!(openings.len(), old_openings.len() + 1);
+        assert!(old_openings.iter().all(|rim| openings.contains(rim)));
+        let restored = reopened.restore_deleted_holes(&[rim.sides[0].edge], &[], false).unwrap();
+        assert_eq!(restored.evaluate().unwrap(), old_skin);
+        assert_eq!(restored.layout().unwrap().owners, layout.owners);
+        assert!(restored.layout().unwrap().faces[cap].is_empty());
+    }
+
+    #[test]
+    fn refined_fill_recovers_terminal_children_and_preserves_an_unrelated_dissolve() {
+        use hierarchy::Hierarchy;
+        let parameters = primitives::Parameters { kind: "face".into(), segments: [4, 4, 1], ..Default::default() };
+        let h = Hierarchy::new(parameters.build().unwrap()).unwrap().subdivide(&[5], [2, 2]).unwrap();
+        let parent = h.leaves.len() - 4;
+        let first = h.leaves.len();
+        let h = h.subdivide(&[parent], [2, 2]).unwrap();
+        let layout = h.layout().unwrap();
+        let has = |face: &[usize], edge: [usize; 2]| {
+            face.iter().copied().zip(face.iter().copied().cycle().skip(1)).take(face.len()).any(|(a, b)| key(a, b) == key(edge[0], edge[1]))
+        };
+        let seam = layout.paths.iter().find(|(edge, _)| has(&layout.faces[14], *edge) && has(&layout.faces[15], *edge)).unwrap().0;
+        let h = h.dissolve_edges(&[seam]).unwrap();
+        assert!(h.leaves[15].active && h.layout().unwrap().faces[15].is_empty(), "dissolved owners remain active material");
+        let all_children: Vec<_> = (first..h.leaves.len()).collect();
+        let deleted = h.delete_faces(&all_children).unwrap();
+        let cage = deleted.evaluate().unwrap();
+        let layout = deleted.layout().unwrap();
+        let rims = cage.boundary_loops_where(|cell| layout.owners[cell].is_some()).unwrap();
+        assert_eq!(rims.len(), 2);
+        let hole = rims.iter().min_by_key(|rim| rim.len()).unwrap();
+        let outer = rims.iter().max_by_key(|rim| rim.len()).unwrap();
+        let seed = *hole.iter().find(|v| deleted.controls.contains_key(v)).unwrap();
+        let outside = *outer.iter().find(|v| deleted.controls.contains_key(v)).unwrap();
+        assert!(deleted.restore_deleted_holes(&[], &[outside], false).is_err(), "the original open sheet rim has no retained material");
+        assert!(deleted.restore_deleted_holes(&[], &[seed, outside], false).is_err(), "a mixed valid/unsupported fill is atomic");
+        let hole_edges: BTreeSet<_> =
+            hole.iter().copied().zip(hole.iter().copied().cycle().skip(1)).take(hole.len()).map(|(a, b)| key(a, b)).collect();
+        let edge = layout.paths.iter().find(|(_, path)| path.windows(2).all(|w| hole_edges.contains(&key(w[0], w[1])))).unwrap().0;
+        assert!(
+            deleted.restore_deleted_holes(&[edge], &[outside], false).is_err(),
+            "an edge pick cannot hide an explicitly selected unsupported point"
+        );
+        let filled = deleted.restore_deleted_holes(&[edge], &[seed], false).unwrap();
+        assert_eq!(filled, h);
+        assert!(!filled.leaves[parent].active, "the old parent must stay retired even when all its children were deleted");
+        let mut ambiguous = deleted.clone();
+        ambiguous.leaves.push(ambiguous.leaves[first].clone());
+        assert!(ambiguous.restore_deleted_holes(&[], &[seed], false).is_err(), "duplicate inactive domains cannot supply material");
+        let layout = h.layout().unwrap();
+        let id = *all_children.last().unwrap();
+        let point = layout.faces[id][0];
+        assert_eq!(layout.faces[id].len(), 4);
+        let one = h.delete_faces(&[id]).unwrap();
+        assert_eq!(one.restore_deleted_holes(&[], &[point], true).unwrap(), h);
+    }
+    #[test]
     fn forms_logical_deletion_and_dissolve_preserve_the_sculpted_evaluator() {
         use hierarchy::Hierarchy;
         let cage = primitives::Parameters::default().build().unwrap();
@@ -678,6 +1114,180 @@ mod tests {
             }
         }
     }
+    fn mixed_depth_loop_fixture() -> hierarchy::Hierarchy {
+        let cage =
+            primitives::Parameters { kind: "face".into(), dimensions: [8.0, 4.0, 1.0], segments: [2, 1, 1], ..Default::default() }.build().unwrap();
+        let mut h = hierarchy::Hierarchy::new(cage).unwrap().subdivide(&[1], [2, 2]).unwrap();
+        let vertex = *h.controls.iter().find(|(_, birth)| **birth == 1).unwrap().0;
+        h.add_deltas(&[vertex], &[Vec3::new(0.0, 0.0, 0.08)]).unwrap();
+        h
+    }
+    #[test]
+    fn hierarchical_parameter_sides_trace_a_t_control_and_reuse_existing_fine_seams() {
+        let h = mixed_depth_loop_fixture();
+        let sides = h.parameter_sides().unwrap();
+        let coarse = sides.iter().find(|leaf| leaf.id == 0).unwrap();
+        assert_eq!(coarse.sides.iter().map(Vec::len).collect::<Vec<_>>(), vec![1, 2, 1, 1]);
+        let seed = coarse.sides[3][0].edge;
+        let plan = h.aligned_loop(seed, 0.5).unwrap();
+        assert_eq!(plan.cuts, vec![hierarchy::LeafCut { parent: 0, axis: 1, coordinate: 8 }]);
+        assert_eq!(plan.existing_edges.len(), 2);
+        assert_eq!(plan.points.len(), 4);
+        assert_eq!(plan.points.iter().filter(|point| point.existing.is_some()).count(), 3);
+        let after = h.split_at(&plan.cuts).unwrap();
+        assert_eq!(after.depth, h.depth);
+        assert_eq!(after.evaluate().unwrap(), h.evaluate().unwrap(), "aligned topology must not displace the evaluator");
+        assert_eq!(after.details, h.details);
+        for (&id, &birth) in &h.controls {
+            assert_eq!(after.controls.get(&id), Some(&birth));
+        }
+        let vertices = after.aligned_loop_vertices(&plan.points).unwrap();
+        for (point, &id) in plan.points.iter().zip(&vertices) {
+            if let Some(old) = point.existing {
+                assert_eq!(old, id);
+            }
+        }
+        let layout = after.layout().unwrap();
+        for edge in &plan.existing_edges {
+            assert!(layout.paths.iter().any(|(other, _)| other == edge));
+        }
+        assert_eq!(after.leaves.iter().filter(|leaf| leaf.active).count(), h.leaves.iter().filter(|leaf| leaf.active).count() + 1);
+        let reversed = h.aligned_loop([seed[1], seed[0]], 0.5).unwrap();
+        assert_eq!(plan.cuts, reversed.cuts);
+        let mut unchanged = h.clone();
+        assert!(unchanged.aligned_loop(seed, 0.3).is_err());
+        assert_eq!(unchanged, h);
+        // Empty cut plans are genuine no-ops, not another logical seam.
+        unchanged = unchanged.split_at(&[]).unwrap();
+        assert_eq!(unchanged, h);
+    }
+    #[test]
+    fn hierarchical_nonmidpoint_cuts_use_coordinate_depth_and_preserve_exact_parameter_area() {
+        let h = mixed_depth_loop_fixture();
+        let sides = h.parameter_sides().unwrap();
+        let seed = sides.iter().find(|leaf| leaf.id == 0).unwrap().sides[3][0].edge;
+        let point_y = |f: f64| {
+            let side = &sides.iter().find(|leaf| leaf.id == 0).unwrap().sides[3][0];
+            side.uv[0][1] as f64 + (side.uv[1][1] as f64 - side.uv[0][1] as f64) * f
+        };
+        // Canonical ID orientation can reverse the left geometric boundary.
+        let fraction = if point_y(0.25) == 4.0 { 0.25 } else { 0.75 };
+        let plan = h.aligned_loop(seed, fraction).unwrap();
+        assert_eq!(plan.cuts.len(), 3, "one coarse cut plus exactly two fine-cell cuts");
+        let after = h.split_at(&plan.cuts).unwrap();
+        assert_eq!(after.depth, 2);
+        assert_eq!(
+            after.evaluate().unwrap(),
+            h.evaluate().unwrap().refined(1).unwrap(),
+            "new zero-detail evaluation preserves the actual sculpted limit source"
+        );
+        assert_eq!(&after.details[..h.details.len()], h.details.as_slice());
+        assert_eq!(after.leaves.iter().filter(|leaf| leaf.active).count(), h.leaves.iter().filter(|leaf| leaf.active).count() + 3);
+        for root in 0..2 {
+            let area: usize = after
+                .leaves
+                .iter()
+                .filter(|leaf| leaf.active && leaf.root == root)
+                .map(|leaf| (leaf.domain[2] - leaf.domain[0]) * (leaf.domain[3] - leaf.domain[1]))
+                .sum();
+            assert_eq!(area, 256);
+        }
+        let parent = after.leaves.iter().position(|leaf| leaf.active && leaf.root == 0 && leaf.domain[1] == 4 && leaf.domain[3] == 16).unwrap();
+        let split = after.subdivide(&[parent], [1, 2]).unwrap();
+        assert_eq!(split.depth, 3);
+        assert!(split.leaves.iter().any(|leaf| leaf.active && leaf.root == 0 && leaf.domain[1] == 10));
+        let odd = h.split_at(&[hierarchy::LeafCut { parent: 0, axis: 1, coordinate: 3 }]).unwrap();
+        assert_eq!(odd.depth, 4);
+        let parent = odd.leaves.iter().position(|leaf| leaf.active && leaf.root == 0 && leaf.domain[1] == 0 && leaf.domain[3] == 3).unwrap();
+        assert!(odd.subdivide(&[parent], [1, 2]).is_err());
+        assert!(h.split_at(&[hierarchy::LeafCut { parent: 0, axis: 2, coordinate: 8 }]).is_err());
+        assert!(h.split_at(&[hierarchy::LeafCut { parent: 0, axis: 1, coordinate: 0 }]).is_err());
+        // Existing serialized domain/control fields already carry nonuniform
+        // dyadic rectangles; no private cache or new persistent handle is used.
+        let decoded: hierarchy::Hierarchy = serde_json::from_slice(&serde_json::to_vec(&after).unwrap()).unwrap();
+        assert_eq!(decoded, after);
+        assert_eq!(decoded.layout().unwrap().faces, after.layout().unwrap().faces);
+    }
+
+    #[test]
+    fn aligned_loop_validates_nonbinary_fractions_in_the_callers_edge_direction() {
+        let cage = primitives::Parameters { kind: "face".into(), segments: [1; 3], ..Default::default() }.build().unwrap();
+        let h = hierarchy::Hierarchy::new(cage).unwrap().split_at(&[hierarchy::LeafCut { parent: 0, axis: 1, coordinate: 3 }]).unwrap();
+        let sides = h.parameter_sides().unwrap();
+        let leaf = sides.iter().find(|leaf| leaf.id == 1).unwrap();
+        let segment = &leaf.sides[3][0];
+        assert_eq!(segment.uv.map(|uv| uv[1]), [0, 3]);
+        let edge = segment.edge;
+        let forward = h.aligned_loop(edge, 1.0 / 3.0).unwrap();
+        let reversed = h.aligned_loop([edge[1], edge[0]], 2.0 / 3.0).unwrap();
+        assert_eq!(forward.cuts, [hierarchy::LeafCut { parent: 1, axis: 1, coordinate: 1 }]);
+        assert_eq!(forward.cuts, reversed.cuts);
+        assert_eq!(h.split_at(&forward.cuts).unwrap(), h.split_at(&reversed.cuts).unwrap());
+        assert!(h.aligned_loop_from_leaf(1, 1).is_err(), "an odd extent has no exact midpoint on the stored grid");
+    }
+
+    #[test]
+    fn hierarchical_aligned_closed_quarter_itinerary_is_independent_of_the_plan_counts() {
+        let cage = primitives::Parameters { segments: [1; 3], ..Default::default() }.build().unwrap();
+        let h = hierarchy::Hierarchy::new(cage).unwrap().subdivide(&[0], [2, 2]).unwrap();
+        let c = h.leaf_corners().unwrap()[4].unwrap();
+        let seed = [c[0], c[1]];
+        let plan = h.aligned_loop(seed, 0.25).unwrap();
+        let reversed = h.aligned_loop([seed[1], seed[0]], 0.75).unwrap();
+        // From the six documented box frames, x=one-quarter runs top(0),
+        // back(1), bottom(3), front(4), and never left/right(5/2). Root0
+        // has two crossed fine rows: children6 and8, both at root U=4.
+        let expected: std::collections::BTreeSet<_> = [(6, 0, 4), (8, 0, 4), (1, 0, 4), (3, 1, 4), (4, 0, 4)].into_iter().collect();
+        let cuts = |plan: &hierarchy::AlignedLoop| {
+            plan.cuts.iter().map(|cut| (cut.parent, cut.axis, cut.coordinate)).collect::<std::collections::BTreeSet<_>>()
+        };
+        assert_eq!(cuts(&plan), expected);
+        assert_eq!(cuts(&reversed), expected);
+        assert!(plan.existing_edges.is_empty());
+        assert_eq!(plan.points.len(), 5);
+        let after = h.split_at(&plan.cuts).unwrap();
+        let reverse = h.split_at(&reversed.cuts).unwrap();
+        assert_eq!(after, reverse);
+        assert_eq!(after.leaves.iter().filter(|leaf| leaf.active).count(), 14);
+        assert_eq!(after.evaluate().unwrap(), h.evaluate().unwrap().refined(1).unwrap());
+        // Five different seam stations with degree2 incidence form one closed
+        // component, not two open strips accidentally producing the same count.
+        let ids: std::collections::BTreeSet<_> = after.aligned_loop_vertices(&plan.points).unwrap().into_iter().collect();
+        assert_eq!(ids.len(), 5);
+        let layout = after.layout().unwrap();
+        let mut degree = std::collections::BTreeMap::<usize, usize>::new();
+        for (edge, _) in &layout.paths {
+            if edge.iter().all(|id| ids.contains(id)) {
+                for id in edge {
+                    *degree.entry(*id).or_default() += 1;
+                }
+            }
+        }
+        assert_eq!(degree.len(), 5);
+        assert!(degree.values().all(|&degree| degree == 2));
+    }
+    #[test]
+    fn hierarchical_aligned_deleted_region_separates_components_without_balancing_other_roots() {
+        let cage =
+            primitives::Parameters { kind: "face".into(), dimensions: [16.0, 4.0, 1.0], segments: [4, 1, 1], ..Default::default() }.build().unwrap();
+        let h = hierarchy::Hierarchy::new(cage).unwrap().subdivide(&[3], [2, 2]).unwrap().delete_faces(&[1]).unwrap();
+        let c = h.leaf_corners().unwrap()[0].unwrap();
+        let seed = [c[3], c[0]];
+        let plan = h.aligned_loop(seed, 0.5).unwrap();
+        assert_eq!(plan.cuts, vec![hierarchy::LeafCut { parent: 0, axis: 1, coordinate: 8 }]);
+        let after = h.split_at(&plan.cuts).unwrap();
+        assert_eq!(&after.leaves[1..h.leaves.len()], &h.leaves[1..]);
+        assert_eq!(after.evaluate().unwrap(), h.evaluate().unwrap());
+        let right: Vec<_> = after.leaves.iter().filter(|leaf| leaf.root >= 2).collect();
+        let old: Vec<_> = h.leaves.iter().filter(|leaf| leaf.root >= 2).collect();
+        assert_eq!(right, old);
+        assert!(h.aligned_loop(seed, 1.0 / 32.0).unwrap_err().to_string().contains("aligned dyadic"));
+        assert!(
+            h.split_at(&[hierarchy::LeafCut { parent: 0, axis: 1, coordinate: 8 }, hierarchy::LeafCut { parent: 0, axis: 1, coordinate: 4 }])
+                .is_err()
+        );
+    }
+
     #[test]
     fn invalid_cages_and_budgets_are_refused() {
         let c = primitive("box", 40.0, 2).unwrap();

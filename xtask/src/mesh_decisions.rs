@@ -81,7 +81,7 @@ pub const SKIPPED_FUNCTIONS: &[(&str, &str)] = &[
     ("crates/doc/src/eval.rs:feature_json", "fingerprints feature inputs; triangles are only embedded mesh-body source data"),
     ("crates/doc/src/eval.rs:mesh_bodies", "mesh bodies: a mesh import's triangles"),
     ("crates/doc/src/eval.rs:mesh_content_digest", "mesh-body imports: hashes source arrays without geometric classification"),
-    ("crates/doc/src/forms/profile.rs:Profile::display", "the fitted CAD surface's display mesh and editable guide drawing"),
+    ("crates/doc/src/forms/profile.rs:Profile::display_with_body", "the fitted CAD surface's display mesh and editable guide drawing"),
     ("crates/doc/src/forms/profile.rs:Profile::preview", "the editable Surface guide grid's preview mesh and picking index"),
     ("crates/doc/src/forms/profile/partition.rs:display_mesh", "the Surface display's skin triangles and logical guide drawing"),
     ("crates/engine/src/cmd/file.rs:saved_preview", "the preview picture saved in a design"),

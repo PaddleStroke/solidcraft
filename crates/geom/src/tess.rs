@@ -350,7 +350,7 @@ impl EvalSurface {
             EvalSurface::Plane { origin, du, dv } => Some((*origin + *du * u + *dv * v, *du, *dv)),
             EvalSurface::Nurbs { degree, knots, count, ctrl, .. } => {
                 let [u, v] = self.wrap([u, v]);
-                nurbs_derivs(*degree, knots, *count, ctrl, u, v)
+                nurbs_derivs(*degree, knots, *count, ctrl, [u, v], |c| *c)
             }
             EvalSurface::Revolved { profile, origin, axis, transform, swap } => {
                 let [u, v] = self.wrap([u, v]);
@@ -478,7 +478,24 @@ fn rational(a: [f64; 4], da: [f64; 4]) -> Option<(Vec3, Vec3)> {
     (p.is_finite() && d.is_finite()).then_some((p, d))
 }
 
-fn nurbs_derivs(degree: [usize; 2], knots: &[Vec<f64>; 2], count: [usize; 2], ctrl: &[[f64; 4]], u: f64, v: f64) -> Option<(Vec3, Vec3, Vec3)> {
+impl crate::bspline::NurbsSurface {
+    /// Point and first partial derivatives in the spline's own parameter domain.
+    pub fn derivs(&self, uv: [f64; 2]) -> Option<(Vec3, Vec3, Vec3)> {
+        if uv.iter().zip(self.domain()).any(|(&t, [a, b])| !t.is_finite() || t < a || t > b) {
+            return None;
+        }
+        nurbs_derivs(self.degree(), self.knots(), self.count(), self.homogeneous(), uv, |c| [c.x, c.y, c.z, c.w])
+    }
+}
+
+fn nurbs_derivs<C>(
+    degree: [usize; 2],
+    knots: &[Vec<f64>; 2],
+    count: [usize; 2],
+    ctrl: &[C],
+    [u, v]: [f64; 2],
+    components: impl Fn(&C) -> [f64; 4],
+) -> Option<(Vec3, Vec3, Vec3)> {
     let [pu, pv] = degree;
     let [nu, nv] = count;
     let ok = |p: usize, n: usize, k: &[f64]| (1..=MAX_SPLINE_DEGREE).contains(&p) && n > p && k.len() == n + p + 1;
@@ -494,7 +511,7 @@ fn nurbs_derivs(degree: [usize; 2], knots: &[Vec<f64>; 2], count: [usize; 2], ct
     let (mut s, mut s_u, mut s_v) = ([0.0; 4], [0.0; 4], [0.0; 4]);
     for (b, nv0) in bv.iter().take(pv + 1).enumerate() {
         for (a, nu0) in bu.iter().take(pu + 1).enumerate() {
-            let c = ctrl.get((sv + b - pv) * nu + su + a - pu)?;
+            let c = components(ctrl.get((sv + b - pv) * nu + su + a - pu)?);
             for d in 0..4 {
                 s[d] += nu0 * nv0 * c[d];
             }
@@ -508,7 +525,7 @@ fn nurbs_derivs(degree: [usize; 2], knots: &[Vec<f64>; 2], count: [usize; 2], ct
             let k = (sv + b - pv) * nu + i;
             let denominator = knots[0].get(i + pu + 1)? - knots[0].get(i + 1)?;
             if denominator > 0.0 {
-                let (a, b) = (ctrl.get(k)?, ctrl.get(k + 1)?);
+                let (a, b) = (components(ctrl.get(k)?), components(ctrl.get(k + 1)?));
                 let weight = nu0 * nv0 * pu as f64 / denominator;
                 for d in 0..4 {
                     s_u[d] += weight * (b[d] - a[d]);
@@ -522,7 +539,7 @@ fn nurbs_derivs(degree: [usize; 2], knots: &[Vec<f64>; 2], count: [usize; 2], ct
             let k = j * nu + su + a - pu;
             let denominator = knots[1].get(j + pv + 1)? - knots[1].get(j + 1)?;
             if denominator > 0.0 {
-                let (a, b) = (ctrl.get(k)?, ctrl.get(k + nu)?);
+                let (a, b) = (components(ctrl.get(k)?), components(ctrl.get(k + nu)?));
                 let weight = nu0 * nv0 * pv as f64 / denominator;
                 for d in 0..4 {
                     s_v[d] += weight * (b[d] - a[d]);

@@ -1,4 +1,4 @@
-//! Coalesced matched extrusion. Pointer input authors the newest absolute target;
+//! Coalesced surface extrusion. Pointer input authors the newest absolute target;
 //! only a qualified result enters the Form and its existing gesture history.
 use super::*;
 
@@ -6,16 +6,17 @@ use super::*;
 struct Source {
     document: String,
     revision: u64,
-    form: Option<solidcraft_engine::recovery::FormRevision>,
-    preview: Option<(u64, bool)>,
+    // This source key pins document/source identities and bounded context
+    // metadata. Autosave's dirty-state key would compare whole documents on
+    // every unsaved pointer/paint frame.
+    stamp: Option<solidcraft_engine::forms_prototype::validation::Stamp>,
 }
 impl Source {
     fn current(app: &SolveApp) -> Self {
         Self {
             document: app.session.document_id.clone(),
             revision: app.session.authoring_revision(),
-            form: solidcraft_engine::recovery::form_revision(&app.session),
-            preview: app.session.forms_prototype.as_ref().map(|f| (f.revision, f.has_tool_preview())),
+            stamp: solidcraft_engine::forms_prototype::validation::Stamp::current(&app.session),
         }
     }
 }
@@ -24,8 +25,29 @@ struct Pending {
     sequence: u64,
     done: std::sync::mpsc::Receiver<Result<solidcraft_engine::ComputedCommands, String>>,
 }
+#[cfg(not(target_arch = "wasm32"))]
+pub(super) struct WorkerPermit(std::sync::Arc<std::sync::atomic::AtomicBool>);
+#[cfg(not(target_arch = "wasm32"))]
+impl WorkerPermit {
+    pub(super) fn acquire(gate: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Option<Self> {
+        use std::sync::atomic::Ordering;
+        gate.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).ok().map(|_| Self(gate))
+    }
+}
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for WorkerPermit {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+#[cfg(all(not(test), not(target_arch = "wasm32")))]
+pub(super) fn worker_gate() -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+    static GATE: std::sync::OnceLock<std::sync::Arc<std::sync::atomic::AtomicBool>> = std::sync::OnceLock::new();
+    GATE.get_or_init(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false))).clone()
+}
 struct Gesture {
     response: Option<solidcraft_engine::forms_prototype::ExtrusionResponse>,
+    axis: Option<Vec3>,
     feedback: Option<(u64, solidcraft_engine::forms_prototype::ExtrusionPreview)>,
     feedback_error: Option<String>,
     preview_attempted: bool,
@@ -34,6 +56,7 @@ struct Gesture {
     sequence: u64,
     settled: Option<u64>,
     accepted: bool,
+    readout_failed: bool,
     released: bool,
     pending: Option<Pending>,
 }
@@ -41,6 +64,8 @@ struct Gesture {
 pub(super) struct State {
     gesture: Option<Gesture>,
     timing: Timing,
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    worker_gate: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 #[derive(Default)]
 struct Timing {
@@ -99,6 +124,24 @@ pub(super) fn active(app: &SolveApp) -> bool {
 pub(super) fn released(app: &SolveApp) -> bool {
     app.forms_prototype.extrusion.gesture.as_ref().is_some_and(|g| g.released)
 }
+/// Read only the bounded gesture/source metadata; no inspector serialization or
+/// geometry preparation runs while painting the transform readout.
+pub(super) fn readout_phase(app: &SolveApp, target: Vec3) -> Option<transform_feedback::Phase> {
+    let gesture = app.forms_prototype.extrusion.gesture.as_ref()?;
+    if gesture.source != Source::current(app)
+        || gesture.readout_failed
+        || app.forms_prototype.extrusion.timing.samples.back().is_none_or(|sample| sample.sequence != gesture.sequence || sample.target != target)
+    {
+        return None;
+    }
+    Some(if gesture.settled != Some(gesture.sequence) {
+        transform_feedback::Phase::Requested
+    } else if live_cad::mesh(app).is_some() {
+        transform_feedback::Phase::Accepted
+    } else {
+        transform_feedback::Phase::Fitting
+    })
+}
 pub(super) fn inspect(app: &SolveApp) -> serde_json::Value {
     let mut result = app.forms_prototype.extrusion.gesture.as_ref().map_or_else(
         || json!({"active":false}),
@@ -108,9 +151,15 @@ pub(super) fn inspect(app: &SolveApp) -> serde_json::Value {
     result["timing"]["observed_s"] = json!(app.now);
     result
 }
-/// Preserve the ordinary mesh edit path. Matched edits only queue pointer input.
-pub(super) fn command(app: &mut SolveApp, mut parameters: serde_json::Value) -> bool {
-    if app.session.forms_prototype.as_ref().is_none_or(|f| f.matching.is_none()) {
+/// Inverse surface edits and matched edits only queue pointer input.
+pub(super) fn command(app: &mut SolveApp, mut parameters: serde_json::Value, axis: Option<Vec3>) -> bool {
+    if app.forms_prototype.extrusion.gesture.as_ref().is_some_and(|gesture| !same_topology(&gesture.parameters, &parameters)) {
+        stale(app);
+        return false;
+    }
+    if parameters.get("surface").and_then(serde_json::Value::as_bool) != Some(true)
+        && app.session.forms_prototype.as_ref().is_none_or(|f| f.matching.is_none())
+    {
         return run(app, "form.prototype.extrude_drag", parameters);
     }
     parameters["checkpoint"] = json!(false);
@@ -123,12 +172,14 @@ pub(super) fn command(app: &mut SolveApp, mut parameters: serde_json::Value) -> 
         }
         if gesture.parameters != parameters {
             gesture.sequence = gesture.sequence.wrapping_add(1);
+            gesture.readout_failed = false;
             gesture.parameters = parameters;
         }
     } else {
         app.forms_prototype.extrusion.timing = Timing::default();
         *slot = Some(Gesture {
             response: None,
+            axis,
             feedback: None,
             feedback_error: None,
             preview_attempted: false,
@@ -137,6 +188,7 @@ pub(super) fn command(app: &mut SolveApp, mut parameters: serde_json::Value) -> 
             sequence: 0,
             settled: None,
             accepted: false,
+            readout_failed: false,
             released: false,
             pending: None,
         });
@@ -148,6 +200,17 @@ pub(super) fn command(app: &mut SolveApp, mut parameters: serde_json::Value) -> 
     }
     true
 }
+fn same_topology(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+    let same = |key| match (a.get(key).and_then(serde_json::Value::as_array), b.get(key).and_then(serde_json::Value::as_array)) {
+        (Some(a), Some(b)) => a == b,
+        (Some(values), None) | (None, Some(values)) => values.is_empty(),
+        (None, None) => true,
+    };
+    same("faces")
+        && same("edges")
+        && a.get("surface").and_then(serde_json::Value::as_bool).unwrap_or(false)
+            == b.get("surface").and_then(serde_json::Value::as_bool).unwrap_or(false)
+}
 /// Keep a released gesture alive until its final displacement is qualified.
 pub(super) fn release(app: &mut SolveApp) -> bool {
     let Some(gesture) = &mut app.forms_prototype.extrusion.gesture else { return false };
@@ -157,6 +220,7 @@ pub(super) fn release(app: &mut SolveApp) -> bool {
 /// Dropping the receiver invalidates any outstanding result. Undo only an edit
 /// this gesture installed, and only while its accepted source remains current.
 pub(super) fn cancel(app: &mut SolveApp) -> bool {
+    transform_feedback::clear(app);
     let Some(gesture) = app.forms_prototype.extrusion.gesture.take() else { return false };
     if gesture.accepted && gesture.source == Source::current(app) {
         run(app, "form.prototype.undo", json!({}));
@@ -164,6 +228,7 @@ pub(super) fn cancel(app: &mut SolveApp) -> bool {
     true
 }
 fn stale(app: &mut SolveApp) {
+    transform_feedback::clear(app);
     app.forms_prototype.extrusion.gesture = None;
     app.forms_prototype.drag = None;
     app.forms_prototype.gizmo_drag = None;
@@ -225,6 +290,29 @@ pub(super) fn tick(app: &mut SolveApp, ctx: &egui::Context) {
     poll(app);
     dispatch(app, ctx);
 }
+/// Await worker completion in tests without a wall-clock timing assertion or
+/// releasing the pointer gesture. Production always polls without blocking.
+#[cfg(test)]
+pub(super) fn flush_for_test(app: &mut SolveApp, ctx: &egui::Context) -> Result<(), String> {
+    for _ in 0..8 {
+        tick(app, ctx);
+        let Some(mut pending) = app.forms_prototype.extrusion.gesture.as_mut().and_then(|gesture| gesture.pending.take()) else {
+            return Ok(());
+        };
+        let result = pending.done.recv().map_err(|_| "extrusion test worker disconnected".to_owned())?;
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(result).map_err(|_| "extrusion test result receiver disconnected".to_owned())?;
+        pending.done = rx;
+        if let Some(gesture) = &mut app.forms_prototype.extrusion.gesture {
+            gesture.pending = Some(pending);
+        }
+        poll(app);
+        if app.forms_prototype.extrusion.gesture.as_ref().is_none_or(|gesture| gesture.settled == Some(gesture.sequence)) {
+            return Ok(());
+        }
+    }
+    Err("extrusion test did not settle its current target".into())
+}
 fn poll(app: &mut SolveApp) {
     let Some(mut gesture) = app.forms_prototype.extrusion.gesture.take() else { return };
     if gesture.source != Source::current(app) {
@@ -270,7 +358,11 @@ fn poll(app: &mut SolveApp) {
                     app.forms_prototype.selected = app.forms_prototype.elements.iter().flat_map(|e| e.vertices(&form.logical)).collect();
                 }
             }
-            Err(error) => app.set_status(error, true),
+            Err(error) => {
+                gesture.readout_failed = true;
+                transform_feedback::clear(app);
+                app.set_status(error, true);
+            }
         }
     }
     if gesture.released && gesture.pending.is_none() && gesture.settled == Some(gesture.sequence) {
@@ -292,8 +384,21 @@ fn dispatch(app: &mut SolveApp, ctx: &egui::Context) {
         return;
     }
     let sequence = gesture.sequence;
+    let axis = gesture.axis;
     let mut parameters = gesture.parameters.clone();
     parameters["checkpoint"] = json!(!gesture.accepted);
+    #[cfg(not(target_arch = "wasm32"))]
+    let permit = {
+        #[cfg(test)]
+        let gate = app.forms_prototype.extrusion.worker_gate.clone();
+        #[cfg(not(test))]
+        let gate = worker_gate();
+        let Some(permit) = WorkerPermit::acquire(gate) else {
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+            return;
+        };
+        permit
+    };
     let copy = app.session.scratch();
     let prepare_preview = app.preferences.forms_mesh_while_dragging && !gesture.preview_attempted;
     if prepare_preview {
@@ -306,18 +411,24 @@ fn dispatch(app: &mut SolveApp, ctx: &egui::Context) {
     {
         let wake = ctx.clone();
         if let Err(error) = std::thread::Builder::new().name("form-extrusion".into()).spawn(move || {
+            // Closing or replacing an editor may drop its receiver, but it
+            // cannot permit another expensive native solve until this exits.
+            let _permit = permit;
             if prepare_preview {
                 let preview = (|| {
                     let args: solidcraft_engine::schema::forms_prototype::ExtrudeDrag =
                         serde_json::from_value(preview_parameters).map_err(|e| e.to_string())?;
                     let form = copy.forms_prototype.as_ref().ok_or_else(|| "No Form remains for extrusion feedback".to_owned())?;
-                    form.prepare_extrusion_preview(
-                        &args.faces,
-                        &args.edges,
-                        Vec3::new(args.displacement[0], args.displacement[1], args.displacement[2]),
-                        args.checkpoint,
-                    )
-                    .map_err(|e| e.to_string())
+                    let displacement = Vec3::new(args.displacement[0], args.displacement[1], args.displacement[2]);
+                    let (faces, edges) = (&args.faces, &args.edges);
+                    let response = if !args.surface {
+                        form.prepare_extrusion_preview(faces, edges, displacement, args.checkpoint)
+                    } else if let Some(axis) = axis {
+                        form.prepare_surface_extrusion_preview_on_axis(faces, edges, displacement, args.checkpoint, axis)
+                    } else {
+                        form.prepare_surface_extrusion_preview(faces, edges, displacement, args.checkpoint)
+                    };
+                    response.map_err(|e| e.to_string())
                 })();
                 let _ = preview_tx.send(preview);
                 wake.request_repaint();
@@ -328,14 +439,16 @@ fn dispatch(app: &mut SolveApp, ctx: &egui::Context) {
         }) {
             if let Some(gesture) = &mut app.forms_prototype.extrusion.gesture {
                 gesture.settled = Some(sequence);
+                gesture.readout_failed = true;
             }
+            transform_feedback::clear(app);
             app.set_status(error.to_string(), true);
             return;
         }
     }
     #[cfg(target_arch = "wasm32")]
     {
-        let _ = (prepare_preview, preview_parameters, preview_tx);
+        let _ = (prepare_preview, preview_parameters, preview_tx, axis);
         let result = copy.compute_commands(&[("form.prototype.extrude_drag".into(), parameters)], None).map_err(|e| e.to_string());
         let _ = tx.send(result);
         ctx.request_repaint();
@@ -376,6 +489,186 @@ pub(super) fn scene_submitted(app: &mut SolveApp, proj: &Proj) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn extrusion_stamp_ignores_display_history_and_saved_document_comparison_but_pins_document_identity() {
+        let mut document = solidcraft_engine::doc::Document::new("Source stamp fixture");
+        document.params.extend((0..1000).map(|i| serde_json::from_value(json!({"name":format!("p{i}"),"expr":"1 mm","unit":"mm"})).unwrap()));
+        let mut app = SolveApp::new(Default::default(), Default::default());
+        app.session = solidcraft_engine::Session::new(document);
+        app.session.execute("form.prototype.create", &json!({"primitive":"face","segments":[2,2,1],"levels":0})).unwrap();
+        for step in 1..=64 {
+            let p = app.session.forms_prototype.as_ref().unwrap().cage.points[0];
+            app.session.execute("form.prototype.set_vertices", &json!({"vertices":[0],"positions":[[p.x,p.y+f64::from(step)*0.0001,p.z]]})).unwrap();
+        }
+        // Change the unsaved document without refreshing the model. Capturing
+        // an extrusion stamp must not walk either document or evaluate it.
+        std::sync::Arc::make_mut(&mut app.session.doc).params.last_mut().unwrap().expr = "2 mm".into();
+        let document = app.session.doc.clone();
+        let model = app.session.model.state();
+        let before = app.session.forms_prototype.as_ref().unwrap().inspect();
+        assert_eq!(before["undo"], 64);
+        let recovery = solidcraft_engine::recovery::capture_bytes(&app.session).unwrap();
+        let source = Source::current(&app);
+        let surface = std::sync::Arc::make_mut(&mut app.session.forms_prototype.as_mut().unwrap().surface);
+        surface.mesh.positions.extend(std::iter::repeat_n(Vec3::ZERO, 100_000));
+        for _ in 0..128 {
+            assert!(Source::current(&app) == source);
+        }
+        assert!(std::sync::Arc::ptr_eq(&document, &app.session.doc));
+        assert!(std::sync::Arc::ptr_eq(&model, &app.session.model.state()));
+        assert_eq!(app.session.forms_prototype.as_ref().unwrap().inspect(), before);
+        assert_eq!(solidcraft_engine::recovery::capture_bytes(&app.session).unwrap(), recovery);
+
+        // An equal-looking replacement is still a different captured design;
+        // autosave's boolean dirty state and all public counters stay equal.
+        let old_recovery_key = solidcraft_engine::recovery::form_revision(&app.session);
+        app.session.doc = std::sync::Arc::new((*app.session.doc).clone());
+        assert_eq!(solidcraft_engine::recovery::form_revision(&app.session), old_recovery_key);
+        assert!(Source::current(&app) != source);
+    }
+    #[test]
+    fn extrusion_stamp_fences_restored_finish_options_context_parts_tool_and_editor_replacement() {
+        let mut app = SolveApp::new(Default::default(), Default::default());
+        app.session.execute("form.prototype.create", &json!({"primitive":"face","segments":[2,2,1],"levels":0})).unwrap();
+        app.session.execute("form.prototype.finish_options", &json!({"tolerance":"0.01 mm"})).unwrap();
+        let source = Source::current(&app);
+        let definition_identity = app.session.forms_prototype.as_ref().unwrap().source_revision();
+        let revision = app.session.authoring_revision();
+        app.session.execute("form.prototype.finish_options", &json!({"tolerance":"0.02 mm"})).unwrap();
+        app.session.execute("form.prototype.finish_options", &json!({"tolerance":"0.01 mm"})).unwrap();
+        assert_eq!(app.session.forms_prototype.as_ref().unwrap().source_revision(), definition_identity);
+        assert_eq!(app.session.authoring_revision(), revision);
+        assert!(Source::current(&app) != source, "changing then restoring Finish options still invalidates an outstanding result");
+        assert!(source.stamp.as_ref().unwrap().same_definition(Source::current(&app).stamp.as_ref().unwrap()));
+        let current = Source::current(&app);
+        app.session.pending_moves.insert(23, solidcraft_engine::doc::rigid(Vec3::X, Vec3::ZERO, Vec3::Z, 0.0));
+        assert!(Source::current(&app) != current);
+        app.session.pending_moves.clear();
+        assert!(Source::current(&app) == current);
+        let definition = std::sync::Arc::new(app.session.forms_prototype.as_ref().unwrap().definition());
+        app.session
+            .forms_prototype
+            .as_mut()
+            .unwrap()
+            .parts
+            .insert(17, solidcraft_engine::forms_prototype::Part { name: "Staged".into(), definition: definition.clone() });
+        assert!(Source::current(&app) != current);
+        let staged = Source::current(&app);
+        app.session.forms_prototype.as_mut().unwrap().parts.get_mut(&17).unwrap().definition = std::sync::Arc::new((*definition).clone());
+        assert!(Source::current(&app) != staged, "same-looking staged replacement must not inherit a pending result");
+        app.session.forms_prototype.as_mut().unwrap().parts.clear();
+        let current = Source::current(&app);
+        app.session.execute("form.prototype.tool.begin", &json!({})).unwrap();
+        assert!(Source::current(&app) != current);
+        app.session.execute("form.prototype.tool.cancel", &json!({})).unwrap();
+        let current = Source::current(&app);
+        app.session.execute("form.prototype.close", &json!({})).unwrap();
+        app.session.execute("form.prototype.create", &json!({"primitive":"face","segments":[2,2,1],"levels":0})).unwrap();
+        assert!(Source::current(&app) != current);
+        let current = Source::current(&app);
+        app.session.uid = app.session.uid.wrapping_add(1);
+        assert!(Source::current(&app) != current);
+    }
+
+    #[test]
+    fn evaluated_surface_targets_queue_for_unmatched_and_whole_plane_forms() {
+        for spans in [1, 2] {
+            let mut app = SolveApp::new(Default::default(), Default::default());
+            app.session
+                .execute("form.prototype.create", &json!({"primitive":"face","dimensions":[12,12,1],"segments":[spans,spans,1],"levels":1}))
+                .unwrap();
+            let source = app.session.forms_prototype.as_ref().unwrap().definition();
+            let points: Vec<_> = app.session.forms_prototype.as_ref().unwrap().logical.faces[0]
+                .iter()
+                .map(|&id| app.session.forms_prototype.as_ref().unwrap().surface.vertices[id])
+                .collect();
+            let undo = app.session.forms_prototype.as_ref().unwrap().inspect()["undo"].as_u64().unwrap();
+            let ctx = egui::Context::default();
+            for (target, finish) in [(2.0, false), (4.0, true)] {
+                assert!(command(&mut app, json!({"surface":true,"faces":[0],"displacement":[0,0,target]}), Some(Vec3::Z)));
+                if target == 2.0 {
+                    assert_eq!(app.session.forms_prototype.as_ref().unwrap().definition(), source, "pointer input cannot run the inverse solve");
+                }
+                if finish {
+                    assert!(release(&mut app));
+                }
+                flush_for_test(&mut app, &ctx).unwrap();
+                let form = app.session.forms_prototype.as_ref().unwrap();
+                for (&id, &point) in form.logical.faces[0].iter().zip(&points) {
+                    assert!(form.surface.vertices[id].dist(point + Vec3::Z * target) < 1e-7, "{:?}", app.status);
+                }
+                assert_eq!(form.cage.faces.len(), source.cage.faces.len() + 4);
+                assert_eq!(form.inspect()["undo"].as_u64(), Some(undo + 1));
+                assert_eq!(active(&app), !finish);
+            }
+            app.session.execute("form.prototype.undo", &json!({})).unwrap();
+            assert_eq!(app.session.forms_prototype.as_ref().unwrap().definition(), source);
+        }
+    }
+    #[test]
+    fn a_changed_selection_or_surface_mode_invalidates_pending_topology_and_feedback() {
+        for changed in [
+            json!({"surface":true,"faces":[1],"displacement":[0,0,1]}),
+            json!({"surface":true,"edges":[[0,1]],"displacement":[0,0,1]}),
+            json!({"surface":false,"faces":[0],"displacement":[0,0,1]}),
+        ] {
+            let mut app = SolveApp::new(Default::default(), Default::default());
+            app.session.execute("form.prototype.create", &json!({"primitive":"face","segments":[2,2,1],"levels":1})).unwrap();
+            let source = app.session.forms_prototype.as_ref().unwrap().inspect();
+            let recovery = solidcraft_engine::recovery::capture_bytes(&app.session).unwrap();
+            assert!(command(&mut app, json!({"surface":true,"faces":[0],"displacement":[0,0,0.2]}), None));
+            ready(&mut app);
+            let response = app.session.forms_prototype.as_ref().unwrap().prepare_surface_extrusion_preview(&[0], &[], Vec3::Z * 0.2, true).unwrap();
+            app.forms_prototype.extrusion.gesture.as_mut().unwrap().response = Some(response);
+            assert!(!command(&mut app, changed, None));
+            poll(&mut app);
+            assert!(!active(&app));
+            assert!(preview(&app).is_none());
+            assert_eq!(app.session.forms_prototype.as_ref().unwrap().inspect(), source);
+            assert_eq!(solidcraft_engine::recovery::capture_bytes(&app.session).unwrap(), recovery);
+        }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn abandoned_native_work_holds_its_permit_across_editor_reset_until_completion() {
+        let gate = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let permit = WorkerPermit::acquire(gate.clone()).unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finish_tx, finish_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _permit = permit;
+            started_tx.send(()).unwrap();
+            finish_rx.recv().unwrap();
+        });
+        started_rx.recv().unwrap();
+        let mut app = SolveApp::new(Default::default(), Default::default());
+        app.session.execute("form.prototype.create", &json!({"primitive":"face","segments":[1,1,1],"levels":1})).unwrap();
+        let source = app.session.forms_prototype.as_ref().unwrap().definition();
+        let ctx = egui::Context::default();
+        for _ in 0..2 {
+            app.forms_prototype.extrusion = State { worker_gate: gate.clone(), ..Default::default() };
+            assert!(command(&mut app, json!({"surface":true,"faces":[0],"displacement":[0,0,2]}), None));
+            tick(&mut app, &ctx);
+            assert!(active(&app));
+            assert!(app.forms_prototype.extrusion.gesture.as_ref().unwrap().pending.is_none());
+            assert_eq!(app.session.forms_prototype.as_ref().unwrap().definition(), source);
+        }
+        finish_tx.send(()).unwrap();
+        worker.join().unwrap();
+        flush_for_test(&mut app, &ctx).unwrap();
+        assert!(app.forms_prototype.extrusion.gesture.as_ref().unwrap().accepted);
+        assert!(cancel(&mut app));
+        assert_eq!(app.session.forms_prototype.as_ref().unwrap().definition(), source);
+        // A failed worker also releases the resource through RAII unwinding.
+        let gate_for_worker = gate.clone();
+        let failed = std::thread::spawn(move || {
+            let _permit = WorkerPermit::acquire(gate_for_worker).unwrap();
+            panic!("injected extrusion worker failure");
+        });
+        assert!(failed.join().is_err());
+        assert!(WorkerPermit::acquire(gate).is_some());
+    }
+
     fn matched() -> (SolveApp, usize) {
         let mut app = SolveApp::new(Default::default(), Default::default());
         app.session.execute("solid.box", &json!({"length":8,"width":8,"height":1,"corner":[-4,-4,-1],"body_name":"Support"})).unwrap();
@@ -390,7 +683,7 @@ mod tests {
         (app, face)
     }
     fn request(app: &mut SolveApp, face: usize, z: f64) {
-        assert!(command(app, json!({"faces":[face],"edges":[],"displacement":[0,0,z],"checkpoint":false})));
+        assert!(command(app, json!({"faces":[face],"edges":[],"displacement":[0,0,z],"checkpoint":false}), None));
     }
     fn ready(app: &mut SolveApp) {
         let gesture = app.forms_prototype.extrusion.gesture.as_ref().unwrap();
@@ -521,6 +814,7 @@ mod tests {
         // The worker's adoption and selection contract is independent of the solver.
         app.forms_prototype.extrusion.gesture = Some(Gesture {
             response: None,
+            axis: None,
             feedback: None,
             feedback_error: None,
             preview_attempted: false,
@@ -529,6 +823,7 @@ mod tests {
             sequence: 0,
             settled: None,
             accepted: false,
+            readout_failed: false,
             released: true,
             pending: None,
         });

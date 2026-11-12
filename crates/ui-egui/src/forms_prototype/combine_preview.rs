@@ -66,7 +66,7 @@ fn compute(mut scratch: Session, params: &serde_json::Value) -> Result<Preview, 
         if triangles > 2_000_000 || edges > 8_000_000 {
             return Err("combined preview exceeds its display geometry budget".into());
         }
-        entries.push(context::Entry { name: Some(body.name), index: None, mesh, color: body.body.color() });
+        entries.push(context::Entry { name: Some(body.name), index: None, mesh, color: body.body.color(), exact: None, detached_companion: false });
     }
     Ok(Preview { replaced, entries })
 }
@@ -181,8 +181,14 @@ mod tests {
             "the actual opaque Boolean result is genuinely ahead of this authored cutter handle, not a coincident own-skin hit"
         );
         let base = app.session.world_state().unwrap().body("Base").unwrap().mesh();
-        app.forms_prototype.context.entries =
-            vec![context::Entry { name: Some("Base".into()), index: Some(solidcraft_engine::geom::MeshIndex::new(&base)), mesh: base, color: None }];
+        app.forms_prototype.context.entries = vec![context::Entry {
+            name: Some("Base".into()),
+            index: Some(Arc::new(solidcraft_engine::geom::MeshIndex::new(&base))),
+            mesh: base,
+            color: None,
+            exact: None,
+            detached_companion: false,
+        }];
         assert!(
             context::occludes(&app, origin, direction, depth),
             "the ordinary opaque Base would block this handle without the Boolean editing exception"
@@ -197,7 +203,7 @@ mod tests {
         let _ = crate::test_support::frame(&ctx, egui::RawInput { screen_rect: Some(projection.rect), ..Default::default() }, |ui| {
             surface::overlay(&mut app, ui, &projection)
         });
-        assert!(app.forms_prototype.projected.iter().any(|&(vertex, _)| vertex == id));
+        assert!(app.forms_prototype.projected.iter().any(|&(vertex, _, _)| vertex == id));
         assert!(Arc::ptr_eq(&document, &app.session.doc));
         assert_eq!(app.session.forms_prototype.as_ref().unwrap().definition(), definition);
     }

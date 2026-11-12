@@ -118,10 +118,93 @@ pub fn run_api(site: &str) -> Result<(), String> {
         std::thread::sleep(Duration::from_millis(100));
     }
     println!("web-api-test: {result}");
+    let form_check = cdp.eval(FORM_CHECK_TEST)?;
+    println!("web-api-test: {form_check}");
     let keys = cdp.eval(KEYS_TEST)?;
     println!("web-api-test: {keys}");
     Ok(())
 }
+
+// Drive the normal Form panel and hold one *real worker reply* to make
+// supersession deterministic without depending on the time spent fitting.
+const FORM_CHECK_TEST: &str = r#"(async () => {
+    const app = window.solidcraft;
+    const Worker = window.Worker;
+    let hold = false;
+    let withheld;
+    let completed = 0;
+    window.Worker = class extends Worker {
+        constructor(...args) {
+            super(...args);
+            this.addEventListener('message', event => {
+                if (!event.isTrusted || !(event.data instanceof Uint8Array) || event.data[4] !== 2) return;
+                completed++;
+                if (hold) {
+                    event.stopImmediatePropagation();
+                    withheld = [this, event.data];
+                }
+            }, {capture: true});
+        }
+    };
+    const inspect = async () => (await app.request('ui.inspect')).forms_prototype.diagnostics;
+    const wait = async (read, done, label) => {
+        const deadline = performance.now() + 60000;
+        do {
+            const value = await read();
+            if (done(value)) return value;
+        } while (performance.now() < deadline);
+        throw new Error(label);
+    };
+    const create = async () => {
+        await app.execute('form.prototype.create', {primitive:'face', segments:[1,1,1], levels:0});
+        await app.execute('form.prototype.refine', {faces:[0], counts:[2,2]});
+    };
+    const openCheck = async () => {
+        const handles = await wait(
+            () => app.request('ui.handles', {prefix:'forms_check_cad'}),
+            values => values.some(h => h.name === 'forms_check_cad'),
+            'Form CAD check button did not appear',
+        );
+        const {x, y} = handles.find(h => h.name === 'forms_check_cad');
+        await app.request('ui.click', {x, y});
+    };
+    const current = () => wait(inspect, value => !value.pending && (value.report || value.error), 'Form CAD check did not settle');
+    try {
+        await app.request('ui.prefs', {forms_compact_editor:false, forms_cad_tolerance:0.05});
+        await app.execute('file.new');
+        await create();
+        const source = JSON.stringify(await app.execute('form.prototype.inspect'));
+        const canonical = await app.execute('form.prototype.validate', {tolerance:0.05});
+        await openCheck();
+        const checked = await current();
+        if (checked.error || completed !== 1 || JSON.stringify(checked.report) !== JSON.stringify(canonical)) {
+            throw new Error('Form browser worker disagreed with the canonical check: ' + JSON.stringify(checked));
+        }
+        if (JSON.stringify(await app.execute('form.prototype.inspect')) !== source) {
+            throw new Error('browser CAD check changed the Form source/history');
+        }
+        hold = true;
+        await openCheck();
+        await wait(async () => { await inspect(); return withheld; }, Boolean, 'expected a withheld worker reply');
+        if (!(await inspect()).pending) throw new Error('withheld check is not pending');
+        await app.execute('file.new');
+        await create(); // same parameters, new document and draft identities
+        await inspect();
+        hold = false;
+        withheld[0].dispatchEvent(new MessageEvent('message', {data:withheld[1]}));
+        for (let frame = 0; frame < 4; frame++) {
+            const state = await inspect();
+            if (state.report || state.error || state.pending) throw new Error('stale worker reply reached the replacement Form');
+        }
+        await openCheck();
+        const replacement = await current();
+        if (replacement.error || completed !== 3 || !replacement.report) throw new Error('replacement check did not acquire the drained worker');
+        return 'Refined Form CAD worker result, read-only source and stale-reply drain passed';
+    } finally {
+        window.Worker = Worker;
+        await app.execute('file.new');
+    }
+})()"#;
 
 /// The browser's own tab switching keys reach it while the app has the keyboard (#5227): their
 /// default action isn't cancelled, while Tab's is (the app moves between its fields with it).

@@ -1,5 +1,7 @@
 //! Editable Forms sessions, surface edits and persistent CAD feature creation.
 use super::CommandSpec;
+#[cfg(test)]
+use crate::forms_prototype::validation::validity_checks;
 use crate::schema::{TypedContract, forms_prototype as params, output_schema_for};
 use crate::{EngineError, Result, Session};
 use serde_json::{Value, json};
@@ -8,6 +10,7 @@ use solidcraft_geom::prelude::*;
 
 mod blend;
 mod pipe;
+mod refined_weld;
 mod weld_references;
 
 const CREATE: TypedContract<params::Create> = TypedContract::new();
@@ -18,6 +21,7 @@ const QUALITY: TypedContract<params::Quality> = TypedContract::new();
 const EMPTY: TypedContract<params::Empty> = TypedContract::new();
 const COMMIT: TypedContract<params::Commit> = TypedContract::new();
 const FINISH_OPTIONS: TypedContract<params::FinishOptions> = TypedContract::new();
+const VALIDATE: TypedContract<params::Validate> = TypedContract::new();
 const EDIT: TypedContract<params::Edit> = TypedContract::new();
 const TOPOLOGY: TypedContract<params::Topology> = TypedContract::new();
 const SYMMETRY: TypedContract<params::Symmetry> = TypedContract::new();
@@ -30,6 +34,8 @@ const EXTRUDE_DRAG: TypedContract<params::ExtrudeDrag> = TypedContract::new();
 const TRANSFORM: TypedContract<params::Transform> = TypedContract::new();
 const UNWELD: TypedContract<params::Unweld> = TypedContract::new();
 const WELD: TypedContract<params::Weld> = TypedContract::new();
+const REFINED_WELD: TypedContract<params::RefinedWeld> = TypedContract::new();
+const REMOVE_REFINED_WELD: TypedContract<params::RemoveRefinedWeld> = TypedContract::new();
 const MATCH: TypedContract<params::Match> = TypedContract::new();
 const SURFACE: TypedContract<params::Surface> = TypedContract::new();
 const PIPE: TypedContract<params::Pipe> = TypedContract::new();
@@ -54,10 +60,16 @@ pub static COMMANDS: &[CommandSpec] = &[
         .params("body and exactly one of face or closed edges; edge: a free Form boundary edge; order?:0,1,2. Match exact CAD support with persistent references. Tolerances: position_mm?.001, tangent_deg?.1, curvature_relative?.01; tolerance?: fitted CAD mm (.01)."),
     CommandSpec::new("form.prototype.unweld","Unweld Form",crate::checked!("form.prototype.unweld",unweld)).icon("edit")
         .noundo().doc_only().contract(&UNWELD).output(output_schema_for::<params::Reply>)
-        .params("edges: separating interior seam; separate?: true; name?. Stage independent open Forms, or keep their disjoint cages together. Finish creates the staged objects; Cancel restores the document unchanged."),
+        .params("edges: one separating interior seam; separate?: true; name?. Refined Unweld retains both source hierarchies and requires separate Forms. Base cages may stay in one disjoint Form. Finish publishes both pieces; Cancel restores the source."),
     CommandSpec::new("form.prototype.weld","Weld Forms",crate::checked!("form.prototype.weld",weld)).icon("edit")
         .noundo().doc_only().contract(&WELD).output(output_schema_for::<params::Reply>)
         .params("other: {kind:draft,part} or {kind:feature,feature}; first_edge,second_edge. Identify equal free openings, opposite winding, midpoint controls, maximum sharpness. The second object is consumed only on Finish; Cancel and undo restore it."),
+    CommandSpec::new("form.refined_weld", "Weld Refined Forms", crate::checked!("form.refined_weld",refined_weld::author)).icon("edit")
+        .doc_only().contract(&REFINED_WELD).output(output_schema_for::<crate::schema::features::FeatureResult>)
+        .params("features: two saved independent Form feature IDs; edges?: one directed free logical edge per Form, omit to align the only two openings; name?. Adds one qualified seam retaining both editable sources."),
+    CommandSpec::new("form.refined_weld.remove", "Remove Refined Form Weld", crate::checked!("form.refined_weld.remove",refined_weld::remove)).icon("edit")
+        .doc_only().contract(&REMOVE_REFINED_WELD).output(output_schema_for::<params::RemovedRefinedWeld>)
+        .params("feature: refined Weld feature ID. Removes the seam as one undoable edit and restores both source bodies when the result has no dependent features."),
     CommandSpec::new("form.prototype.transform","Place Form",crate::checked!("form.prototype.transform",transform)).icon("move")
         .noundo().doc_only().contract(&TRANSFORM).output(output_schema_for::<params::Reply>)
         .params("matrix: proper rigid column-major 4x4 relative world transform; checkpoint?: true. Changes placement while retaining local controls, hierarchy and symmetry."),
@@ -73,7 +85,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         .noundo().doc_only().contract(&EMPTY).output(output_schema_for::<params::Reply>),
     CommandSpec::new("form.prototype.insert_loop","Insert Form Edge Loop",crate::checked!("form.prototype.insert_loop",insert_loop)).icon("edit")
         .noundo().doc_only().contract(&INSERT_LOOP).output(output_schema_for::<params::Reply>)
-        .params("edge: [a,b]; fraction?: 0..1 (0.5). Insert a complete quad edge ring in a base cage, preserving source sharpness."),
+        .params("Use edge: [a,b] and fraction?: interior 0..1 (0.5), or face: active hierarchical leaf and axis: U=0/V=1 for its midpoint. tolerance?: hierarchical CAD fit tolerance in mm. Insert an edge ring or open strip. Compatible mirrored strips retain source details. Mixed-depth cuts follow exact aligned stations and existing fine seams; arbitrary mixed-depth fractions and conflicting mirror cuts remain unsupported."),
     CommandSpec::new("form.prototype.refine", "Refine Form Faces", crate::checked!("form.prototype.refine", refine)).icon("edit")
         .noundo().doc_only().contract(&REFINE).output(output_schema_for::<params::Reply>)
         .params("faces: active logical IDs; counts?: [U,V], powers of two 1..16. Shape-preserving local leaves over nested uniform evaluation and sparse hierarchical detail."),
@@ -85,7 +97,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         .params("points: [{edge:[a,b],fraction:0..1}], ordered chain on opposite logical face sides. Fractions start at the lower vertex ID on exact fitted CAD source curves, not arc length. tolerance?: active/saved Finish tolerance (0.01 mm). One undoable topology edit."),
     CommandSpec::new("form.prototype.extrude_drag", "Extrude Form by Dragging", crate::checked!("form.prototype.extrude_drag", extrude_drag)).icon("edit")
         .noundo().doc_only().contract(&EXTRUDE_DRAG).output(output_schema_for::<params::Reply>)
-        .params("faces? or boundary edges?; displacement:[x,y,z] mm; checkpoint?:true. Later gesture frames use false and displacement from the original source. One undo step."),
+        .params("faces? or boundary edges?; displacement:[x,y,z] mm; checkpoint?:true; surface?:false. Surface mode targets the original evaluated cap points plus displacement; the default moves raw cap controls. Later gesture frames use false and displacement from the original source. One undo step."),
     CommandSpec::new("form.prototype.project", "Straighten or Flatten Form", crate::checked!("form.prototype.project", project)).icon("edit")
         .noundo().doc_only().contract(&PROJECT).output(output_schema_for::<params::Reply>)
         .params("tool: straighten|flatten; vertices: distinct indices; points?: surface|control; direction?: line direction or plane normal; origin?: mm. Omitted direction uses least-squares fitting; omitted origin uses the centroid. One undoable edit, no reference association."),
@@ -97,9 +109,12 @@ pub static COMMANDS: &[CommandSpec] = &[
         .params("dimensions?: [x,y,z] mm; segments?: [x,y,z]; radii?: [major,minor] or [outer,inner]; path?: [[x,y,z]] mm. Dimension changes preserve sculpted controls and target exact local CAD extents; tolerance?: fitting/qualification mm (Finish tolerance by default). Topology changes currently require an unedited primitive."),
     CommandSpec::new("form.prototype.topology", "Edit Form Topology", crate::checked!("form.prototype.topology", topology)).icon("edit")
         .noundo().doc_only().contract(&TOPOLOGY).output(output_schema_for::<params::Reply>)
-        .params("tool: extrude_faces|extrude_edges|delete_faces|dissolve|fill_hole|bridge|weld|unweld|thicken|subdivide; faces?, edges?, vertices?, displacement?, distance?. Atomic validated topology edit."),
+        .params("tool: extrude_faces|extrude_edges|delete_faces|dissolve|erase_and_fill|fill_hole|bridge|weld|unweld|thicken|subdivide|crease|uncrease; faces?, edges?, vertices?, displacement?, distance?. Crease uses distance as sharpness 0..10. Refined Fill accepts fill_mode: automatic|single|new_cap. Delete a derived cap by its sole face ID. Refined Fill, Erase and Fill and cap deletion accept tolerance? in mm. Atomic validated topology edit."),
     CommandSpec::new("form.prototype.commit","Finish Form",crate::checked!("form.prototype.commit",commit)).icon("finish").contract(&COMMIT).output(output_schema_for::<Value>)
         .params("tolerance?: mm; operation?: new|join|cut|intersect; targets?: body names; name?. Uses staged Finish options when omitted. Fit and sew CAD patches and save the editable Form feature."),
+    CommandSpec::new("form.prototype.validate", "Check Form CAD", crate::checked!("form.prototype.validate", validate)).icon("inspect")
+        .noundo().contract(&VALIDATE).output(output_schema_for::<params::ValidationReply>)
+        .params("tolerance?: active/saved Finish tolerance, 0.01 mm by default. Read-only checks of the active fitted Form before Finish booleans; staged Forms are counted but not checked. Reports sampled-fit metrics, conversion stage, shape kind, and separate record/SMLib passed, failed, not-supported or not-run coverage. Does not change Finish acceptance policy."),
     CommandSpec::new("form.prototype.finish_options","Form Finish Options",crate::checked!("form.prototype.finish_options",finish_options)).icon("edit")
         .noundo().doc_only().contract(&FINISH_OPTIONS).output(output_schema_for::<params::FinishOptions>)
         .params("tolerance?: CAD fitting expression in mm; operation?: new|join|cut|intersect. Stages output settings in the active Form without committing it."),
@@ -162,12 +177,7 @@ fn parse<T: serde::de::DeserializeOwned>(p: &Value) -> Result<T> {
 }
 fn form(s: &mut Session) -> Result<&mut crate::forms_prototype::Form> {
     let f = raw_form(s)?;
-    if f.tool_original.is_some() {
-        return Err(EngineError::Other("apply or cancel the active Form tool first".into()));
-    }
-    if f.repair.is_some() {
-        return Err(EngineError::Other("reattach the retained Form support and Apply, or Cancel".into()));
-    }
+    f.require_editable()?;
     Ok(f)
 }
 fn raw_form(s: &mut Session) -> Result<&mut crate::forms_prototype::Form> {
@@ -272,6 +282,9 @@ fn create(s: &mut Session, p: &Value) -> Result<Value> {
     }
     if s.forms_prototype.as_ref().is_some_and(|f| f.tool_original.is_some()) {
         return Err(EngineError::Other("apply or cancel the active Form tool first".into()));
+    }
+    if s.forms_prototype.as_ref().and_then(|form| form.editing_feature).is_some_and(|id| refined_weld::attached(&s.doc, id)) {
+        return Err(EngineError::Other("remove the refined Weld before replacing its Form source".into()));
     }
     let p: params::Create = parse(p)?;
     if s.active_sketch.is_some() {
@@ -400,6 +413,12 @@ fn matching_with_mode(s: &mut Session, p: &Value, retained: bool) -> Result<Valu
     } else {
         form(s)?.definition()
     };
+    if definition.hierarchy.as_ref().is_some_and(|h| h.has_quad_cap()) {
+        return Err(EngineError::Other("Match on a Form with a derived cap is not supported yet".into()));
+    }
+    if definition.hierarchy.as_ref().is_some_and(|h| h.has_boundary_collapse()) {
+        return Err(EngineError::Other("Match requires an untrimmed Form before Collapse".into()));
+    }
     let state = match_state(s)?;
     let body = state.body(&args.body).ok_or_else(|| EngineError::Other("Match support body is missing or follows the edited Form".into()))?;
     let source = match (args.face, args.edges) {
@@ -503,7 +522,8 @@ fn refine_form(s: &mut Session, edit: impl FnOnce(&mut crate::forms_prototype::F
         let state = match_state(s)?;
         form(s)?.refine_with_match(&state, edit)?;
     } else {
-        edit(form(s)?)?;
+        let tolerance = crate::forms_prototype::collapse_tolerance(s)?;
+        edit_with_collapse_fit(form(s)?, tolerance, edit)?;
     }
     Ok(form(s)?.inspect())
 }
@@ -520,17 +540,47 @@ fn insert_points(s: &mut Session, p: &Value) -> Result<Value> {
     let tolerance = active_tolerance(s, args.tolerance)?;
     let state = if s.forms_prototype.as_ref().is_some_and(|f| f.matching.is_some()) { Some(match_state(s)?) } else { None };
     let current = form(s)?;
-    current.insert_points(&points, state.as_ref(), tolerance)?;
+    edit_with_collapse_fit(current, Some(tolerance), |f| f.insert_points(&points, state.as_ref(), tolerance))?;
     Ok(current.inspect())
 }
 fn insert_loop(s: &mut Session, p: &Value) -> Result<Value> {
     let args: params::InsertLoop = parse(p)?;
+    if s.forms_prototype.as_ref().is_some_and(|f| f.hierarchy.is_some()) {
+        let requested = match &args {
+            params::InsertLoop::Edge(args) => args.tolerance,
+            params::InsertLoop::Face(args) => args.tolerance,
+        };
+        let tolerance = active_tolerance(s, requested)?;
+        let state = if s.forms_prototype.as_ref().is_some_and(|f| f.matching.is_some()) { Some(match_state(s)?) } else { None };
+        let f = form(s)?;
+        edit_with_collapse_fit(f, Some(tolerance), |f| match args {
+            params::InsertLoop::Edge(args) => f.insert_hierarchical_loop(args.edge, args.fraction, state.as_ref(), tolerance),
+            params::InsertLoop::Face(args) => f.insert_hierarchical_loop_from_leaf(args.face, args.axis, state.as_ref(), tolerance),
+        })?;
+        return Ok(f.inspect());
+    }
+    let params::InsertLoop::Edge(args) = args else { return Err(EngineError::Other("a face/axis loop requires a Form hierarchy".into())) };
+    if args.tolerance.is_some() {
+        active_tolerance(s, args.tolerance)?;
+    }
     let f = form(s)?;
     f.insert_loop(args.edge, args.fraction)?;
     Ok(f.inspect())
 }
 fn extrude_drag(s: &mut Session, p: &Value) -> Result<Value> {
     let args: params::ExtrudeDrag = parse(p)?;
+    if args.surface {
+        let state = if form(s)?.matching.is_some() { Some(match_state(s)?) } else { None };
+        let f = form(s)?;
+        f.extrude_surface_drag(
+            state.as_ref(),
+            &args.faces,
+            &args.edges,
+            solidcore_record::Vec3::new(args.displacement[0], args.displacement[1], args.displacement[2]),
+            args.checkpoint,
+        )?;
+        return Ok(f.inspect());
+    }
     if form(s)?.matching.is_some() {
         let state = match_state(s)?;
         let f = form(s)?;
@@ -555,6 +605,7 @@ fn extrude_drag(s: &mut Session, p: &Value) -> Result<Value> {
 fn project(s: &mut Session, p: &Value) -> Result<Value> {
     use crate::geom::subdivision::projection::{Projection, project};
     let args: params::Project = parse(p)?;
+    let tolerance = crate::forms_prototype::collapse_tolerance(s)?;
     let form = form(s)?;
     let controls;
     let source = match args.points {
@@ -586,12 +637,17 @@ fn project(s: &mut Session, p: &Value) -> Result<Value> {
         .into_iter()
         .map(|p| [p.x, p.y, p.z])
         .collect();
-    match args.points {
-        params::ProjectionPoints::Control => form.set(&args.vertices, &positions, true)?,
-        params::ProjectionPoints::Surface => form.set_surface(&args.vertices, &positions, true)?,
-    }
+    edit_with_collapse_fit(form, tolerance, |form| match args.points {
+        params::ProjectionPoints::Control => form.set(&args.vertices, &positions, true),
+        params::ProjectionPoints::Surface => form.set_surface(&args.vertices, &positions, true),
+    })?;
     Ok(form.inspect())
 }
+fn validate(s: &mut Session, p: &Value) -> Result<Value> {
+    let args: params::Validate = parse(p)?;
+    Ok(json!(crate::forms_prototype::validation::Input::capture(s)?.check(&args)?))
+}
+
 fn finish_options(s: &mut Session, p: &Value) -> Result<Value> {
     let update = crate::forms_prototype::checked_finish_options(parse(p)?)?;
     if let Some(tolerance) = &update.tolerance {
@@ -719,6 +775,13 @@ fn commit_in_author(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(EngineError::Other("object-level Unweld and Weld require standalone New Body Forms".into()));
     }
     let editing_feature = form.editing_feature;
+    let welded_source = editing_feature.filter(|&id| refined_weld::attached(&s.doc, id));
+    if let Some(id) = welded_source {
+        refined_weld::check_source_edit(&s.doc, id, &definition, operation)?;
+        if !form.parts.is_empty() || !form.consumed.is_empty() {
+            return Err(EngineError::Other("remove the refined Weld before staging other objects with its Form source".into()));
+        }
+    }
     let parts = form.parts.clone();
     let imported_name = form.imported.as_ref().map(|i| i.object.clone());
     let consumed = form.consumed.clone();
@@ -728,13 +791,16 @@ fn commit_in_author(s: &mut Session, p: &Value) -> Result<Value> {
         }
     }
     let references = weld_references::prepare(s, &consumed)?;
+    let refined_split = !parts.is_empty() && definition.hierarchy.as_ref().is_some_and(|h| h.has_detached_material());
+    let refined_collapse = editing_feature.is_some() && definition.hierarchy.as_ref().is_some_and(|h| h.has_boundary_collapse());
+    let fit_tolerance = args
+        .tolerance
+        .map(|v| format!("{v} mm").into())
+        .or_else(|| form.finish_options.tolerance.as_ref().map(|text| text.clone().into()))
+        .unwrap_or_else(|| previous.as_ref().map_or_else(|| "0.01 mm".into(), |p| p.0.clone()));
     let kind = crate::doc::FeatureKind::Form {
         definition: Box::new(definition),
-        tolerance: args
-            .tolerance
-            .map(|v| format!("{v} mm").into())
-            .or_else(|| form.finish_options.tolerance.as_ref().map(|text| text.clone().into()))
-            .unwrap_or_else(|| previous.as_ref().map_or_else(|| "0.01 mm".into(), |p| p.0.clone())),
+        tolerance: fit_tolerance.clone(),
         operation,
         targets: if p.get("targets").is_none() {
             previous.map(|p| p.2).unwrap_or_default()
@@ -747,7 +813,8 @@ fn commit_in_author(s: &mut Session, p: &Value) -> Result<Value> {
         .filter(|feature| form_attachment_changed(&feature.kind, &kind))
         .map(|feature| reattached_face_names(s, feature, &kind))
         .transpose()?;
-    let before_reattach = recaptured.as_ref().map(|_| (s.doc.clone(), s.model.clone()));
+    let before_replay =
+        (recaptured.is_some() || welded_source.is_some() || refined_split || refined_collapse).then(|| (s.doc.clone(), s.model.clone()));
     for &id in consumed.keys() {
         s.doc_mut().delete_feature(id)?;
     }
@@ -776,7 +843,11 @@ fn commit_in_author(s: &mut Session, p: &Value) -> Result<Value> {
     for part in parts.values() {
         let kind = crate::doc::FeatureKind::Form {
             definition: Box::new(part.definition.as_ref().clone()),
-            tolerance: args.tolerance.map_or_else(|| "0.01 mm".into(), |v| format!("{v} mm").into()),
+            tolerance: if part.definition.hierarchy.as_ref().is_some_and(|h| h.has_detached_material()) {
+                fit_tolerance.clone()
+            } else {
+                args.tolerance.map_or_else(|| "0.01 mm".into(), |v| format!("{v} mm").into())
+            },
             operation: crate::doc::Operation::NewBody,
             targets: Vec::new(),
         };
@@ -788,11 +859,20 @@ fn commit_in_author(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let joined = result.get("feature").and_then(Value::as_u64).ok_or_else(|| EngineError::Other("new Form did not return its identity".into()))?;
     references.apply(s, joined)?;
-    if let Some((document, model)) = before_reattach {
+    if let Some((document, model)) = before_replay {
         let broken = super::edit::newly_broken_in_history(&document, &model, &s.doc, &s.model);
         if !broken.is_empty() {
+            let operation = if refined_split {
+                "finishing refined Unweld"
+            } else if refined_collapse {
+                "finishing refined Collapse"
+            } else if welded_source.is_some() {
+                "finishing the welded Form"
+            } else {
+                "reattaching the Form"
+            };
             return Err(EngineError::Other(format!(
-                "reattaching the Form would break: {}",
+                "{operation} would break: {}",
                 broken.into_iter().map(|(name, error)| format!("{name}: {error}")).collect::<Vec<_>>().join("; ")
             )));
         }
@@ -802,6 +882,10 @@ fn commit_in_author(s: &mut Session, p: &Value) -> Result<Value> {
 }
 fn topology(s: &mut Session, p: &Value) -> Result<Value> {
     let mut args: params::Topology = parse(p)?;
+    let new_cap = matches!(&args.fill_mode, params::FillMode::NewCap);
+    if new_cap && args.tool != "fill_hole" {
+        return Err(EngineError::Other("New cap is a Fill Hole mode".into()));
+    }
     if matches!(args.tool.as_str(), "extrude_faces" | "extrude_edges") && form(s)?.matching.is_some() {
         let state = match_state(s)?;
         let form = form(s)?;
@@ -813,9 +897,66 @@ fn topology(s: &mut Session, p: &Value) -> Result<Value> {
         }
         return Ok(form.inspect());
     }
+    let hierarchy = s.forms_prototype.as_ref().and_then(|form| form.hierarchy.as_ref());
+    let deleting_cap = hierarchy.filter(|_| args.tool == "delete_faces").and_then(|h| args.faces.iter().copied().find(|&id| h.is_quad_cap_face(id)));
+    let refined_erase = args.tool == "erase_and_fill" && hierarchy.is_some();
+    let refined_collapse = args.tool == "weld" && hierarchy.is_some();
+    if hierarchy.is_some_and(|h| h.has_boundary_collapse())
+        && matches!(args.tool.as_str(), "bridge" | "thicken" | "unweld" | "erase_and_fill" | "fill_hole" | "extrude_faces" | "extrude_edges")
+    {
+        return Err(EngineError::Other("this topology tool requires an untrimmed Form before Collapse".into()));
+    }
+    let qualified_tolerance = (deleting_cap.is_some() || refined_erase || refined_collapse || (args.tool == "fill_hole" && hierarchy.is_some()))
+        .then(|| active_tolerance(s, args.tolerance))
+        .transpose()?;
+    let collapse_tolerance = crate::forms_prototype::collapse_tolerance(s)?;
     let form = form(s)?;
     if form.profile.is_some() {
         return Err(EngineError::Other("Form Surface keeps its fixed source boundary and guide grid".into()));
+    }
+    if refined_collapse {
+        let [first, second] = args.vertices.as_slice() else {
+            return Err(EngineError::Other("select exactly two endpoints of one free side".into()));
+        };
+        if !args.edges.is_empty() || !args.faces.is_empty() {
+            return Err(EngineError::Other("select only the two Collapse endpoints".into()));
+        }
+        let tolerance = qualified_tolerance.ok_or_else(|| EngineError::Other("missing refined Collapse tolerance".into()))?;
+        form.collapse_boundary([*first, *second], tolerance)?;
+        return Ok(form.inspect());
+    }
+    if let Some(cap) = deleting_cap {
+        if args.faces != [cap] || !args.edges.is_empty() || !args.vertices.is_empty() {
+            return Err(EngineError::Other("select only the quad cap face to delete it".into()));
+        }
+        let tolerance = qualified_tolerance.ok_or_else(|| EngineError::Other("missing quad cap removal tolerance".into()))?;
+        form.delete_logical_faces_at_tolerance(&[cap], tolerance)?;
+        return Ok(form.inspect());
+    }
+    if refined_erase {
+        if !args.edges.is_empty() || !args.vertices.is_empty() {
+            return Err(EngineError::Other("select only faces of one four-sided interior region to erase and fill".into()));
+        }
+        let tolerance = qualified_tolerance.ok_or_else(|| EngineError::Other("missing refined Erase and Fill tolerance".into()))?;
+        form.erase_and_fill_logical(&args.faces, tolerance)?;
+        return Ok(form.inspect());
+    }
+    if new_cap {
+        let tolerance = qualified_tolerance.ok_or_else(|| EngineError::Other("New cap requires a refined Form".into()))?;
+        if form.symmetry.is_some() || form.matching.is_some() {
+            return Err(EngineError::Other("New cap requires a Form without Match or symmetry".into()));
+        }
+        if !args.faces.is_empty()
+            || args.edges.len() > 256
+            || args.vertices.len() > 256
+            || args.edges.iter().any(|edge| edge[0] == edge[1])
+            || args.edges.iter().map(|&[a, b]| [a.min(b), a.max(b)]).collect::<std::collections::BTreeSet<_>>().len() != args.edges.len()
+            || args.vertices.iter().collect::<std::collections::BTreeSet<_>>().len() != args.vertices.len()
+        {
+            return Err(EngineError::Other("pick distinct edges or points on one four-sided opening for New cap".into()));
+        }
+        form.author_logical_cap(&args.edges, &args.vertices, tolerance)?;
+        return Ok(form.inspect());
     }
     let preserve_topology = form.hierarchy.is_some() || form.symmetry.is_some();
     if preserve_topology && matches!(args.tool.as_str(), "extrude_faces" | "extrude_edges") {
@@ -856,19 +997,32 @@ fn topology(s: &mut Session, p: &Value) -> Result<Value> {
     }
     args.faces = form.mirror_face_selection(&args.faces)?;
     if args.tool == "subdivide" {
-        form.refine(&args.faces, [2, 2])?;
+        edit_with_collapse_fit(form, collapse_tolerance, |form| form.refine(&args.faces, [2, 2]))?;
         return Ok(form.inspect());
     }
     if form.hierarchy.is_some() && matches!(args.tool.as_str(), "crease" | "uncrease") {
-        form.hierarchical_creases(&args.edges, &args.vertices, if args.tool == "crease" { args.distance } else { 0.0 })?;
+        edit_with_collapse_fit(form, collapse_tolerance, |form| {
+            form.hierarchical_creases(&args.edges, &args.vertices, if args.tool == "crease" { args.distance } else { 0.0 })
+        })?;
         return Ok(form.inspect());
     }
     if args.tool == "delete_faces" && form.hierarchy.is_some() {
-        form.delete_logical_faces(&args.faces)?;
+        edit_with_collapse_fit(form, collapse_tolerance, |form| form.delete_logical_faces(&args.faces))?;
         return Ok(form.inspect());
     }
     if args.tool == "dissolve" {
-        form.dissolve_logical_edges(&args.edges)?;
+        edit_with_collapse_fit(form, collapse_tolerance, |form| form.dissolve_logical_edges(&args.edges))?;
+        return Ok(form.inspect());
+    }
+    if let Some(tolerance) = qualified_tolerance {
+        let single = match args.fill_mode {
+            params::FillMode::Automatic => false,
+            params::FillMode::Single => true,
+            params::FillMode::Minimal | params::FillMode::ReducedStar | params::FillMode::NewCap => {
+                return Err(EngineError::Other("refined Fill Hole supports Automatic, Single and New cap".into()));
+            }
+        };
+        form.restore_logical_holes(&args.edges, &args.vertices, single, tolerance)?;
         return Ok(form.inspect());
     }
     if args.tool == "bridge" {
@@ -897,6 +1051,7 @@ fn topology(s: &mut Session, p: &Value) -> Result<Value> {
                 params::FillMode::Single => crate::geom::subdivision::topology_tools::FillMode::Single,
                 params::FillMode::Minimal => crate::geom::subdivision::topology_tools::FillMode::Minimal,
                 params::FillMode::ReducedStar => crate::geom::subdivision::topology_tools::FillMode::Star,
+                params::FillMode::NewCap => return Err(EngineError::Other("New cap requires a refined Form".into())),
             };
             c.fill_boundaries(&edges, mode)
         }
@@ -916,6 +1071,9 @@ fn topology(s: &mut Session, p: &Value) -> Result<Value> {
 fn symmetry(s: &mut Session, p: &Value) -> Result<Value> {
     let args: params::Symmetry = parse(p)?;
     let form = form(s)?;
+    if args.axis.is_some() && form.hierarchy.as_ref().is_some_and(|h| h.has_boundary_collapse()) {
+        return Err(EngineError::Other("symmetry requires an untrimmed Form before Collapse".into()));
+    }
     form.set_symmetry(args.axis)?;
     Ok(form.inspect())
 }
@@ -1010,10 +1168,32 @@ fn edit_with_mode(s: &mut Session, p: &Value, retained: bool) -> Result<Value> {
     Ok(reply)
 }
 fn set(s: &mut Session, p: &Value) -> Result<Value> {
+    set_targets(s, p, crate::forms_prototype::FormTargetSpace::Control)
+}
+
+fn set_targets(s: &mut Session, p: &Value, space: crate::forms_prototype::FormTargetSpace) -> Result<Value> {
     let p: params::SetVertices = parse(p)?;
+    let tolerance = crate::forms_prototype::collapse_tolerance(s)?;
     let f = form(s)?;
-    f.set(&p.vertices, &p.positions, p.checkpoint)?;
+    edit_with_collapse_fit(f, tolerance, |form| form.apply_transform_targets(&p, space))?;
     Ok(f.inspect())
+}
+fn edit_with_collapse_fit(
+    form: &mut crate::forms_prototype::Form,
+    tolerance: Option<f64>,
+    edit: impl FnOnce(&mut crate::forms_prototype::Form) -> Result<()>,
+) -> Result<()> {
+    if let Some(tolerance) = tolerance.filter(|_| form.hierarchy.as_ref().is_some_and(|h| h.has_boundary_collapse())) {
+        let mut candidate = form.clone();
+        edit(&mut candidate)?;
+        if candidate.source_revision() != form.source_revision() {
+            crate::forms_prototype::qualify_collapse_edit(&candidate, tolerance)?;
+            *form = candidate;
+        }
+        Ok(())
+    } else {
+        edit(form)
+    }
 }
 fn transform(s: &mut Session, p: &Value) -> Result<Value> {
     let p: params::Transform = parse(p)?;
@@ -1022,10 +1202,7 @@ fn transform(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(f.inspect())
 }
 fn set_surface(s: &mut Session, p: &Value) -> Result<Value> {
-    let p: params::SetVertices = parse(p)?;
-    let f = form(s)?;
-    f.set_surface(&p.vertices, &p.positions, p.checkpoint)?;
-    Ok(f.inspect())
+    set_targets(s, p, crate::forms_prototype::FormTargetSpace::Surface)
 }
 fn standalone(s: &Session) -> Result<()> {
     let f = s.forms_prototype.as_ref().ok_or_else(|| EngineError::Other("no Form is being edited".into()))?;
@@ -1040,8 +1217,13 @@ fn standalone(s: &Session) -> Result<()> {
 fn unweld(s: &mut Session, p: &Value) -> Result<Value> {
     standalone(s)?;
     let args: params::Unweld = parse(p)?;
+    let current = s.forms_prototype.as_ref().ok_or_else(|| EngineError::Other("no Form is being edited".into()))?;
+    if current.editing_feature.is_some_and(|id| refined_weld::attached(&s.doc, id)) {
+        return Err(EngineError::Other("remove the refined Weld before splitting its source".into()));
+    }
+    let tolerance = if current.hierarchy.is_some() { active_tolerance(s, None)? } else { 0.01 };
     let f = form(s)?;
-    f.unweld_parts(&args.edges, args.separate, args.name.as_deref().unwrap_or("Unwelded Form"))?;
+    f.unweld_parts(&args.edges, args.separate, args.name.as_deref().unwrap_or("Unwelded Form"), tolerance)?;
     Ok(f.inspect())
 }
 fn weld(s: &mut Session, p: &Value) -> Result<Value> {
@@ -1115,6 +1297,295 @@ fn close(s: &mut Session, _: &Value) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn history_availability_tracks_real_edit_undo_redo_and_cancelled_tool_preview() {
+        let mut s = Session::default();
+        let available = |s: &Session| s.forms_prototype.as_ref().unwrap().history_available();
+        s.execute("form.prototype.create", &json!({"primitive":"face","segments":[1,1,1],"levels":0})).unwrap();
+        let original = s.forms_prototype.as_ref().unwrap().definition();
+        assert_eq!(available(&s), (false, false));
+        assert!(s.execute("form.prototype.undo", &json!({})).is_err());
+        assert_eq!(available(&s), (false, false));
+
+        let point = original.cage.points[0];
+        s.execute("form.prototype.set_vertices", &json!({"vertices":[0],"positions":[[point.x,point.y,point.z+0.25]]})).unwrap();
+        let edited = s.forms_prototype.as_ref().unwrap().definition();
+        assert_ne!(edited, original);
+        assert_eq!(available(&s), (true, false));
+        s.execute("form.prototype.undo", &json!({})).unwrap();
+        assert_eq!(s.forms_prototype.as_ref().unwrap().definition(), original);
+        assert_eq!(available(&s), (false, true));
+        s.execute("form.prototype.redo", &json!({})).unwrap();
+        assert_eq!(s.forms_prototype.as_ref().unwrap().definition(), edited);
+        assert_eq!(available(&s), (true, false));
+        s.execute("form.prototype.undo", &json!({})).unwrap();
+
+        s.execute("form.prototype.tool.begin", &json!({})).unwrap();
+        assert_eq!(available(&s), (false, true));
+        s.execute("form.prototype.tool.preview", &json!({"topology":{"tool":"subdivide","faces":[0]}})).unwrap();
+        assert_ne!(s.forms_prototype.as_ref().unwrap().definition(), original);
+        assert_eq!(available(&s), (true, false));
+        // Stack availability preserves the existing UI meaning. A live tool
+        // still owns its transaction and rejects Undo/Redo until Apply/Cancel.
+        assert!(s.execute("form.prototype.undo", &json!({})).is_err());
+        assert!(s.execute("form.prototype.redo", &json!({})).is_err());
+        assert_eq!(available(&s), (true, false));
+        s.execute("form.prototype.tool.cancel", &json!({})).unwrap();
+        assert_eq!(s.forms_prototype.as_ref().unwrap().definition(), original);
+        assert_eq!(available(&s), (false, true));
+        s.execute("form.prototype.redo", &json!({})).unwrap();
+        assert_eq!(s.forms_prototype.as_ref().unwrap().definition(), edited);
+        assert_eq!(available(&s), (true, false));
+
+        s.execute("form.prototype.undo", &json!({})).unwrap();
+        s.execute("form.prototype.set_vertices", &json!({"vertices":[0],"positions":[[point.x,point.y,point.z+0.5]]})).unwrap();
+        assert_eq!(available(&s), (true, false));
+        assert!(s.execute("form.prototype.redo", &json!({})).is_err(), "a new edit discards the old redo branch");
+        s.execute("form.prototype.undo", &json!({})).unwrap();
+        assert_eq!(s.forms_prototype.as_ref().unwrap().definition(), original);
+        assert_eq!(available(&s), (false, true));
+    }
+
+    #[test]
+    fn form_checking_reports_fit_and_independent_coverage_without_authoring_or_checkpoint_capture() {
+        for primitive in ["face", "box", "sphere", "tube", "pipe"] {
+            let mut s = Session::default();
+            s.execute("form.prototype.create", &json!({"primitive":primitive,"segments":[1,1,1],"levels":0})).unwrap();
+            s.execute("edit.checkpoint", &json!({})).unwrap();
+            assert!(s.checkpoints.last().unwrap().form.is_none());
+            let before = s.forms_prototype.as_ref().unwrap().inspect();
+            let document = s.doc.clone();
+            let recovery = crate::recovery::capture_bytes(&s).unwrap();
+            let undo = s.undo.len();
+            let input = crate::forms_prototype::validation::Input::capture(&s).unwrap();
+            let shared = input.clone();
+            assert!(std::sync::Arc::ptr_eq(&input.source, &shared.source));
+            assert!(std::sync::Arc::ptr_eq(&input.context, &shared.context));
+            assert!(std::sync::Arc::ptr_eq(&input.context.document, &s.doc));
+            assert!(std::sync::Arc::ptr_eq(&input.context.before, &s.model.state()));
+            let queried = input.check(&params::Validate { tolerance: Some(0.01) }).unwrap();
+            let reply: params::ValidationReply =
+                serde_json::from_value(s.execute("form.prototype.validate", &json!({"tolerance":0.01})).unwrap()).unwrap();
+            assert_eq!(json!(reply), json!(queried), "command and worker query must share the same validation policy");
+            assert_eq!(reply.tolerance_mm, 0.01);
+            assert_eq!(reply.staged_forms_not_checked, 0);
+            if reply.stage == params::CheckStage::Complete {
+                assert_eq!(reply.shape, Some(if primitive == "face" { params::CheckedShape::Surface } else { params::CheckedShape::Solid }));
+                assert_eq!(reply.conversion.status, params::CheckStatus::Passed);
+                assert!(reply.fit.as_ref().unwrap().sampled_deviation_mm.is_finite());
+            } else {
+                // Unsupported fitted pole/atlas cases must report conversion
+                // failure, never silently become passed record/SMLib checks.
+                assert_eq!(reply.conversion.status, params::CheckStatus::Failed);
+                assert_eq!(reply.record.status, params::CheckStatus::NotRun);
+                assert_eq!(reply.smlib.status, params::CheckStatus::NotRun);
+                assert!(reply.shape.is_none());
+            }
+            assert_eq!(s.forms_prototype.as_ref().unwrap().inspect(), before);
+            assert!(std::sync::Arc::ptr_eq(&document, &s.doc));
+            assert_eq!(s.undo.len(), undo);
+            assert_eq!(crate::recovery::capture_bytes(&s).unwrap(), recovery);
+            assert!(s.checkpoints.last().unwrap().form.is_none(), "a read-only Form check must not fill lazy checkpoint source snapshots");
+        }
+    }
+
+    #[test]
+    fn checking_never_conflates_unsupported_unrun_failed_and_passed_smlib_coverage() {
+        use crate::doc::kernel::{SmlibCheck, Validity};
+        use params::CheckStatus::{Failed, NotRun, NotSupported, Passed};
+        for (smlib, expected) in [
+            (None, NotRun),
+            (Some(SmlibCheck::Valid), Passed),
+            (Some(SmlibCheck::Invalid("invalid topology".into())), Failed),
+            (Some(SmlibCheck::NotSupported("unsupported conversion".into())), NotSupported),
+        ] {
+            let (record, other) = validity_checks(Validity { record: Ok(()), smlib });
+            assert_eq!(record.status, Passed);
+            assert_eq!(other.status, expected);
+        }
+        let (record, other) = validity_checks(Validity { record: Err("bad pcurve".into()), smlib: Some(SmlibCheck::Valid) });
+        assert_eq!(record.status, Failed);
+        assert_eq!(record.message.as_deref(), Some("bad pcurve"));
+        assert_eq!(other.status, Passed, "the independent verdict must not hide the record failure");
+    }
+
+    #[test]
+    fn browser_form_check_uses_the_canonical_report_and_keeps_authored_state() {
+        use crate::forms_prototype::validation::BrowserCheck;
+        for primitive in ["face", "box", "sphere", "torus"] {
+            let mut session = Session { param_check: crate::schema::ParamCheck::Strict, ..Session::default() };
+            session.execute("form.prototype.create", &json!({"primitive":primitive,"segments":[2,2,2],"levels":0})).unwrap();
+            let form = session.forms_prototype.as_mut().unwrap();
+            form.placement.origin = Vec3::new(4.0, -1.5, 2.25);
+            form.parts.insert(42, crate::forms_prototype::Part { name: "Other Form".into(), definition: std::sync::Arc::new(form.definition()) });
+            let before = crate::recovery::capture_bytes(&session).unwrap();
+            let report = session.execute("form.prototype.validate", &json!({"tolerance":0.05})).unwrap();
+            let request = BrowserCheck::capture(&session, 0.05).unwrap().encode().unwrap();
+            let response = BrowserCheck::run(&request).unwrap();
+            let checked = BrowserCheck::decode_reply(&response).unwrap();
+            assert_eq!(json!(checked), report);
+            assert_eq!(checked.staged_forms_not_checked, 1);
+            assert_eq!(crate::recovery::capture_bytes(&session).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn browser_form_check_replays_refinement_and_extrusion_without_authoring() {
+        use crate::forms_prototype::validation::BrowserCheck;
+        let mut session = Session { param_check: crate::schema::ParamCheck::Strict, ..Session::default() };
+        session.execute("form.prototype.create", &json!({"primitive":"face","dimensions":[10,10,1],"segments":[2,2,1],"levels":1})).unwrap();
+        session.execute("form.prototype.refine", &json!({"faces":[0],"counts":[2,2]})).unwrap();
+        let check = |session: &mut Session, faces| {
+            let form = session.forms_prototype.as_ref().unwrap();
+            assert_eq!(form.cage.faces.len(), faces);
+            assert_eq!(form.hierarchy.as_ref().unwrap().replay_face_bound(), Some(faces));
+            let before = crate::recovery::capture_bytes(session).unwrap();
+            let request = BrowserCheck::capture(session, 0.05).unwrap().encode().unwrap();
+            let checked = BrowserCheck::decode_reply(&BrowserCheck::run(&request).unwrap()).unwrap();
+            let canonical = session.execute("form.prototype.validate", &json!({"tolerance":0.05})).unwrap();
+            assert_eq!(json!(checked), canonical);
+            assert_eq!(canonical["conversion"]["status"], "passed");
+            assert_eq!(crate::recovery::capture_bytes(session).unwrap(), before);
+        };
+        check(&mut session, 16);
+        session.execute("form.prototype.topology", &json!({"tool":"extrude_faces","faces":[4],"displacement":[0,0,3]})).unwrap();
+        check(&mut session, 20);
+    }
+
+    #[test]
+    fn browser_form_check_refuses_unbounded_or_contextual_inputs_before_fitting() {
+        use crate::forms_prototype::validation::BrowserCheck;
+        let mut session = Session::default();
+        session.execute("form.prototype.create", &json!({"primitive":"box","segments":[2,2,2],"levels":0})).unwrap();
+        let request = BrowserCheck::capture(&session, 0.05).unwrap().encode().unwrap();
+        let mut malformed: Value = serde_json::from_slice(&request).unwrap();
+        malformed["tolerance"] = json!(-1);
+        assert!(BrowserCheck::decode_reply(&BrowserCheck::run(&serde_json::to_vec(&malformed).unwrap()).unwrap()).is_err());
+        assert!(BrowserCheck::decode_reply(&BrowserCheck::run(&vec![0; BrowserCheck::MAX_PAYLOAD + 1]).unwrap()).is_err());
+        assert!(BrowserCheck::decode_reply(&vec![0; BrowserCheck::MAX_PAYLOAD + 1]).is_err());
+        session.execute("form.prototype.refine", &json!({"faces":[0],"counts":[2,2]})).unwrap();
+        let refined = BrowserCheck::capture(&session, 0.05).unwrap().encode().unwrap();
+        let mut forged: Value = serde_json::from_slice(&refined).unwrap();
+        // A small terminal cage must not let a much larger hierarchy allocate
+        // its evaluator before we discover that the two descriptions disagree.
+        forged["definition"]["hierarchy"]["depth"] = json!(4);
+        forged["definition"]["hierarchy"]["details"] = json!([[], [], [], [], []]);
+        let refused = BrowserCheck::decode_reply(&BrowserCheck::run(&serde_json::to_vec(&forged).unwrap()).unwrap()).unwrap_err();
+        assert!(refused.contains("needs the desktop CAD check"));
+        let mut associated = Session::default();
+        associated.execute("solid.box", &json!({"length":8,"width":8,"height":1,"body_name":"Support"})).unwrap();
+        let support = &associated.model.state().body("Support").unwrap().body.clone();
+        let top = (0..support.face_count()).find(|&i| support.planar_face(i).is_some_and(|p| p.normal().z > 0.99)).unwrap();
+        associated.execute("form.surface", &json!({"body":"Support","face":top,"segments":[2,2],"partition":false})).unwrap();
+        assert!(!BrowserCheck::available(&associated));
+        assert!(BrowserCheck::capture(&associated, 0.05).is_err());
+        let mut too_many = Session::default();
+        too_many.execute("form.prototype.create", &json!({"primitive":"face","segments":[16,16,1],"levels":0})).unwrap();
+        let form = too_many.forms_prototype.as_mut().unwrap();
+        form.cage.faces.push(vec![0, 1, 2, 3]);
+        assert!(!BrowserCheck::available(&too_many));
+    }
+
+    #[test]
+    fn form_checking_resolves_matched_support_and_rebuilt_surface_without_installing_them() {
+        let (mut matched, _, _) = matched_extrusion_case(0, false);
+        let before = crate::recovery::capture_bytes(&matched).unwrap();
+        let queried = crate::forms_prototype::validation::Input::capture(&matched).unwrap().check(&params::Validate { tolerance: None }).unwrap();
+        let reply: params::ValidationReply = serde_json::from_value(matched.execute("form.prototype.validate", &json!({})).unwrap()).unwrap();
+        assert_eq!(json!(reply), json!(queried));
+        assert_eq!(reply.stage, params::CheckStage::Complete);
+        assert_eq!(reply.shape, Some(params::CheckedShape::Surface));
+        assert_eq!(crate::recovery::capture_bytes(&matched).unwrap(), before);
+
+        let mut surface = Session::default();
+        surface.execute("solid.box", &json!({"length":8,"width":8,"height":1,"corner":[-4,-4,-1],"body_name":"Support"})).unwrap();
+        let body = surface.model.state().body("Support").unwrap().body.clone();
+        let top = (0..body.face_count()).find(|&i| body.planar_face(i).is_some_and(|p| p.normal().z > 0.99)).unwrap();
+        surface.execute("form.surface", &json!({"body":"Support","face":top,"segments":[2,2],"partition":false})).unwrap();
+        let before = crate::recovery::capture_bytes(&surface).unwrap();
+        let queried = crate::forms_prototype::validation::Input::capture(&surface).unwrap().check(&params::Validate { tolerance: None }).unwrap();
+        let reply: params::ValidationReply = serde_json::from_value(surface.execute("form.prototype.validate", &json!({})).unwrap()).unwrap();
+        assert_eq!(json!(reply), json!(queried));
+        assert_eq!(reply.stage, params::CheckStage::Complete);
+        assert_eq!(
+            reply.shape,
+            Some(params::CheckedShape::Solid),
+            "Surface Finish checks the rebuilt source solid rather than just its displayed patch"
+        );
+        assert_eq!(reply.fit.as_ref().unwrap().basis, params::FitBasis::BoundaryAndGuideSamples);
+        assert_eq!(crate::recovery::capture_bytes(&surface).unwrap(), before);
+
+        let mut pipe = Session::default();
+        pipe.execute("solid.box", &json!({"corner":[78,17,0],"length":20,"width":20,"height":20,"body_name":"Support","operation":"new"})).unwrap();
+        let author = pipe.execute("component.create", &json!({"name":"Pipe author","grounded":false})).unwrap();
+        pipe.execute("occurrence.move", &json!({"occurrence":author["occurrence"],"translate":[80,20,5],"angle":90,"axis":[0,0,1],"capture":true}))
+            .unwrap();
+        pipe.execute("form.pipe", &json!({"body":"Support","edges":[0],"diameter":2})).unwrap();
+        let component = pipe.forms_prototype.as_ref().unwrap().authoring_component;
+        let another = pipe.doc_mut().add_occurrence(component, 0, crate::doc::IDENTITY).unwrap();
+        let path = vec![another];
+        pipe.forms_prototype.as_mut().unwrap().authoring_path = Some(path.clone());
+        pipe.pending_moves.insert(another, crate::doc::rigid(Vec3::new(80.0, 20.0, 5.0), Vec3::ZERO, Vec3::Z, std::f64::consts::FRAC_PI_2));
+        pipe.active_component = component;
+        pipe.active_occurrence_path = Some(path);
+        let expected_frame = pipe.active_component_frame();
+        pipe.active_component = 0;
+        pipe.active_occurrence_path = None;
+        let input = crate::forms_prototype::validation::Input::capture(&pipe).unwrap();
+        assert_eq!(input.context.frame(), expected_frame, "stored author path and pending move must survive leaving that component");
+        let before = crate::recovery::capture_bytes(&pipe).unwrap();
+        let queried = input.check(&params::Validate { tolerance: Some(0.05) }).unwrap();
+        let reply: params::ValidationReply =
+            serde_json::from_value(pipe.execute("form.prototype.validate", &json!({"tolerance":0.05})).unwrap()).unwrap();
+        assert_eq!(json!(reply), json!(queried));
+        assert_ne!(reply.stage, params::CheckStage::Source, "the pipe support must resolve in its author's translated/rotated frame");
+        assert_eq!(crate::recovery::capture_bytes(&pipe).unwrap(), before);
+    }
+
+    #[test]
+    fn immutable_form_check_keeps_staged_scope_hierarchy_tolerance_and_pre_feature_state() {
+        let mut s = Session::default();
+        s.execute("form.prototype.create", &json!({"primitive":"face","segments":[2,2,1],"levels":0})).unwrap();
+        s.execute("form.prototype.refine", &json!({"faces":[0],"counts":[2,2]})).unwrap();
+        let staged = s.forms_prototype.as_ref().unwrap().definition();
+        s.forms_prototype =
+            Some(crate::forms_prototype::Form::from_import(vec![("Active".into(), staged.clone(), 0), ("Staged".into(), staged, 0)]).unwrap());
+        s.execute("form.prototype.finish_options", &json!({"tolerance":"0.02 mm"})).unwrap();
+        let input = crate::forms_prototype::validation::Input::capture(&s).unwrap();
+        let before = crate::recovery::capture_bytes(&s).unwrap();
+        let implicit = input.check(&params::Validate { tolerance: None }).unwrap();
+        let explicit = input.check(&params::Validate { tolerance: Some(0.02) }).unwrap();
+        assert_eq!(json!(implicit), json!(explicit));
+        assert_eq!(explicit.staged_forms_not_checked, 1);
+        assert_eq!(explicit.shape, Some(params::CheckedShape::Surface));
+        assert_eq!(crate::recovery::capture_bytes(&s).unwrap(), before);
+
+        let mut edited = Session::default();
+        edited.execute("form.prototype.create", &json!({"segments":[1,1,1],"levels":0})).unwrap();
+        let feature = edited.execute("form.prototype.commit", &json!({"tolerance":0.01})).unwrap()["feature"].as_u64().unwrap();
+        edited.execute("form.edit", &json!({"feature":feature})).unwrap();
+        let input = crate::forms_prototype::validation::Input::capture(&edited).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&input.context.before, &edited.model.state_before(feature)));
+        let before = crate::recovery::capture_bytes(&edited).unwrap();
+        let queried = input.check(&params::Validate { tolerance: None }).unwrap();
+        assert_eq!(queried.tolerance_mm, 0.01);
+        assert_eq!(crate::recovery::capture_bytes(&edited).unwrap(), before);
+    }
+
+    #[test]
+    fn form_checking_refuses_hostile_tolerances_without_changing_the_live_source() {
+        let mut s = Session::default();
+        s.execute("form.prototype.create", &json!({"primitive":"face","segments":[1,1,1]})).unwrap();
+        let before = crate::recovery::capture_bytes(&s).unwrap();
+        for parameters in
+            [json!({"tolerance":0}), json!({"tolerance":-1}), json!({"tolerance":2}), json!({"tolerance":"0.01"}), json!({"unexpected":true})]
+        {
+            assert!(s.execute("form.prototype.validate", &parameters).is_err());
+            assert_eq!(crate::recovery::capture_bytes(&s).unwrap(), before);
+        }
+    }
+
     use solidcore_record::Vec3;
 
     fn sculpted_dimension_fixture(levels: usize) -> Session {
@@ -2137,7 +2608,7 @@ mod tests {
         let remaining = state.body("Support").unwrap();
         assert!(!remaining.body.is_surface() && remaining.body.validity().is_empty());
         let volume = remaining.measure().unwrap().volume;
-        assert!(volume > 0.0 && (volume + cutter_volume - 8.0).abs() < 0.003, "{volume} + {cutter_volume} mm³");
+        assert!(volume > 0.0 && (volume + cutter_volume - 8.0).abs() < 0.003, "{volume} + {cutter_volume} mmÂ³");
         s.execute("form.edit", &json!({"feature":feature})).unwrap();
         assert!(s.forms_prototype.as_ref().unwrap().matching.as_ref().unwrap().adjacent_faces);
     }
@@ -2739,6 +3210,173 @@ mod tests {
         f.iter().copied().zip(f.iter().copied().cycle().skip(1)).take(f.len()).map(|(a, b)| [a, b]).collect()
     }
     #[test]
+    fn refined_collapse_uses_the_normal_tool_and_keeps_qualified_edits_atomic() {
+        use solidcore_record::Vec3;
+        let mut s = Session::default();
+        s.execute("form.prototype.create", &json!({"primitive":"plane","size":8,"spans":1,"levels":2})).unwrap();
+        s.execute("form.prototype.refine", &json!({"faces":[0],"counts":[2,1]})).unwrap();
+        s.execute("form.prototype.finish_options", &json!({"tolerance":"0.05 mm"})).unwrap();
+        let source = s.forms_prototype.as_ref().unwrap().definition();
+        let initial = source.hierarchy.as_ref().unwrap().layout().unwrap();
+        let leaf = &initial.faces[1];
+        let picks = [leaf[3], leaf[0]];
+        let before = s.doc.to_json();
+        let params = json!({"topology":{"tool":"weld","vertices":picks,"tolerance":0.05}});
+        for apply in [false, true] {
+            s.execute("form.prototype.tool.begin", &json!({})).unwrap();
+            s.execute("form.prototype.tool.preview", &params).unwrap();
+            let edited = s.forms_prototype.as_ref().unwrap();
+            let site = edited.hierarchy.as_ref().unwrap().validated_boundary_collapse().unwrap().unwrap();
+            assert_eq!(edited.logical.faces[site.face], site.boundary);
+            assert_eq!(edited.logical.faces[site.retained_neighbor], initial.faces[site.retained_neighbor]);
+            assert_eq!(edited.cage, source.cage);
+            assert!(edited.selectable_control(site.point));
+            assert!(picks.iter().all(|&id| !edited.selectable_control(id)));
+            assert_eq!(s.doc.to_json(), before);
+            let command = if apply { "form.prototype.tool.apply" } else { "form.prototype.tool.cancel" };
+            s.execute(command, &json!({})).unwrap();
+            if !apply {
+                assert_eq!(s.forms_prototype.as_ref().unwrap().definition(), source);
+            }
+        }
+        s.execute("form.prototype.undo", &json!({})).unwrap();
+        assert_eq!(s.forms_prototype.as_ref().unwrap().definition(), source);
+        s.execute("form.prototype.redo", &json!({})).unwrap();
+        let form = s.forms_prototype.as_ref().unwrap();
+        let neighbor = leaf[1];
+        let local = form.cage.points[neighbor];
+        let old = form.definition();
+        let target = local + Vec3::Z * 0.5;
+        let params = json!({"vertices":[neighbor],"positions":[[target.x,target.y,target.z]]});
+        assert!(s.execute("form.prototype.set_vertices", &params).is_err());
+        assert_eq!(s.forms_prototype.as_ref().unwrap().definition(), old);
+        let prepared = s.prepare_form_transform(crate::forms_prototype::FormTargetSpace::Control, params).unwrap();
+        assert!(prepared.compute().is_err());
+        assert_eq!(s.forms_prototype.as_ref().unwrap().definition(), old);
+        let before_refusal = s.forms_prototype.as_ref().unwrap().inspect();
+        let projection = json!({
+            "tool":"flatten","points":"control","vertices":[neighbor,leaf[2]],
+            "direction":[0,0,1],"origin":[0,0,0.5]
+        });
+        assert!(s.execute("form.prototype.project", &projection).is_err());
+        assert_eq!(s.forms_prototype.as_ref().unwrap().inspect(), before_refusal);
+        let target = local + Vec3::X * 0.125;
+        let params = json!({"vertices":[neighbor],"positions":[[target.x,target.y,target.z]]});
+        let prepared = s.prepare_form_transform(crate::forms_prototype::FormTargetSpace::Control, params).unwrap().compute().unwrap();
+        assert!(s.accept_form_transform(prepared).unwrap().0);
+        assert_ne!(s.forms_prototype.as_ref().unwrap().definition(), old);
+
+        let feature = s.execute("form.prototype.commit", &json!({"tolerance":0.05})).unwrap()["feature"].as_u64().unwrap();
+        assert_eq!(s.model.state().bodies[0].body.edge_count(), 6);
+        let saved = s.doc.to_json();
+        let mut reopened = Session::new(crate::doc::Document::from_json(&saved).unwrap());
+        reopened.refresh();
+        reopened.execute("form.edit", &json!({"feature":feature})).unwrap();
+        assert_eq!(reopened.forms_prototype.as_ref().unwrap().logical.faces[1].len(), 3);
+        s.execute("edit.undo", &json!({})).unwrap();
+        assert_eq!(s.doc.to_json(), before);
+        s.execute("edit.redo", &json!({})).unwrap();
+        assert_eq!(s.doc.to_json(), saved);
+    }
+
+    #[test]
+    fn refined_unweld_previews_two_exact_skins_and_finishes_one_independent_split() {
+        use crate::doc::forms::{Definition, Placement};
+        use crate::doc::{Document, FeatureKind};
+        use crate::geom::subdivision::{Cage, hierarchy::Hierarchy, primitives::Parameters};
+        use solidcore_record::Vec3;
+        let mut points = Vec::new();
+        for z in [-5.0, 0.0, 5.0] {
+            for (x, y) in [(-4.0, -4.0), (4.0, -4.0), (4.0, 4.0), (-4.0, 4.0)] {
+                points.push(Vec3::new(x, y, z));
+            }
+        }
+        let mut faces = Vec::new();
+        for ring in [0, 4] {
+            for i in 0..4 {
+                let a = ring + i;
+                let b = ring + (i + 1) % 4;
+                faces.push(vec![a, b, b + 4, a + 4]);
+            }
+        }
+        faces.extend([vec![3, 2, 1, 0], vec![8, 9, 10, 11]]);
+        let mut h =
+            Hierarchy::new(Cage { points, faces, ..Default::default() }).unwrap().subdivide(&[8], [2, 2]).unwrap().subdivide(&[9], [4, 4]).unwrap();
+        let cage = h.evaluate().unwrap();
+        let centers: Vec<_> =
+            h.controls.iter().filter(|&(&i, &birth)| birth == 1 && cage.points[i].x == 0. && cage.points[i].y == 0.).map(|(&id, _)| id).collect();
+        assert_eq!(centers.len(), 2);
+        h.add_deltas(&centers, &[Vec3::Z * 0.25, Vec3::Z * 0.35]).unwrap();
+        let source = Definition {
+            cage: h.evaluate().unwrap(),
+            hierarchy: Some(h.clone()),
+            placement: Placement { origin: Vec3::new(2., -3., 4.), ..Default::default() },
+            parameters: Parameters { kind: "box".into(), dimensions: [8., 8., 10.], ..Default::default() },
+            matching: None,
+            pipe: None,
+            profile: None,
+            imported: None,
+            symmetry: None,
+        };
+
+        let mut s = Session::new(Document::new("Refined Unweld"));
+        s.forms_prototype = Some(crate::forms_prototype::Form::from_definition(source, 2, None).unwrap());
+        let first = s.execute("form.prototype.commit", &json!({"name":"Original","tolerance":0.05})).unwrap()["feature"].as_u64().unwrap();
+        assert_eq!(s.model.state().bodies.len(), 1);
+        assert!(!s.model.state().bodies[0].body.is_surface());
+        let original = s.doc.to_json();
+        s.execute("form.edit", &json!({"feature":first})).unwrap();
+        let source = s.forms_prototype.as_ref().unwrap().definition();
+        let edges = [[4, 5], [5, 6], [6, 7], [7, 4]];
+        assert!(s.execute("form.prototype.unweld", &json!({"edges":edges,"separate":false})).is_err());
+        assert_eq!(s.forms_prototype.as_ref().unwrap().definition(), source);
+        let preview = json!({"unweld":{"edges":edges,"name":"Second half"}});
+        for apply in [false, true] {
+            s.execute("form.prototype.tool.begin", &json!({})).unwrap();
+            s.execute("form.prototype.tool.preview", &preview).unwrap();
+            let edited = s.forms_prototype.as_ref().unwrap();
+            assert_eq!(edited.cage, source.cage);
+            assert!(edited.hierarchy.as_ref().unwrap().has_detached_material());
+            assert_eq!(edited.parts.len(), 1);
+            let other = edited.parts.values().next().unwrap();
+            assert_eq!(other.definition.cage, source.cage);
+            assert!(other.definition.hierarchy.as_ref().unwrap().has_detached_material());
+            assert_eq!(s.doc.to_json(), original);
+            let command = if apply { "form.prototype.tool.apply" } else { "form.prototype.tool.cancel" };
+            s.execute(command, &json!({})).unwrap();
+            if !apply {
+                assert_eq!(s.forms_prototype.as_ref().unwrap().definition(), source);
+                assert!(s.forms_prototype.as_ref().unwrap().parts.is_empty());
+            }
+        }
+        s.execute("form.prototype.undo", &json!({})).unwrap();
+        assert_eq!(s.forms_prototype.as_ref().unwrap().definition(), source);
+        assert!(s.forms_prototype.as_ref().unwrap().parts.is_empty());
+        s.execute("form.prototype.redo", &json!({})).unwrap();
+        let second = s.execute("form.prototype.commit", &json!({})).unwrap()["parts"][0].as_u64().unwrap();
+        assert_ne!(first, second);
+        let completed = s.doc.to_json();
+        let reopened = Document::from_json(&completed).unwrap();
+        let mut reopened = Session::new(reopened);
+        reopened.refresh();
+        let st = reopened.model.state();
+        assert_eq!(st.bodies.len(), 2);
+        assert!(st.bodies.iter().all(|body| body.body.is_surface() && crate::doc::kernel::validity(&body.body).ok()));
+        for (id, count) in [(first, 8), (second, 20)] {
+            let FeatureKind::Form { definition, tolerance, .. } = &reopened.doc.feature(id).unwrap().kind else { panic!("saved Form part") };
+            assert_eq!(tolerance.as_str(), "0.05 mm");
+            let half = definition.hierarchy.as_ref().unwrap();
+            assert_eq!(half.details, source.hierarchy.as_ref().unwrap().details);
+            assert_eq!(half.layout().unwrap().faces.iter().filter(|face| !face.is_empty()).count(), count);
+            assert_eq!(st.bodies.iter().find(|body| body.feature == id).unwrap().body.face_count(), count);
+        }
+        s.execute("edit.undo", &json!({})).unwrap();
+        assert_eq!(s.doc.to_json(), original);
+        s.execute("edit.redo", &json!({})).unwrap();
+        assert_eq!(s.doc.to_json(), completed);
+    }
+
+    #[test]
     fn unweld_and_draft_weld_stage_objects_and_restore_complete_editor_history() {
         let mut s = Session::default();
         s.execute("form.prototype.create", &json!({"size":10,"segments":[1,1,1],"levels":1})).unwrap();
@@ -2774,6 +3412,171 @@ mod tests {
         s.execute("form.prototype.close", &json!({})).unwrap();
         assert_eq!(serde_json::to_value(s.doc.as_ref()).unwrap(), document);
     }
+    fn refined_weld_fixture(offset: f64) -> (Session, [u64; 2]) {
+        use crate::doc::forms::{Definition, Placement};
+        use crate::geom::subdivision::{Cage, hierarchy::Hierarchy, primitives::Parameters};
+        use solidcore_record::Vec3;
+        let mut s = Session::new(crate::doc::Document::new("Refined Weld"));
+        let ids = [true, false].map(|lower| {
+            let mut points = Vec::new();
+            for z in [-5.0, 0.0] {
+                for (x, y) in [(-4.0, -4.0), (4.0, -4.0), (4.0, 4.0), (-4.0, 4.0)] {
+                    points.push(Vec3::new(x, y, z));
+                }
+            }
+            let mut faces = (0..4)
+                .map(|a| {
+                    let b = (a + 1) % 4;
+                    vec![a, b, b + 4, a + 4]
+                })
+                .collect::<Vec<_>>();
+            faces.push(if lower { vec![3, 2, 1, 0] } else { vec![4, 5, 6, 7] });
+            let depth = if lower { 2 } else { 4 };
+            let mut hierarchy = Hierarchy::new(Cage { points, faces, ..Default::default() }).unwrap().subdivide(&[4], [depth, depth]).unwrap();
+            let cage = hierarchy.evaluate().unwrap();
+            let center = hierarchy
+                .controls
+                .iter()
+                .find(|&(&id, &level)| {
+                    let p = cage.points[id];
+                    level == 1 && p.x == 0.0 && p.y == 0.0
+                })
+                .map(|(&id, _)| id)
+                .unwrap();
+            hierarchy.add_deltas(&[center], &[Vec3::Z * 0.25]).unwrap();
+            assert_ne!(hierarchy.evaluate().unwrap(), cage);
+            let definition = Definition {
+                placement: Placement { origin: if lower { Vec3::ZERO } else { Vec3::Z * (5.0 + offset) }, ..Default::default() },
+                cage: hierarchy.evaluate().unwrap(),
+                hierarchy: Some(hierarchy),
+                parameters: Parameters { kind: "box".into(), dimensions: [8.0, 8.0, 5.0], ..Default::default() },
+                symmetry: None,
+                imported: None,
+                pipe: None,
+                profile: None,
+                matching: None,
+            };
+            s.forms_prototype = Some(crate::forms_prototype::Form::from_definition(definition, 2, None).unwrap());
+            s.execute("form.prototype.commit", &json!({"name": if lower {"Lower"} else {"Upper"}, "tolerance": 0.05})).unwrap()["feature"]
+                .as_u64()
+                .unwrap()
+        });
+        assert_eq!(s.model.state().bodies.len(), 2);
+        (s, ids)
+    }
+
+    #[test]
+    fn refined_weld_retains_both_finished_sources_through_save_edit_remove_and_undo() {
+        use crate::doc::{FeatureKind, naming::named_face_point};
+        let (mut s, [a, b]) = refined_weld_fixture(0.0);
+        let before = s.doc.to_json();
+        let lower = s.model.state().bodies.iter().find(|body| body.feature == a).unwrap().name.clone();
+        let names = [a, b].map(|id| format!("F{id}:FormPatch1"));
+        for name in &names {
+            assert!(named_face_point(&s.model.state(), None, name).is_ok(), "{name}");
+        }
+        let args = json!({"features":[a,b],"name":"Seam"});
+        let feature = s.execute("form.refined_weld", &args).unwrap()["feature"].as_u64().unwrap();
+        let seam = s.doc.feature(feature).unwrap();
+        let FeatureKind::Stitch { form_seam: Some(record), .. } = &seam.kind else { panic!("saved seam") };
+        assert_eq!(record.sources(), [crate::doc::FeatureId(a), crate::doc::FeatureId(b)]);
+        assert!(seam.kind.names_feature(a, "Lower") && seam.kind.names_feature(b, "Upper"));
+        assert_eq!(s.model.state().bodies.len(), 1);
+        assert!(!s.model.state().body(&lower).unwrap().body.is_surface());
+        for name in &names {
+            assert!(named_face_point(&s.model.state(), Some(&lower), name).is_ok(), "{name}");
+        }
+        let welded = s.doc.to_json();
+        s.execute("edit.undo", &json!({})).unwrap();
+        assert_eq!(s.doc.to_json(), before);
+        s.execute("edit.redo", &json!({})).unwrap();
+        assert_eq!(s.doc.to_json(), welded);
+
+        let mut reopened = Session::new(crate::doc::Document::from_json(&welded).unwrap());
+        reopened.refresh();
+        assert_eq!(reopened.model.state().bodies.len(), 1);
+        for name in &names {
+            assert!(named_face_point(&reopened.model.state(), Some(&lower), name).is_ok(), "{name}");
+        }
+        reopened.execute("form.edit", &json!({"feature":a})).unwrap();
+        let form = reopened.forms_prototype.as_ref().unwrap();
+        let hierarchy = form.hierarchy.as_ref().unwrap();
+        let id = hierarchy.details[1][0].vertex;
+        let point = form.cage.points[id];
+        reopened.execute("form.prototype.set_vertices", &json!({"vertices":[id],"positions":[[point.x,point.y,point.z+0.01]]})).unwrap();
+        reopened.execute("form.prototype.commit", &json!({})).unwrap();
+        assert!(reopened.forms_prototype.is_none());
+        assert_eq!(reopened.model.state().bodies.len(), 1);
+        let edited = reopened.doc.to_json();
+        assert_ne!(edited, welded);
+        reopened.execute("edit.undo", &json!({})).unwrap();
+        assert_eq!(reopened.doc.to_json(), welded);
+        reopened.execute("edit.redo", &json!({})).unwrap();
+        assert_eq!(reopened.doc.to_json(), edited);
+
+        reopened.execute("form.refined_weld.remove", &json!({"feature":feature})).unwrap();
+        assert!(reopened.doc.feature(feature).is_none());
+        assert!(reopened.doc.feature(a).is_some() && reopened.doc.feature(b).is_some());
+        assert_eq!(reopened.model.state().bodies.len(), 2);
+        reopened.execute("edit.undo", &json!({})).unwrap();
+        assert_eq!(reopened.doc.to_json(), edited);
+        reopened.execute("edit.redo", &json!({})).unwrap();
+        assert_eq!(reopened.model.state().bodies.len(), 2);
+        let next = reopened.execute("form.refined_weld", &args).unwrap()["feature"].as_u64().unwrap();
+        assert_ne!(next, feature, "retired seam identity cannot name a later seam");
+    }
+
+    #[test]
+    fn refined_weld_refuses_disconnected_changed_or_consumed_inputs_atomically() {
+        use solidcore_record::Vec3;
+        let (mut disconnected, ids) = refined_weld_fixture(0.01);
+        let args = json!({"features":ids,"edges":[[4,5],[0,1]]});
+        let before = disconnected.doc.to_json();
+        let auto_error = disconnected.execute("form.refined_weld", &json!({"features":ids})).unwrap_err().to_string();
+        assert!(auto_error.contains("rims are not aligned"), "{auto_error}");
+        let error = disconnected.execute("form.refined_weld", &args).unwrap_err().to_string();
+        assert!(error.contains("do not coincide"), "{error}");
+        assert_eq!(disconnected.doc.to_json(), before);
+        assert_eq!(disconnected.model.state().bodies.len(), 2);
+
+        let (mut s, [a, b]) = refined_weld_fixture(0.0);
+        let args = json!({"features":[a,b],"edges":[[4,5],[0,1]]});
+        let donor = s.model.state().bodies.iter().find(|body| body.feature == b).unwrap().name.clone();
+        s.execute("solid.move", &json!({"bodies":[donor],"translate":[0,0,0.01]})).unwrap();
+        let moved = s.doc.to_json();
+        let error = s.execute("form.refined_weld", &args).unwrap_err().to_string();
+        assert!(error.contains("source body changed"), "{error}");
+        assert_eq!(s.doc.to_json(), moved);
+        s.execute("edit.undo", &json!({})).unwrap();
+        let joined = s.execute("form.refined_weld", &args).unwrap()["feature"].as_u64().unwrap();
+        for rolled_back in [false, true] {
+            if rolled_back {
+                let before_seam = s.doc.feature_index(joined).unwrap();
+                s.execute("timeline.rollback", &json!({"position":before_seam})).unwrap();
+                assert_eq!(s.model.state().bodies.len(), 2);
+            }
+            let before = s.doc.to_json();
+            s.execute("form.edit", &json!({"feature":b})).unwrap();
+            let placement = crate::doc::rigid(Vec3::Z * 0.01, Vec3::ZERO, Vec3::Z, 0.0);
+            s.execute("form.prototype.transform", &json!({"matrix":placement})).unwrap();
+            let attempted = s.forms_prototype.as_ref().unwrap().definition();
+            let error = s.execute("form.prototype.commit", &json!({})).unwrap_err().to_string();
+            assert!(error.contains("would break") && error.contains("do not coincide"), "{error}");
+            assert_eq!(s.doc.to_json(), before);
+            assert_eq!(s.forms_prototype.as_ref().unwrap().definition(), attempted);
+            s.execute("form.prototype.close", &json!({})).unwrap();
+        }
+        s.execute("timeline.rollback", &json!({"position":"end"})).unwrap();
+        assert_eq!(s.model.state().bodies.len(), 1);
+
+        let result = s.model.state().bodies.first().unwrap().name.clone();
+        s.execute("solid.move", &json!({"bodies":[result],"translate":[1,0,0]})).unwrap();
+        let consumed = s.doc.to_json();
+        let error = s.execute("form.refined_weld.remove", &json!({"feature":joined})).unwrap_err().to_string();
+        assert!(error.contains("dependency"), "{error}");
+        assert_eq!(s.doc.to_json(), consumed);
+    }
+
     #[test]
     fn saved_object_weld_cancel_preserves_incoming_links_and_finish_is_one_document_action() {
         let mut s = Session::default();
@@ -2946,8 +3749,9 @@ mod tests {
         let face = dense.surface.mesh.tri_face[0];
         // Duplicate coincident display triangles without changing authored
         // geometry or the solve. The old display-count gate refused this edit.
-        dense.surface.mesh.triangles.resize(500_001, triangle);
-        dense.surface.mesh.tri_face.resize(500_001, face);
+        let surface = std::sync::Arc::make_mut(&mut dense.surface);
+        surface.mesh.triangles.resize(500_001, triangle);
+        surface.mesh.tri_face.resize(500_001, face);
         s.forms_prototype = Some(dense);
         s.execute("form.prototype.set_surface_vertices", &args).unwrap();
         assert_eq!(s.forms_prototype.as_ref().unwrap().definition(), expected);
@@ -2956,7 +3760,7 @@ mod tests {
         s.execute("form.prototype.create", &json!({"segments":[4,4,4],"levels":4})).unwrap();
         let expensive = s.forms_prototype.as_mut().unwrap();
         let source = expensive.definition();
-        expensive.surface.mesh.triangles.clear();
+        std::sync::Arc::make_mut(&mut expensive.surface).mesh.triangles.clear();
         let indices: Vec<_> = (0..85).collect();
         let targets: Vec<_> = indices
             .iter()
@@ -3239,6 +4043,407 @@ mod tests {
         assert!(s.execute("form.prototype.topology", &json!({"tool":"crease","edges":[[id,partner]],"distance":2.0})).is_err());
         assert_eq!(s.forms_prototype.as_ref().unwrap().inspect(), snapshot);
     }
+
+    #[test]
+    fn refined_fill_restores_a_placed_mirrored_sculpt_as_one_undoable_cad_solid() {
+        let mut s = Session::default();
+        s.execute("form.prototype.create", &json!({"primitive":"box","dimensions":[12,10,8],"segments":[1,1,1],"levels":0})).unwrap();
+        s.execute("form.prototype.finish_options", &json!({"tolerance":"0.05 mm"})).unwrap();
+        s.execute("form.prototype.symmetry", &json!({"axis":2})).unwrap();
+        s.execute("form.prototype.refine", &json!({"faces":[0],"counts":[4,4]})).unwrap();
+        let f = s.forms_prototype.as_ref().unwrap();
+        let h = f.hierarchy.as_ref().unwrap();
+        let removed: Vec<_> = h
+            .leaves
+            .iter()
+            .enumerate()
+            .filter_map(|(id, leaf)| {
+                let [_, _, x, y] = leaf.domain;
+                (leaf.active && leaf.root == 0 && x <= 8 && y <= 8).then_some(id)
+            })
+            .collect();
+        assert_eq!(removed.len(), 4);
+        let centre = h.leaf_corners().unwrap()[removed[0]].unwrap()[2];
+        assert_eq!(h.controls.get(&centre), Some(&2));
+        let target = f.control_positions()[centre] + Vec3::Z * 0.125;
+        s.execute("form.prototype.set_vertices", &json!({"vertices":[centre],"positions":[[target.x,target.y,target.z]]})).unwrap();
+        let transform = crate::doc::rigid(Vec3::new(12.0, -4.0, 9.0), Vec3::ZERO, Vec3::new(1.0, 2.0, 3.0), 0.7);
+        s.execute("form.prototype.transform", &json!({"matrix":transform})).unwrap();
+        let intact = s.forms_prototype.as_ref().unwrap().definition();
+        assert!(intact.hierarchy.as_ref().unwrap().details[2].iter().any(|detail| detail.vertex == centre && detail.delta.len() > 0.1));
+        s.execute("form.prototype.topology", &json!({"tool":"delete_faces","faces":removed})).unwrap();
+        let f = s.forms_prototype.as_ref().unwrap();
+        let hole = f.definition();
+        let h = hole.hierarchy.as_ref().unwrap();
+        assert!(!h.controls.contains_key(&centre));
+        assert_eq!(hole.cage, intact.cage);
+        assert_eq!(h.details, intact.hierarchy.as_ref().unwrap().details);
+        let rims = crate::doc::forms::match_openings(&hole.cage, Some(h)).unwrap();
+        assert_eq!(rims.len(), 2);
+        let rim = rims.iter().find(|rim| rim.iter().all(|&v| hole.cage.points[v].z > 0.0)).unwrap();
+        assert_eq!(rim.len(), 8);
+        let rim_edges: std::collections::BTreeSet<_> =
+            rim.iter().copied().zip(rim.iter().copied().cycle().skip(1)).take(rim.len()).map(|(a, b)| (a.min(b), a.max(b))).collect();
+        let edge = h
+            .layout()
+            .unwrap()
+            .paths
+            .into_iter()
+            .find(|(_, path)| path.windows(2).all(|pair| rim_edges.contains(&(pair[0].min(pair[1]), pair[0].max(pair[1])))))
+            .unwrap()
+            .0;
+        let edge = [edge[1], edge[0]];
+        let undo = f.inspect()["undo"].as_u64().unwrap();
+        let recovery = crate::recovery::capture_bytes(&s).unwrap();
+        for mode in ["single", "minimal", "reduced_star"] {
+            assert!(s.execute("form.prototype.topology", &json!({"tool":"fill_hole","edges":[edge],"fill_mode":mode})).is_err());
+            assert_eq!(crate::recovery::capture_bytes(&s).unwrap(), recovery);
+        }
+        s.execute("form.prototype.topology", &json!({"tool":"fill_hole","edges":[edge]})).unwrap();
+        let f = s.forms_prototype.as_ref().unwrap();
+        assert_eq!(f.definition(), intact, "restored leaf IDs, sculpt, mirror and placement are the original source");
+        assert_eq!(f.inspect()["undo"].as_u64(), Some(undo + 1));
+        let (body, report) = crate::doc::forms::convert(&f.definition(), 0.05).unwrap();
+        assert!(report.solid && !body.is_mesh() && !body.is_surface());
+        assert!(body.validity().is_empty());
+        s.execute("form.prototype.undo", &json!({})).unwrap();
+        assert_eq!(s.forms_prototype.as_ref().unwrap().definition(), hole);
+        s.execute("form.prototype.redo", &json!({})).unwrap();
+        assert_eq!(s.forms_prototype.as_ref().unwrap().definition(), intact);
+        let saved = crate::recovery::restore_bytes(&crate::recovery::capture_bytes(&s).unwrap(), None).unwrap();
+        assert_eq!(saved.forms_prototype.as_ref().unwrap().definition(), intact);
+    }
+    #[test]
+    fn fresh_refined_cap_preserves_restore_policy_and_commits_one_tool_checkpoint() {
+        let mut s = Session::default();
+        s.execute("form.prototype.create", &json!({"primitive":"face","dimensions":[8,8,1],"segments":[4,4,1],"levels":0})).unwrap();
+        let edge: [usize; 2] = s.forms_prototype.as_ref().unwrap().logical.faces[10][..2].try_into().unwrap();
+        let new_cap = json!({"tool":"fill_hole","edges":[edge],"fill_mode":"new_cap","tolerance":0.05});
+        s.execute("form.prototype.topology", &json!({"tool":"delete_faces","faces":[10]})).unwrap();
+        let base = s.forms_prototype.as_ref().unwrap().definition();
+        assert!(s.execute("form.prototype.topology", &new_cap).unwrap_err().to_string().contains("requires a refined Form"));
+        assert_eq!(s.forms_prototype.as_ref().unwrap().definition(), base);
+        s.execute("form.prototype.refine", &json!({"faces":[0],"counts":[2,2]})).unwrap();
+        let form = s.forms_prototype.as_ref().unwrap();
+        let before = form.definition();
+        let face = before.hierarchy.as_ref().unwrap().leaves.len();
+        let undo = form.inspect()["undo"].as_u64().unwrap();
+        let recovery = crate::recovery::capture_bytes(&s).unwrap();
+        let document = s.doc.clone();
+        let automatic = s.execute("form.prototype.topology", &json!({"tool":"fill_hole","edges":[edge]})).unwrap_err().to_string();
+        assert!(automatic.contains("original free boundary") && automatic.contains("New cap"), "{automatic}");
+        let invalid = json!({"tool":"fill_hole","edges":[edge,[edge[1],edge[0]]],"fill_mode":"new_cap"});
+        for request in [
+            invalid.clone(),
+            json!({"tool":"fill_hole","vertices":[usize::MAX],"fill_mode":"new_cap"}),
+            json!({"tool":"fill_hole","edges":[edge],"faces":[0],"fill_mode":"new_cap"}),
+        ] {
+            assert!(s.execute("form.prototype.topology", &request).is_err());
+            assert_eq!(crate::recovery::capture_bytes(&s).unwrap(), recovery);
+        }
+
+        let mut notched = s.scratch();
+        notched.execute("form.prototype.topology", &json!({"tool":"delete_faces","faces":[1]})).unwrap();
+        let notch = notched.forms_prototype.as_ref().unwrap().definition();
+        let h = notch.hierarchy.as_ref().unwrap();
+        let rings = crate::doc::forms::match_openings(&notch.cage, Some(h)).unwrap();
+        let outer = rings.iter().max_by_key(|rim| rim.len()).unwrap();
+        let vertex = *outer.iter().find(|id| h.controls.contains_key(id)).unwrap();
+        let unchanged = crate::recovery::capture_bytes(&notched).unwrap();
+        let error = notched.execute("form.prototype.topology", &json!({"tool":"fill_hole","vertices":[vertex]})).unwrap_err().to_string();
+        assert!(error.contains("mix original free edges and deleted material"), "{error}");
+        assert!(!error.contains("Choose New cap"));
+        assert_eq!(crate::recovery::capture_bytes(&notched).unwrap(), unchanged);
+
+        let mut mirrored = Session::default();
+        mirrored.execute("form.prototype.create", &json!({"primitive":"face","segments":[3,3,1],"levels":0})).unwrap();
+        mirrored.execute("form.prototype.symmetry", &json!({"axis":0})).unwrap();
+        mirrored.execute("form.prototype.refine", &json!({"faces":[0],"counts":[2,2]})).unwrap();
+        let unchanged = crate::recovery::capture_bytes(&mirrored).unwrap();
+        let error = mirrored.execute("form.prototype.topology", &new_cap).unwrap_err().to_string();
+        assert!(error.contains("without Match or symmetry"), "{error}");
+        assert_eq!(crate::recovery::capture_bytes(&mirrored).unwrap(), unchanged);
+
+        s.execute("form.prototype.tool.begin", &json!({})).unwrap();
+        assert!(s.execute("form.prototype.tool.preview", &json!({"topology":invalid})).is_err());
+        assert_eq!(s.forms_prototype.as_ref().unwrap().definition(), before);
+        assert_eq!(s.forms_prototype.as_ref().unwrap().inspect()["undo"], undo);
+        s.execute("form.prototype.tool.preview", &json!({"topology":new_cap})).unwrap();
+        let preview = s.forms_prototype.as_ref().unwrap();
+        let authored = preview.definition();
+        assert_eq!(authored.cage, before.cage);
+        assert_eq!(authored.hierarchy.as_ref().unwrap().quad_cap_face(), Some(face));
+        assert_eq!(preview.logical.faces[face].len(), 4);
+        assert_eq!(preview.inspect()["undo"], undo + 1);
+        s.execute("form.prototype.tool.cancel", &json!({})).unwrap();
+        assert_eq!(s.forms_prototype.as_ref().unwrap().definition(), before);
+        assert_eq!(s.forms_prototype.as_ref().unwrap().inspect()["undo"], undo);
+        assert_eq!(s.doc.as_ref(), document.as_ref());
+
+        s.execute("form.prototype.tool.begin", &json!({})).unwrap();
+        s.execute("form.prototype.tool.preview", &json!({"topology":new_cap})).unwrap();
+        s.execute("form.prototype.tool.apply", &json!({})).unwrap();
+        assert_eq!(s.forms_prototype.as_ref().unwrap().definition(), authored);
+        assert_eq!(s.forms_prototype.as_ref().unwrap().inspect()["undo"], undo + 1);
+        assert_eq!(s.doc.as_ref(), document.as_ref());
+        let accepted = crate::recovery::capture_bytes(&s).unwrap();
+        for (command, request) in [
+            ("form.prototype.topology", json!({"tool":"delete_faces","faces":[face,1]})),
+            ("form.prototype.topology", json!({"tool":"bridge","edges":[edge]})),
+            ("form.prototype.symmetry", json!({"axis":0})),
+            ("form.prototype.extrude_drag", json!({"faces":[face],"displacement":[0,0,1]})),
+        ] {
+            assert!(s.execute(command, &request).is_err(), "{command}");
+            assert_eq!(crate::recovery::capture_bytes(&s).unwrap(), accepted, "{command}");
+        }
+        s.execute("form.prototype.undo", &json!({})).unwrap();
+        assert_eq!(s.forms_prototype.as_ref().unwrap().definition(), before);
+        s.execute("form.prototype.redo", &json!({})).unwrap();
+        assert_eq!(s.forms_prototype.as_ref().unwrap().definition(), authored);
+        let id = s.execute("form.prototype.commit", &json!({"tolerance":0.05})).unwrap()["feature"].as_u64().unwrap();
+        let saved = solidcraft_io::write_design(s.doc.as_ref());
+        let mut reopened = Session::new(solidcraft_io::read_design(&saved).unwrap());
+        assert!(reopened.model.result(id).unwrap().error.is_none());
+        reopened.execute("form.edit", &json!({"feature":id})).unwrap();
+        assert_eq!(reopened.forms_prototype.as_ref().unwrap().definition(), authored);
+        assert_eq!(reopened.forms_prototype.as_ref().unwrap().logical.faces[face].len(), 4);
+
+        let old_name = format!("F{id}:FormPatch{}", face + 1);
+        let old = reopened.model.state();
+        let cap_index = crate::doc::naming::face_names(&old.bodies[0]).iter().position(|name| name == &old_name).unwrap();
+        assert!(crate::doc::naming::named_face_point(&old, None, &old_name).is_ok());
+        let ordinal = format!("F{id}:FormPiece{}", cap_index + 1);
+        assert!(crate::doc::naming::named_face_point(&old, None, &ordinal).is_err());
+        let snapshot = crate::recovery::capture_bytes(&reopened).unwrap();
+        let undo = reopened.forms_prototype.as_ref().unwrap().inspect()["undo"].as_u64().unwrap();
+        for invalid in [
+            json!({"tool":"delete_faces","faces":[face,1],"tolerance":0.05}),
+            json!({"tool":"delete_faces","faces":[face],"edges":[edge],"tolerance":0.05}),
+            json!({"tool":"delete_faces","faces":[face],"tolerance":0.0}),
+        ] {
+            assert!(reopened.execute("form.prototype.topology", &invalid).is_err());
+            assert_eq!(crate::recovery::capture_bytes(&reopened).unwrap(), snapshot);
+        }
+        let delete = json!({"tool":"delete_faces","faces":[face],"tolerance":0.05});
+        reopened.execute("form.prototype.topology", &delete).unwrap();
+        let form = reopened.forms_prototype.as_ref().unwrap();
+        let removed = form.definition();
+        let hierarchy = removed.hierarchy.as_ref().unwrap();
+        assert_eq!(hierarchy.quad_cap_face(), None);
+        assert!(hierarchy.has_quad_cap_history());
+        assert_eq!(form.inspect()["undo"], undo + 1);
+        assert!(form.logical.faces[face].is_empty());
+        assert_eq!(removed.cage, authored.cage);
+        assert_eq!(removed.placement, authored.placement);
+        assert_eq!(hierarchy.controls, authored.hierarchy.as_ref().unwrap().controls);
+        assert_eq!(hierarchy.details, authored.hierarchy.as_ref().unwrap().details);
+        let (_, old_rim) = authored.hierarchy.as_ref().unwrap().validated_quad_cap().unwrap().unwrap();
+        assert_eq!(hierarchy.quad_cap_rim(&[edge], &[]).unwrap(), old_rim);
+        assert!(reopened.execute("form.prototype.topology", &delete).is_err());
+        assert!(reopened.execute("form.prototype.topology", &json!({"tool":"bridge","edges":[edge]})).is_err());
+        assert_eq!(reopened.forms_prototype.as_ref().unwrap().definition(), removed);
+        reopened.execute("form.prototype.undo", &json!({})).unwrap();
+        assert_eq!(reopened.forms_prototype.as_ref().unwrap().definition(), authored);
+        reopened.execute("form.prototype.redo", &json!({})).unwrap();
+        assert_eq!(reopened.forms_prototype.as_ref().unwrap().definition(), removed);
+        assert_eq!(reopened.execute("form.prototype.commit", &json!({"tolerance":0.05})).unwrap()["feature"], id);
+        let opened_skin = reopened.model.state();
+        assert!(opened_skin.bodies[0].body.is_surface());
+        assert!(crate::doc::naming::named_face_point(&opened_skin, None, &old_name).is_err());
+
+        let bytes = solidcraft_io::write_design(reopened.doc.as_ref());
+        let mut reopened = Session::new(solidcraft_io::read_design(&bytes).unwrap());
+        reopened.execute("form.edit", &json!({"feature":id})).unwrap();
+        assert_eq!(reopened.forms_prototype.as_ref().unwrap().definition(), removed);
+        reopened.execute("form.prototype.refine", &json!({"faces":[3],"counts":[4,4]})).unwrap();
+        let next = reopened.forms_prototype.as_ref().unwrap().hierarchy.as_ref().unwrap().leaves.len();
+        assert!(next > face + 1);
+        reopened.execute("form.prototype.topology", &new_cap).unwrap();
+        let form = reopened.forms_prototype.as_ref().unwrap();
+        assert_eq!(form.hierarchy.as_ref().unwrap().quad_cap_face(), Some(next));
+        assert!(form.logical.faces[face].is_empty());
+        assert_eq!(form.logical.faces[next].len(), 4);
+        assert_eq!(reopened.execute("form.prototype.commit", &json!({"tolerance":0.05})).unwrap()["feature"], id);
+        let recapped = reopened.model.state();
+        assert!(crate::doc::naming::named_face_point(&recapped, None, &old_name).is_err());
+        assert!(crate::doc::naming::named_face_point(&recapped, None, &format!("F{id}:FormPatch{}", next + 1)).is_ok());
+    }
+
+    #[test]
+    fn refined_erase_and_fill_previews_a_new_owned_cap_and_applies_one_checkpoint() {
+        let mut s = Session::default();
+        s.execute("form.prototype.create", &json!({"primitive":"face","dimensions":[8,8,1],"segments":[4,4,1],"levels":0})).unwrap();
+        s.execute("form.prototype.refine", &json!({"faces":[10],"counts":[2,2]})).unwrap();
+        let form = s.forms_prototype.as_ref().unwrap();
+        let before = form.definition();
+        let hierarchy = before.hierarchy.as_ref().unwrap();
+        let faces: Vec<_> = hierarchy.leaves.iter().enumerate().filter_map(|(id, leaf)| (leaf.active && leaf.root == 10).then_some(id)).collect();
+        assert_eq!(faces.len(), 4);
+        let cap = hierarchy.leaves.len();
+        let undo = form.inspect()["undo"].as_u64().unwrap();
+        let original = s.doc.clone();
+        let recovery = crate::recovery::capture_bytes(&s).unwrap();
+        for invalid in [
+            json!({"tool":"erase_and_fill","faces":[0],"tolerance":0.05}),
+            json!({"tool":"erase_and_fill","faces":faces,"vertices":[0],"tolerance":0.05}),
+            json!({"tool":"erase_and_fill","faces":faces,"tolerance":1.1}),
+        ] {
+            assert!(s.execute("form.prototype.topology", &invalid).is_err());
+            assert_eq!(crate::recovery::capture_bytes(&s).unwrap(), recovery);
+        }
+        let request = json!({"topology":{"tool":"erase_and_fill","faces":faces,"tolerance":0.05}});
+        s.execute("form.prototype.tool.begin", &json!({})).unwrap();
+        s.execute("form.prototype.tool.preview", &request).unwrap();
+        let form = s.forms_prototype.as_ref().unwrap();
+        let replacement = form.definition();
+        assert_eq!(replacement.cage, before.cage);
+        assert_eq!(replacement.hierarchy.as_ref().unwrap().quad_cap_face(), Some(cap));
+        assert_eq!(form.logical.faces[cap].len(), 4);
+        assert!(faces.iter().all(|&id| form.logical.faces[id].is_empty()));
+        assert_eq!(form.inspect()["undo"], undo + 1);
+        s.execute("form.prototype.tool.cancel", &json!({})).unwrap();
+        assert_eq!(s.forms_prototype.as_ref().unwrap().definition(), before);
+        assert_eq!(s.forms_prototype.as_ref().unwrap().inspect()["undo"], undo);
+        assert_eq!(s.doc.as_ref(), original.as_ref());
+
+        s.execute("form.prototype.tool.begin", &json!({})).unwrap();
+        s.execute("form.prototype.tool.preview", &request).unwrap();
+        s.execute("form.prototype.tool.apply", &json!({})).unwrap();
+        assert_eq!(s.forms_prototype.as_ref().unwrap().definition(), replacement);
+        assert_eq!(s.forms_prototype.as_ref().unwrap().inspect()["undo"], undo + 1);
+        assert_eq!(s.doc.as_ref(), original.as_ref());
+        s.execute("form.prototype.undo", &json!({})).unwrap();
+        assert_eq!(s.forms_prototype.as_ref().unwrap().definition(), before);
+        s.execute("form.prototype.redo", &json!({})).unwrap();
+        assert_eq!(s.forms_prototype.as_ref().unwrap().definition(), replacement);
+        let restored = crate::recovery::restore_bytes(&crate::recovery::capture_bytes(&s).unwrap(), None).unwrap();
+        assert_eq!(restored.forms_prototype.as_ref().unwrap().definition(), replacement);
+    }
+
+    #[test]
+    fn a_hierarchical_crease_preserves_the_exact_ridge_in_cad_and_undo() {
+        use crate::geom::subdivision::{hierarchy::Hierarchy, primitives::Parameters};
+        use std::collections::BTreeSet;
+
+        let parameters = Parameters { kind: "face".into(), dimensions: [20.0, 20.0, 1.0], segments: [1; 3], ..Default::default() };
+        let mut h = Hierarchy::new(parameters.build().unwrap()).unwrap().subdivide(&[0], [2, 1]).unwrap();
+        let mut roof = h.evaluate().unwrap();
+        for point in &mut roof.points {
+            point.z = 8.0 - 0.8 * point.x.abs();
+        }
+        h = h.with_evaluator(&roof).unwrap();
+        let layout = h.layout().unwrap();
+        let (seam, path) = layout.paths.iter().find(|(_, p)| p.iter().all(|&v| roof.points[v].x == 0.0)).unwrap();
+        assert_eq!(path.len(), 3);
+        assert!(!h.controls.contains_key(&path[1]), "the evaluator midpoint is not a selectable point");
+        let before = crate::doc::forms::Definition {
+            cage: h.evaluate().unwrap(),
+            hierarchy: Some(h.clone()),
+            parameters,
+            imported: None,
+            matching: None,
+            pipe: None,
+            placement: Default::default(),
+            profile: None,
+            symmetry: None,
+        };
+        let mut s =
+            Session { forms_prototype: Some(crate::forms_prototype::Form::from_definition(before.clone(), 1, None).unwrap()), ..Default::default() };
+        assert!(s.forms_prototype.as_ref().unwrap().surface.vertices[path[1]].z < 8.0);
+        let sharp = json!({"tool":"crease","edges":[seam],"distance":10});
+        let applied = s.execute("form.prototype.topology", &sharp).unwrap();
+        assert_eq!(applied["undo"], 1);
+        let after = s.forms_prototype.as_ref().unwrap().definition();
+        let hierarchy = after.hierarchy.as_ref().unwrap();
+        assert_eq!(hierarchy.base, h.base);
+        assert_eq!(hierarchy.details, h.details);
+        assert_eq!(hierarchy.leaves, h.leaves);
+        assert_eq!(hierarchy.controls, h.controls);
+        assert_eq!(hierarchy.layout().unwrap().faces, layout.faces);
+        assert_eq!(after.cage.faces, before.cage.faces);
+        assert_eq!(after.cage.points, before.cage.points);
+        let expected: BTreeSet<_> = path.windows(2).map(|p| [p[0].min(p[1]), p[0].max(p[1])]).collect();
+        assert_eq!(after.cage.edge_creases.iter().map(|c| c.edge).collect::<BTreeSet<_>>(), expected);
+        assert!(after.cage.edge_creases.iter().all(|c| c.sharpness == 10.0));
+        assert_eq!(s.execute("form.prototype.topology", &sharp).unwrap()["undo"], 1);
+        let recovery = crate::recovery::capture_bytes(&s).unwrap();
+        let error = s.execute("form.prototype.topology", &json!({"tool":"uncrease","vertices":[path[1]]})).unwrap_err();
+        assert!(error.to_string().contains("active logical point"), "{error}");
+        assert_eq!(crate::recovery::capture_bytes(&s).unwrap(), recovery);
+        s.execute("form.prototype.undo", &json!({})).unwrap();
+        assert_eq!(s.forms_prototype.as_ref().unwrap().definition(), before);
+        s.execute("form.prototype.redo", &json!({})).unwrap();
+        assert_eq!(s.forms_prototype.as_ref().unwrap().definition(), after);
+
+        assert!(hierarchy.fit_root_patches(0.01).unwrap_err().to_string().contains("local sharpness"));
+        let (body, report) = crate::doc::forms::convert(&after, 0.01).unwrap();
+        assert!(body.is_surface() && !body.is_mesh());
+        assert!(!report.trimmed_roots);
+        assert_eq!(report.patch_roots.iter().copied().collect::<BTreeSet<_>>(), BTreeSet::from([1, 2]));
+        let native: Vec<_> = body
+            .record()
+            .edges
+            .iter()
+            .enumerate()
+            .filter_map(|(id, edge)| {
+                let [a, b] = edge.uses.as_slice() else { return None };
+                (report.patch_roots[a.face as usize] != report.patch_roots[b.face as usize]).then_some(id)
+            })
+            .collect();
+        assert!(!native.is_empty(), "the ridge must be a shared native edge between the two logical faces");
+        for edge in crate::kernel::edge_geometry(&body, &native).unwrap() {
+            for t in [0.0, 0.5, 1.0] {
+                let (point, tangent) = edge.at(t).unwrap();
+                assert!(point.x.abs() < 1e-7 && (point.z - 8.0).abs() < 1e-7);
+                assert!(tangent.x.abs() < 1e-7 && tangent.z.abs() < 1e-7);
+            }
+        }
+
+        assert_eq!(s.execute("form.prototype.topology", &json!({"tool":"uncrease","edges":[seam]})).unwrap()["undo"], 2);
+        assert_eq!(s.forms_prototype.as_ref().unwrap().definition(), before);
+    }
+
+    #[test]
+    fn hierarchical_crease_mirrors_evaluator_segments_and_active_points() {
+        let mut s = Session::default();
+        s.execute("form.prototype.create", &json!({"primitive":"face","dimensions":[30,20,1],"segments":[3,1,1],"levels":1})).unwrap();
+        s.execute("form.prototype.symmetry", &json!({"axis":0})).unwrap();
+        s.execute("form.prototype.refine", &json!({"faces":[0],"counts":[2,1]})).unwrap();
+        let form = s.forms_prototype.as_ref().unwrap();
+        let before = form.definition();
+        let h = before.hierarchy.as_ref().unwrap();
+        let layout = h.layout().unwrap();
+        let (seam, path) = layout.paths.iter().find(|(_, p)| p.iter().all(|&v| (before.cage.points[v].x + 10.0).abs() < 1e-10)).unwrap();
+        assert_eq!(path.len(), 3);
+        let point = seam[0];
+        let partners = &before.symmetry.as_ref().unwrap().partners;
+        assert_ne!(partners[point], point);
+        s.execute("form.prototype.topology", &json!({"tool":"crease","edges":[seam],"vertices":[point],"distance":2.5})).unwrap();
+        let after = s.forms_prototype.as_ref().unwrap().definition();
+        assert_eq!(after.symmetry, before.symmetry);
+        after.symmetry.as_ref().unwrap().validate_reflection(&after.cage).unwrap();
+        assert_eq!(after.cage.edge_creases.len(), 4);
+        assert_eq!(after.cage.vertex_creases.len(), 2);
+        assert!(after.cage.edge_creases.iter().all(|c| c.sharpness == 2.5));
+        assert!(after.cage.vertex_creases.iter().all(|c| c.sharpness == 2.5));
+        s.execute("form.prototype.topology", &json!({"tool":"uncrease","edges":[seam],"vertices":[point]})).unwrap();
+        assert_eq!(s.forms_prototype.as_ref().unwrap().definition(), before);
+    }
+
+    #[test]
+    fn hierarchical_crease_refuses_match_without_changing_source_or_history() {
+        let (mut s, _, _) = matched_extrusion_case(1, true);
+        let form = s.forms_prototype.as_ref().unwrap();
+        let h = form.hierarchy.as_ref().unwrap();
+        let (edge, _) = h.layout().unwrap().paths.into_iter().find(|(e, _)| e.iter().any(|&v| v >= h.base.points.len())).unwrap();
+        let before = form.inspect();
+        let recovery = crate::recovery::capture_bytes(&s).unwrap();
+        let error = s.execute("form.prototype.topology", &json!({"tool":"crease","edges":[edge],"distance":3})).unwrap_err();
+        assert!(error.to_string().contains("detach Match"), "{error}");
+        assert_eq!(s.forms_prototype.as_ref().unwrap().inspect(), before);
+        assert_eq!(crate::recovery::capture_bytes(&s).unwrap(), recovery);
+    }
+
     #[test]
     fn logical_topology_keeps_the_evaluator_and_is_one_atomic_history_step() {
         let mut s = Session::default();
@@ -3264,6 +4469,1074 @@ mod tests {
         assert_eq!(s.forms_prototype.as_ref().unwrap().inspect(), after);
         s.execute("form.prototype.undo", &json!({})).unwrap();
         assert_eq!(s.forms_prototype.as_ref().unwrap().definition(), refined);
+    }
+    fn nested_loop_fixture(primitive: &str) -> Session {
+        let mut s = Session::default();
+        s.execute("form.prototype.create", &json!({"primitive":primitive,"size":10,"segments":[1,1,1],"levels":0})).unwrap();
+        for level in 1..=2 {
+            let faces: Vec<_> = s
+                .forms_prototype
+                .as_ref()
+                .unwrap()
+                .logical
+                .faces
+                .iter()
+                .enumerate()
+                .filter_map(|(id, face)| (!face.is_empty()).then_some(id))
+                .collect();
+            s.execute("form.prototype.refine", &json!({"faces":faces,"counts":[2,2]})).unwrap();
+            let f = s.forms_prototype.as_ref().unwrap();
+            let vertex = *f.hierarchy.as_ref().unwrap().controls.iter().find(|(_, authoring)| **authoring == level).unwrap().0;
+            let p = f.cage.points[vertex] + solidcore_record::Vec3::new(0.03, -0.02, 0.04) * level as f64;
+            s.execute("form.prototype.set_vertices", &json!({"vertices":[vertex],"positions":[[p.x,p.y,p.z]]})).unwrap();
+            if level == 1 {
+                s.execute("form.prototype.topology", &json!({"tool":"crease","vertices":[0],"distance":0.3})).unwrap();
+            }
+        }
+        s
+    }
+
+    #[test]
+    fn hierarchical_loop_preserves_nested_details_ids_exact_endpoints_history_and_source_reopen() {
+        for primitive in ["box", "face"] {
+            for fraction in [0.3, 0.5, 0.7] {
+                let mut s = nested_loop_fixture(primitive);
+                let f = s.forms_prototype.as_ref().unwrap();
+                let face = f.logical.faces.iter().find(|face| !face.is_empty()).unwrap();
+                let seed = [face[0], face[1]];
+                let records = f.hierarchical_loop_records(seed, fraction).unwrap();
+                assert_eq!(records.first().unwrap().0 == records.last().unwrap().0, primitive == "box");
+                let before = f.definition();
+                let old = before.hierarchy.as_ref().unwrap();
+                assert!(old.details[1].iter().any(|detail| detail.delta.len() > 0.001));
+                assert!(old.details[2].iter().any(|detail| detail.delta.len() > 0.001));
+                assert!(!old.base.vertex_creases.is_empty());
+                let depth = f.inspect()["undo"].as_u64().unwrap();
+                let plan: Vec<_> = records.windows(2).map(|pair| old.insert_target(pair[0].0, pair[1].0).unwrap()).collect();
+                let curves = crate::doc::forms::edge_curves(&before, 0.01, &records.iter().map(|record| record.0).collect::<Vec<_>>()).unwrap();
+                let targets: Vec<_> = curves.iter().zip(&records).map(|(curve, record)| curve.at(record.1).unwrap()).collect();
+                s.execute("form.prototype.insert_loop", &json!({"edge":seed,"fraction":fraction})).unwrap();
+                let f = s.forms_prototype.as_ref().unwrap();
+                let after = f.definition();
+                let h = after.hierarchy.as_ref().unwrap();
+                assert_eq!(f.inspect()["undo"].as_u64().unwrap(), depth + 1);
+                assert_eq!(h.base, old.base);
+                assert_eq!(h.sharpness, old.sharpness);
+                for (&id, &level) in &old.controls {
+                    assert_eq!(h.controls.get(&id), Some(&level));
+                }
+                for (level, details) in old.details.iter().enumerate() {
+                    for detail in details {
+                        assert!(h.details[level].contains(detail), "insertion must retain existing authored detail records");
+                    }
+                }
+                for (id, leaf) in old.leaves.iter().enumerate() {
+                    let mut expected = leaf.clone();
+                    if plan.iter().any(|&(parent, _)| parent == id) {
+                        expected.active = false;
+                    }
+                    assert_eq!(h.leaves[id], expected, "old leaf slots must not be reordered or overwritten");
+                }
+                let endpoints: std::collections::BTreeSet<_> =
+                    plan.iter().flat_map(|&(parent, axis)| h.seam_endpoints(parent, axis).unwrap()).collect();
+                let unique_edges: std::collections::BTreeSet<_> = records.iter().map(|record| record.0).collect();
+                assert_eq!(endpoints.len(), unique_edges.len(), "the closed seed endpoint must be deduplicated");
+                for &id in &endpoints {
+                    assert!(!old.controls.contains_key(&id));
+                }
+                for target in targets {
+                    assert!(endpoints.iter().any(|&id| f.surface.vertices[id].dist(target) <= 0.01));
+                }
+                s.execute("form.prototype.undo", &json!({})).unwrap();
+                assert_eq!(s.forms_prototype.as_ref().unwrap().definition(), before);
+                s.execute("form.prototype.redo", &json!({})).unwrap();
+                assert_eq!(s.forms_prototype.as_ref().unwrap().definition(), after);
+                let decoded: crate::doc::forms::Definition = serde_json::from_slice(&serde_json::to_vec(&after).unwrap()).unwrap();
+                let reopened = crate::forms_prototype::Form::from_definition(decoded, 0, None).unwrap();
+                assert_eq!(reopened.definition(), after);
+            }
+        }
+    }
+
+    #[test]
+    fn hierarchical_loop_seed_orientation_and_open_strip_order_preserve_parameter_direction() {
+        for primitive in ["box", "face"] {
+            let mut s = nested_loop_fixture(primitive);
+            let f = s.forms_prototype.as_ref().unwrap();
+            let face = f.logical.faces.iter().find(|face| !face.is_empty()).unwrap();
+            let seed = [face[0], face[1]];
+            let before = f.definition();
+            let forward = f.hierarchical_loop_records(seed, 0.3).unwrap();
+            let reverse = f.hierarchical_loop_records([seed[1], seed[0]], 0.7).unwrap();
+            assert_eq!(forward.len(), reverse.len());
+            for (a, b) in forward.iter().zip(&reverse) {
+                assert_eq!(a.0, b.0);
+                assert!((a.1 - b.1).abs() < 1e-12);
+            }
+            // Pick an interior strip edge as well as the boundary seed: both
+            // halves must concatenate without reversing the edge parameter.
+            if primitive == "face" {
+                let interior = forward[forward.len() / 2];
+                let records = f.hierarchical_loop_records(interior.0, interior.1).unwrap();
+                let a: std::collections::BTreeMap<_, _> = forward.iter().copied().collect();
+                let b: std::collections::BTreeMap<_, _> = records.iter().copied().collect();
+                assert_eq!(a.len(), b.len());
+                for (edge, fraction) in a {
+                    assert!((fraction - b[&edge]).abs() < 1e-12);
+                }
+            }
+            s.execute("form.prototype.insert_loop", &json!({"edge":seed,"fraction":0.3})).unwrap();
+            let a = s.forms_prototype.as_ref().unwrap().definition();
+            let mut reversed =
+                Session { forms_prototype: Some(crate::forms_prototype::Form::from_definition(before, 0, None).unwrap()), ..Default::default() };
+            reversed.execute("form.prototype.insert_loop", &json!({"edge":[seed[1],seed[0]],"fraction":0.7})).unwrap();
+            let b = reversed.forms_prototype.as_ref().unwrap().definition();
+            assert_eq!(a.hierarchy.as_ref().unwrap().leaves, b.hierarchy.as_ref().unwrap().leaves);
+            for (a, b) in a.cage.points.iter().zip(&b.cage.points) {
+                assert!(a.dist(*b) < 1e-8);
+            }
+        }
+    }
+
+    #[test]
+    fn hierarchical_loop_refusals_leave_source_history_and_recovery_untouched() {
+        let mut s = Session::default();
+        s.execute("form.prototype.create", &json!({"segments":[1,1,1],"levels":0})).unwrap();
+        s.execute("form.prototype.refine", &json!({"faces":[0],"counts":[2,2]})).unwrap();
+        let face = s.forms_prototype.as_ref().unwrap().logical.faces.iter().find(|face| face.len() > 4).unwrap();
+        let seed = [face[0], face[1]];
+        let before = s.forms_prototype.as_ref().unwrap().inspect();
+        let recovery = crate::recovery::capture_bytes(&s).unwrap();
+        let refusal = s.execute("form.prototype.insert_loop", &json!({"edge":seed,"fraction":0.3})).unwrap_err();
+        assert!(refusal.to_string().contains("aligned dyadic"), "{refusal}");
+        for parameters in [json!({"edge":[99999,99998]}), json!({"edge":seed,"fraction":0}), json!({"edge":seed,"fraction":1})] {
+            assert!(s.execute("form.prototype.insert_loop", &parameters).is_err());
+        }
+        assert_eq!(s.forms_prototype.as_ref().unwrap().inspect(), before);
+        assert_eq!(crate::recovery::capture_bytes(&s).unwrap(), recovery);
+
+        let mut symmetric = Session::default();
+        symmetric.execute("form.prototype.create", &json!({"segments":[1,1,1],"levels":0})).unwrap();
+        symmetric.execute("form.prototype.symmetry", &json!({"axis":0})).unwrap();
+        symmetric.execute("form.prototype.refine", &json!({"faces":[0],"counts":[2,2]})).unwrap();
+        let face = symmetric.forms_prototype.as_ref().unwrap().logical.faces.iter().find(|face| face.len() > 4).unwrap();
+        let seed = [face[0], face[1]];
+        let before = symmetric.forms_prototype.as_ref().unwrap().inspect();
+        let recovery = crate::recovery::capture_bytes(&symmetric).unwrap();
+        let refusal = symmetric.execute("form.prototype.insert_loop", &json!({"edge":seed,"fraction":0.3})).unwrap_err();
+        assert!(refusal.to_string().contains("aligned dyadic"), "{refusal}");
+        assert_eq!(symmetric.forms_prototype.as_ref().unwrap().inspect(), before);
+        assert_eq!(crate::recovery::capture_bytes(&symmetric).unwrap(), recovery);
+    }
+
+    #[test]
+    fn hierarchical_loop_target_budget_and_insert_point_public_record_limit_are_atomic() {
+        use solidcore_record::Vec3;
+        use solidcraft_geom::subdivision::{Cage, hierarchy::Hierarchy};
+        let mut s = Session::default();
+        s.execute("form.prototype.create", &json!({"primitive":"face","segments":[1,1,1],"levels":0})).unwrap();
+        let mut definition = s.forms_prototype.as_ref().unwrap().definition();
+        // 256 regular quads require 257 distinct boundary-to-boundary targets.
+        let cage = Cage {
+            points: (0..=256).flat_map(|x| [Vec3::new(x as f64, 0.0, 0.0), Vec3::new(x as f64, 1.0, 0.0)]).collect(),
+            faces: (0..256).map(|x| vec![2 * x, 2 * x + 2, 2 * x + 3, 2 * x + 1]).collect(),
+            ..Default::default()
+        };
+        definition.hierarchy = Some(Hierarchy::new(cage.clone()).unwrap());
+        definition.cage = cage;
+        s.forms_prototype = Some(crate::forms_prototype::Form::from_definition(definition, 0, None).unwrap());
+        let before = s.forms_prototype.as_ref().unwrap().inspect();
+        let recovery = crate::recovery::capture_bytes(&s).unwrap();
+        let refusal = s.execute("form.prototype.insert_loop", &json!({"edge":[0,1]})).unwrap_err();
+        assert!(refusal.to_string().contains("256 unique"), "{refusal}");
+        let too_many = vec![json!({"edge":[0,1],"fraction":0.5}); 33];
+        let refusal = s.execute("form.prototype.insert_points", &json!({"points":too_many})).unwrap_err();
+        assert!(refusal.to_string().contains("2..32"), "{refusal}");
+        assert_eq!(s.forms_prototype.as_ref().unwrap().inspect(), before);
+        assert_eq!(crate::recovery::capture_bytes(&s).unwrap(), recovery);
+    }
+
+    #[test]
+    fn hierarchical_loop_depth_budget_refuses_without_a_history_or_source_change() {
+        let mut s = Session::default();
+        s.execute("form.prototype.create", &json!({"primitive":"face","segments":[1,1,1],"levels":0})).unwrap();
+        s.execute("form.prototype.refine", &json!({"faces":[0],"counts":[16,16]})).unwrap();
+        let f = s.forms_prototype.as_ref().unwrap();
+        let face = f.logical.faces.iter().find(|face| !face.is_empty()).unwrap();
+        let seed = [face[0], face[1]];
+        let before = f.inspect();
+        let recovery = crate::recovery::capture_bytes(&s).unwrap();
+        let refusal = s.execute("form.prototype.insert_loop", &json!({"edge":seed})).unwrap_err();
+        assert!(refusal.to_string().contains("depth budget"), "{refusal}");
+        assert_eq!(s.forms_prototype.as_ref().unwrap().inspect(), before);
+        assert_eq!(crate::recovery::capture_bytes(&s).unwrap(), recovery);
+    }
+
+    #[test]
+    fn hierarchical_loop_rebinds_matched_regular_strips_without_dropping_original_coordinates() {
+        for order in [0, 1, 2] {
+            let (mut s, _, _) = matched_extrusion_case(order, false);
+            s.execute("form.prototype.refine", &json!({"faces":(0..16).collect::<Vec<_>>(),"counts":[2,2]})).unwrap();
+            let f = s.forms_prototype.as_ref().unwrap();
+            let face = f.logical.faces.iter().find(|face| !face.is_empty()).unwrap();
+            let seed = [face[0], face[1]];
+            let records = f.hierarchical_loop_records(seed, 0.3).unwrap();
+            let before = f.definition();
+            let old = before.matching.as_ref().unwrap();
+            let old_ring = crate::doc::forms::match_openings(&before.cage, before.hierarchy.as_ref()).unwrap().remove(0);
+            let curves = crate::doc::forms::edge_curves(&before, 0.01, &records.iter().map(|record| record.0).collect::<Vec<_>>()).unwrap();
+            let targets: Vec<_> = curves.iter().zip(&records).map(|(curve, record)| curve.at(record.1).unwrap()).collect();
+            let plan: Vec<_> =
+                records.windows(2).map(|pair| before.hierarchy.as_ref().unwrap().insert_target(pair[0].0, pair[1].0).unwrap()).collect();
+            let depth = f.inspect()["undo"].as_u64().unwrap();
+            s.execute("form.prototype.insert_loop", &json!({"edge":seed,"fraction":0.3})).unwrap();
+            let f = s.forms_prototype.as_ref().unwrap();
+            let after = f.definition();
+            let matching = f.matching.as_ref().unwrap();
+            let new_ring = crate::doc::forms::match_openings(&f.cage, f.hierarchy.as_ref()).unwrap().remove(0);
+            for (&vertex, coordinate) in old_ring.iter().zip(&old.coordinates) {
+                let station = new_ring.iter().position(|&id| id == vertex).unwrap();
+                assert_eq!(&matching.coordinates[station], coordinate, "G{order}: an original station must retain its saved native coordinate");
+            }
+            let h = f.hierarchy.as_ref().unwrap();
+            let endpoints: std::collections::BTreeSet<_> = plan.iter().flat_map(|&(parent, axis)| h.seam_endpoints(parent, axis).unwrap()).collect();
+            for target in targets {
+                assert!(
+                    endpoints.iter().any(|&id| f.surface.vertices[id].dist(target) <= 0.01),
+                    "G{order}: Match must retain the original CAD insertion target"
+                );
+            }
+            assert!(f.match_report.as_ref().unwrap().position_mm <= matching.config.tolerances.position_mm);
+            assert_eq!(f.inspect()["undo"].as_u64().unwrap(), depth + 1);
+            s.execute("form.prototype.undo", &json!({})).unwrap();
+            assert_eq!(s.forms_prototype.as_ref().unwrap().definition(), before);
+            s.execute("form.prototype.redo", &json!({})).unwrap();
+            assert_eq!(s.forms_prototype.as_ref().unwrap().definition(), after);
+        }
+    }
+
+    fn symmetric_loop_fixture(axis: usize, nested: bool) -> Session {
+        use crate::geom::subdivision::hierarchy::Hierarchy;
+        use solidcore_record::Vec3;
+        let mut s = Session::default();
+        s.execute("form.prototype.create", &json!({"primitive":"face","size":10,"segments":[1,1,1],"levels":0})).unwrap();
+        let mut definition = s.forms_prototype.as_ref().unwrap().definition();
+        for point in &mut definition.cage.points {
+            let (u, v) = (point.x, point.y);
+            let mut coordinates = [0.0; 3];
+            coordinates[axis] = u;
+            coordinates[(axis + 1) % 3] = v;
+            *point = Vec3::new(coordinates[0], coordinates[1], coordinates[2]);
+        }
+        definition.hierarchy = Some(Hierarchy::new(definition.cage.clone()).unwrap());
+        s.forms_prototype = Some(crate::forms_prototype::Form::from_definition(definition, 0, None).unwrap());
+        s.execute("form.prototype.symmetry", &json!({"axis":axis})).unwrap();
+        if nested {
+            for level in 1..=2 {
+                let ids: Vec<_> = s
+                    .forms_prototype
+                    .as_ref()
+                    .unwrap()
+                    .hierarchy
+                    .as_ref()
+                    .unwrap()
+                    .leaves
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(id, leaf)| leaf.active.then_some(id))
+                    .collect();
+                s.execute("form.prototype.refine", &json!({"faces":ids,"counts":[2,2]})).unwrap();
+                let f = s.forms_prototype.as_ref().unwrap();
+                let vertex = *f.hierarchy.as_ref().unwrap().controls.iter().find(|(_, birth)| **birth == level).unwrap().0;
+                let mut displacement = [0.0; 3];
+                displacement[(axis + 2) % 3] = 0.025 * level as f64;
+                let p = f.control_positions()[vertex] + Vec3::new(displacement[0], displacement[1], displacement[2]);
+                s.execute("form.prototype.set_vertices", &json!({"vertices":[vertex],"positions":[[p.x,p.y,p.z]]})).unwrap();
+            }
+        }
+        s
+    }
+
+    fn mirrored_loop_records(f: &crate::forms_prototype::Form, records: &[([usize; 2], f64)]) -> Vec<([usize; 2], f64)> {
+        let symmetry = f.symmetry.as_ref().unwrap();
+        records
+            .iter()
+            .map(|&(edge, fraction)| {
+                let [a, b] = edge.map(|v| symmetry.partners[v]);
+                ([a.min(b), a.max(b)], if a < b { fraction } else { 1.0 - fraction })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn hierarchical_loop_mirrors_disjoint_regular_strips_in_the_placed_local_frame() {
+        use solidcore_record::Vec3;
+        for axis in 0..3 {
+            for placed in [false, true] {
+                let mut s = symmetric_loop_fixture(axis, true);
+                if placed {
+                    let matrix = crate::doc::rigid(Vec3::new(20.0, -8.0, 3.0), Vec3::ZERO, Vec3::new(1.0, 2.0, 3.0), 0.6);
+                    s.execute("form.prototype.transform", &json!({"matrix":matrix})).unwrap();
+                }
+                let f = s.forms_prototype.as_ref().unwrap();
+                let h = f.hierarchy.as_ref().unwrap();
+                let id = h.leaves.iter().position(|leaf| leaf.active && leaf.domain[0] == 0 && leaf.domain[1] == 0).unwrap();
+                let face = &f.logical.faces[id];
+                let seed = [face[0], face[1]];
+                let original_records = f.hierarchical_loop_records(seed, 0.3).unwrap();
+                let mirror = mirrored_loop_records(f, &original_records);
+                let source_parents: std::collections::BTreeSet<_> =
+                    original_records.windows(2).map(|p| h.insert_target(p[0].0, p[1].0).unwrap().0).collect();
+                let mirror_parents: std::collections::BTreeSet<_> = mirror.windows(2).map(|p| h.insert_target(p[0].0, p[1].0).unwrap().0).collect();
+                assert!(source_parents.is_disjoint(&mirror_parents), "fixture must exercise distinct mirrored strips");
+                let records: Vec<_> = original_records.iter().chain(&mirror).copied().collect();
+                let before = f.definition();
+                let curves = crate::doc::forms::edge_curves(&before, 0.01, &records.iter().map(|record| record.0).collect::<Vec<_>>()).unwrap();
+                let targets: Vec<_> = curves.iter().zip(&records).map(|(curve, record)| curve.at(record.1).unwrap()).collect();
+                let undo = f.inspect()["undo"].as_u64().unwrap();
+                s.execute("form.prototype.insert_loop", &json!({"edge":seed,"fraction":0.3})).unwrap();
+                let f = s.forms_prototype.as_ref().unwrap();
+                let after = f.definition();
+                let old_h = before.hierarchy.as_ref().unwrap();
+                let h = after.hierarchy.as_ref().unwrap();
+                let symmetry = f.symmetry.as_ref().unwrap();
+                let old_symmetry = before.symmetry.as_ref().unwrap();
+                assert_eq!(&symmetry.partners[..old_symmetry.partners.len()], old_symmetry.partners.as_slice());
+                assert_eq!(after.placement, before.placement);
+                assert_eq!(h.base, old_h.base);
+                assert_eq!(h.sharpness, old_h.sharpness);
+                for (&id, &birth) in &old_h.controls {
+                    assert_eq!(h.controls.get(&id), Some(&birth));
+                }
+                for (level, details) in old_h.details.iter().enumerate() {
+                    for detail in details {
+                        assert!(h.details[level].contains(detail));
+                    }
+                }
+                let endpoints: std::collections::BTreeSet<_> = original_records
+                    .windows(2)
+                    .chain(mirror.windows(2))
+                    .flat_map(|p| {
+                        let (parent, axis) = old_h.insert_target(p[0].0, p[1].0).unwrap();
+                        h.seam_endpoints(parent, axis).unwrap()
+                    })
+                    .collect();
+                let unique: std::collections::BTreeSet<_> = records.iter().map(|record| record.0).collect();
+                assert_eq!(endpoints.len(), unique.len());
+                for &id in &endpoints {
+                    assert!(!old_h.controls.contains_key(&id));
+                    assert!(endpoints.contains(&symmetry.partners[id]));
+                    assert_eq!(h.controls.get(&id), h.controls.get(&symmetry.partners[id]));
+                }
+                for target in targets {
+                    assert!(endpoints.iter().any(|&id| f.surface.vertices[id].dist(target) <= 0.01));
+                }
+                symmetry.validate_reflection(&f.cage).unwrap();
+                assert_eq!(f.inspect()["undo"].as_u64().unwrap(), undo + 1);
+                s.execute("form.prototype.undo", &json!({})).unwrap();
+                assert_eq!(s.forms_prototype.as_ref().unwrap().definition(), before);
+                s.execute("form.prototype.redo", &json!({})).unwrap();
+                assert_eq!(s.forms_prototype.as_ref().unwrap().definition(), after);
+                let decoded = serde_json::from_slice(&serde_json::to_vec(&after).unwrap()).unwrap();
+                assert_eq!(crate::forms_prototype::Form::from_definition(decoded, 0, None).unwrap().definition(), after);
+            }
+        }
+    }
+
+    #[test]
+    fn hierarchical_loop_deduplicates_self_mirrors_and_refuses_distinct_source_stations_atomically() {
+        for primitive in ["face", "box"] {
+            let mut s = symmetric_loop_fixture(0, false);
+            if primitive == "box" {
+                s.execute("form.prototype.create", &json!({"primitive":"box","size":10,"segments":[1,1,1],"levels":0})).unwrap();
+                let mut definition = s.forms_prototype.as_ref().unwrap().definition();
+                definition.hierarchy = Some(crate::geom::subdivision::hierarchy::Hierarchy::new(definition.cage.clone()).unwrap());
+                s.forms_prototype = Some(crate::forms_prototype::Form::from_definition(definition, 0, None).unwrap());
+                s.execute("form.prototype.symmetry", &json!({"axis":0})).unwrap();
+            }
+            let f = s.forms_prototype.as_ref().unwrap();
+            let face = &f.logical.faces[0];
+            let seed = [face[0], face[1]];
+            let records = f.hierarchical_loop_records(seed, 0.5).unwrap();
+            assert_eq!(records.first().unwrap().0 == records.last().unwrap().0, primitive == "box");
+            let h = f.hierarchy.as_ref().unwrap();
+            let plan: Vec<_> = records.windows(2).map(|p| h.insert_target(p[0].0, p[1].0).unwrap()).collect();
+            let active = h.leaves.iter().filter(|leaf| leaf.active).count();
+            let before = f.definition();
+            let inspect = f.inspect();
+            let recovery = crate::recovery::capture_bytes(&s).unwrap();
+            let refusal = s.execute("form.prototype.insert_loop", &json!({"edge":seed,"fraction":0.3})).unwrap_err();
+            assert!(refusal.to_string().contains("different stations"), "{refusal}");
+            assert_eq!(s.forms_prototype.as_ref().unwrap().definition(), before);
+            assert_eq!(s.forms_prototype.as_ref().unwrap().inspect(), inspect);
+            assert_eq!(crate::recovery::capture_bytes(&s).unwrap(), recovery);
+            let undo = inspect["undo"].as_u64().unwrap();
+            s.execute("form.prototype.insert_loop", &json!({"edge":seed,"fraction":0.5})).unwrap();
+            let f = s.forms_prototype.as_ref().unwrap();
+            let after = f.definition();
+            let h = f.hierarchy.as_ref().unwrap();
+            assert_eq!(h.leaves.iter().filter(|leaf| leaf.active).count(), active + plan.len(), "a self-mirror must refine each parent once");
+            let endpoints: std::collections::BTreeSet<_> = plan.iter().flat_map(|&(parent, axis)| h.seam_endpoints(parent, axis).unwrap()).collect();
+            for id in endpoints {
+                assert_eq!(f.symmetry.as_ref().unwrap().partners[id], id);
+                assert!(f.surface.vertices[id].x.abs() < 1e-8);
+            }
+            assert_eq!(f.inspect()["undo"].as_u64().unwrap(), undo + 1);
+            s.execute("form.prototype.undo", &json!({})).unwrap();
+            assert_eq!(s.forms_prototype.as_ref().unwrap().definition(), before);
+            s.execute("form.prototype.redo", &json!({})).unwrap();
+            assert_eq!(s.forms_prototype.as_ref().unwrap().definition(), after);
+        }
+    }
+
+    #[test]
+    fn hierarchical_loop_refuses_cross_axis_mirror_overlap_without_partial_refinement() {
+        use solidcore_record::Vec3;
+        let mut s = symmetric_loop_fixture(0, false);
+        let mut definition = s.forms_prototype.as_ref().unwrap().definition();
+        // A diamond's X mirror exchanges its root U/V axes. Each strip is
+        // individually regular, but the pair would split this parent twice.
+        for p in &mut definition.cage.points {
+            *p = Vec3::new(p.x - p.y, p.x + p.y, 0.0);
+        }
+        definition.symmetry = Some(crate::geom::subdivision::symmetry::Symmetry::new(&definition.cage, 0).unwrap());
+        definition.hierarchy = Some(crate::geom::subdivision::hierarchy::Hierarchy::new(definition.cage.clone()).unwrap());
+        s.forms_prototype = Some(crate::forms_prototype::Form::from_definition(definition, 0, None).unwrap());
+        let f = s.forms_prototype.as_ref().unwrap();
+        let face = &f.logical.faces[0];
+        let seed = [face[0], face[1]];
+        let before = f.inspect();
+        let recovery = crate::recovery::capture_bytes(&s).unwrap();
+        let refusal = s.execute("form.prototype.insert_loop", &json!({"edge":seed,"fraction":0.5})).unwrap_err();
+        assert!(refusal.to_string().contains("different parent seams"), "{refusal}");
+        assert_eq!(s.forms_prototype.as_ref().unwrap().inspect(), before);
+        assert_eq!(crate::recovery::capture_bytes(&s).unwrap(), recovery);
+    }
+
+    #[test]
+    fn hierarchical_loop_mirrors_matched_targets_without_rebinding_old_native_stations() {
+        use solidcore_record::Vec3;
+        for order in [0, 1, 2] {
+            let mut s = Session::default();
+            s.execute("solid.box", &json!({"length":8,"width":8,"height":1,"corner":[-4,-4,-1],"body_name":"Support"})).unwrap();
+            let body = s.model.state().bodies[0].body.clone();
+            let top = (0..body.face_count()).find(|&id| body.planar_face(id).is_some_and(|p| p.normal().dot(Vec3::Z) > 0.99)).unwrap();
+            s.execute("form.prototype.create", &json!({"primitive":"face","dimensions":[8,8,1],"segments":[4,4,1],"levels":2})).unwrap();
+            s.execute("form.prototype.symmetry", &json!({"axis":0})).unwrap();
+            let ring = crate::doc::forms::match_openings(&s.forms_prototype.as_ref().unwrap().cage, None).unwrap().remove(0);
+            s.execute("form.prototype.match", &json!({"body":"Support","face":top,"edge":[ring[0],ring[1]],"order":order})).unwrap();
+            s.execute("form.prototype.refine", &json!({"faces":(0..16).collect::<Vec<_>>(),"counts":[2,2]})).unwrap();
+            let f = s.forms_prototype.as_ref().unwrap();
+            let h = f.hierarchy.as_ref().unwrap();
+            let parent = h.leaves.iter().position(|leaf| leaf.active && leaf.root == 0 && leaf.domain[0] == 0 && leaf.domain[1] == 0).unwrap();
+            let face = &f.logical.faces[parent];
+            let seed = [face[0], face[1]];
+            let records = f.hierarchical_loop_records(seed, 0.3).unwrap();
+            let mirror = mirrored_loop_records(f, &records);
+            let all: Vec<_> = records.iter().chain(&mirror).copied().collect();
+            let before = f.definition();
+            let original = before.matching.as_ref().unwrap();
+            let old_ring = crate::doc::forms::match_openings(&before.cage, before.hierarchy.as_ref()).unwrap().remove(0);
+            let curves = crate::doc::forms::edge_curves(&before, 0.01, &all.iter().map(|r| r.0).collect::<Vec<_>>()).unwrap();
+            let targets: Vec<_> = curves.iter().zip(&all).map(|(curve, record)| curve.at(record.1).unwrap()).collect();
+            let undo = f.inspect()["undo"].as_u64().unwrap();
+            s.execute("form.prototype.insert_loop", &json!({"edge":seed,"fraction":0.3})).unwrap();
+            let f = s.forms_prototype.as_ref().unwrap();
+            let after = f.definition();
+            let matching = f.matching.as_ref().unwrap();
+            let new_ring = crate::doc::forms::match_openings(&after.cage, after.hierarchy.as_ref()).unwrap().remove(0);
+            assert_eq!(matching.source, original.source);
+            assert_eq!(matching.binding, original.binding);
+            for (&id, coordinate) in old_ring.iter().zip(&original.coordinates) {
+                let station = new_ring.iter().position(|&v| v == id).unwrap();
+                assert_eq!(&matching.coordinates[station], coordinate, "G{order}: old native station");
+            }
+            let h = f.hierarchy.as_ref().unwrap();
+            let endpoints: std::collections::BTreeSet<_> = records
+                .windows(2)
+                .chain(mirror.windows(2))
+                .flat_map(|p| {
+                    let (parent, axis) = before.hierarchy.as_ref().unwrap().insert_target(p[0].0, p[1].0).unwrap();
+                    h.seam_endpoints(parent, axis).unwrap()
+                })
+                .collect();
+            for target in targets {
+                assert!(endpoints.iter().any(|&id| f.surface.vertices[id].dist(target) <= 0.01), "G{order}: original CAD target");
+            }
+            let report = f.match_report.as_ref().unwrap();
+            assert!(report.position_mm <= matching.config.tolerances.position_mm);
+            if order >= 1 {
+                assert!(report.tangent_deg <= matching.config.tolerances.tangent_deg);
+            }
+            if order == 2 {
+                assert!(report.curvature_relative <= matching.config.tolerances.curvature_relative);
+            }
+            f.symmetry.as_ref().unwrap().validate_reflection(&f.cage).unwrap();
+            assert_eq!(f.inspect()["undo"].as_u64().unwrap(), undo + 1);
+            s.execute("form.prototype.undo", &json!({})).unwrap();
+            assert_eq!(s.forms_prototype.as_ref().unwrap().definition(), before);
+            s.execute("form.prototype.redo", &json!({})).unwrap();
+            assert_eq!(s.forms_prototype.as_ref().unwrap().definition(), after);
+        }
+    }
+
+    #[test]
+    fn hierarchical_loop_mirror_union_budget_counts_both_strips_without_partial_refinement() {
+        use crate::geom::subdivision::{Cage, hierarchy::Hierarchy};
+        use solidcore_record::Vec3;
+        let mut s = symmetric_loop_fixture(0, false);
+        let mut definition = s.forms_prototype.as_ref().unwrap().definition();
+        let cage = Cage {
+            points: (0..=128).flat_map(|y| (0..=2).map(move |x| Vec3::new(f64::from(x) - 1.0, f64::from(y), 0.0))).collect(),
+            faces: (0..128).flat_map(|y| (0..2).map(move |x| vec![3 * y + x, 3 * y + x + 1, 3 * (y + 1) + x + 1, 3 * (y + 1) + x])).collect(),
+            ..Default::default()
+        };
+        definition.symmetry = Some(crate::geom::subdivision::symmetry::Symmetry::new(&cage, 0).unwrap());
+        definition.hierarchy = Some(Hierarchy::new(cage.clone()).unwrap());
+        definition.cage = cage;
+        s.forms_prototype = Some(crate::forms_prototype::Form::from_definition(definition, 0, None).unwrap());
+        let before = s.forms_prototype.as_ref().unwrap().inspect();
+        let recovery = crate::recovery::capture_bytes(&s).unwrap();
+        let refusal = s.execute("form.prototype.insert_loop", &json!({"edge":[0,1],"fraction":0.3})).unwrap_err();
+        assert!(refusal.to_string().contains("256 unique"), "{refusal}");
+        assert_eq!(s.forms_prototype.as_ref().unwrap().inspect(), before);
+        assert_eq!(crate::recovery::capture_bytes(&s).unwrap(), recovery);
+    }
+
+    fn aligned_loop_fixture() -> (Session, [usize; 2]) {
+        let mut s = Session::default();
+        s.execute("form.prototype.create", &json!({"primitive":"face","dimensions":[8,4,1],"segments":[2,1,1],"levels":0})).unwrap();
+        s.execute("form.prototype.refine", &json!({"faces":[1],"counts":[2,2]})).unwrap();
+        let f = s.forms_prototype.as_ref().unwrap();
+        let vertex = *f.hierarchy.as_ref().unwrap().controls.iter().find(|(_, birth)| **birth == 1).unwrap().0;
+        let p = f.control_positions()[vertex] + Vec3::new(0.0, 0.0, 0.08);
+        s.execute("form.prototype.set_vertices", &json!({"vertices":[vertex],"positions":[[p.x,p.y,p.z]]})).unwrap();
+        let sides = s.forms_prototype.as_ref().unwrap().hierarchy.as_ref().unwrap().parameter_sides().unwrap();
+        let seed = sides.iter().find(|leaf| leaf.id == 0).unwrap().sides[3][0].edge;
+        (s, seed)
+    }
+
+    #[test]
+    fn insert_loop_contract_accepts_legacy_edges_and_requires_one_unambiguous_seed() {
+        let legacy = serde_json::from_value::<params::InsertLoop>(json!({"edge":[2,1]})).unwrap();
+        let params::InsertLoop::Edge(legacy) = legacy else { panic!("legacy edge shape must remain valid") };
+        assert_eq!(legacy.edge, [2, 1]);
+        assert_eq!(legacy.fraction, 0.5);
+        let face = serde_json::from_value::<params::InsertLoop>(json!({"face":1,"axis":0,"tolerance":0.05})).unwrap();
+        let params::InsertLoop::Face(face) = face else { panic!("face/axis must use its own seed") };
+        assert_eq!((face.face, face.axis, face.tolerance), (1, 0, Some(0.05)));
+        for invalid in [json!({"edge":[2,1],"face":1,"axis":0}), json!({"face":1,"axis":0,"fraction":0.5}), json!({"face":1})] {
+            assert!(serde_json::from_value::<params::InsertLoop>(invalid).is_err());
+        }
+    }
+    #[test]
+    fn hierarchical_loop_aligned_t_continuation_reuses_fine_seams_and_preserves_history_and_placement() {
+        for (placed, fraction) in [(false, 0.25), (true, 0.25), (false, 0.5), (true, 0.5)] {
+            let (mut s, seed) = aligned_loop_fixture();
+            if placed {
+                let matrix = crate::doc::rigid(Vec3::new(12.0, -4.0, 9.0), Vec3::ZERO, Vec3::new(1.0, 2.0, 3.0), 0.7);
+                s.execute("form.prototype.transform", &json!({"matrix":matrix})).unwrap();
+            }
+            let f = s.forms_prototype.as_ref().unwrap();
+            let before = f.definition();
+            let old = before.hierarchy.as_ref().unwrap();
+            let plan = old.aligned_loop(seed, fraction).unwrap();
+            assert_eq!(plan.existing_edges.len(), if fraction == 0.5 { 2 } else { 0 });
+            let undo = f.inspect()["undo"].as_u64().unwrap();
+            let curves =
+                crate::doc::forms::edge_curves(&before, 0.01, &plan.points.iter().map(|point| point.source_edge).collect::<Vec<_>>()).unwrap();
+            let targets: Vec<_> = curves.iter().zip(&plan.points).map(|(curve, point)| curve.at(point.fraction).unwrap()).collect();
+            s.execute("form.prototype.insert_loop", &json!({"edge":seed,"fraction":fraction})).unwrap();
+            let f = s.forms_prototype.as_ref().unwrap();
+            let after = f.definition();
+            let h = after.hierarchy.as_ref().unwrap();
+            assert_eq!(h.evaluate().unwrap(), old.evaluate().unwrap().refined(h.depth - old.depth).unwrap());
+            assert_eq!(&h.details[..old.details.len()], old.details.as_slice());
+            assert_eq!(after.placement, before.placement);
+            assert_eq!(h.leaves.iter().filter(|leaf| leaf.active).count(), if fraction == 0.5 { 6 } else { 8 });
+            let ids = h.aligned_loop_vertices(&plan.points).unwrap();
+            for ((point, &id), target) in plan.points.iter().zip(&ids).zip(targets) {
+                assert!(f.surface.vertices[id].dist(target) <= 0.01);
+                if let Some(old) = point.existing {
+                    assert_eq!(old, id);
+                }
+            }
+            let layout = h.layout().unwrap();
+            for edge in &plan.existing_edges {
+                assert!(layout.paths.iter().any(|(other, _)| other == edge));
+            }
+            assert_eq!(f.inspect()["undo"].as_u64().unwrap(), undo + 1);
+            s.execute("form.prototype.undo", &json!({})).unwrap();
+            assert_eq!(s.forms_prototype.as_ref().unwrap().definition(), before);
+            s.execute("form.prototype.redo", &json!({})).unwrap();
+            assert_eq!(s.forms_prototype.as_ref().unwrap().definition(), after);
+            let decoded = serde_json::from_slice(&serde_json::to_vec(&after).unwrap()).unwrap();
+            assert_eq!(crate::forms_prototype::Form::from_definition(decoded, 0, None).unwrap().definition(), after);
+        }
+    }
+    #[test]
+    fn hierarchical_loop_aligned_mixed_depth_closed_and_mirrored_plans_do_not_balance_extra_faces() {
+        for symmetric in [false, true] {
+            let mut s = Session::default();
+            s.execute("form.prototype.create", &json!({"primitive":"box","segments":[1,1,1],"levels":0})).unwrap();
+            if symmetric {
+                s.execute("form.prototype.symmetry", &json!({"axis":2})).unwrap();
+            }
+            s.execute("form.prototype.refine", &json!({"faces":[0],"counts":[2,2]})).unwrap();
+            let f = s.forms_prototype.as_ref().unwrap();
+            let before = f.definition();
+            let h = before.hierarchy.as_ref().unwrap();
+            let face = f.logical.faces.iter().find(|face| face.len() > 4).unwrap();
+            let seed = [face[0], face[1]];
+            let mut cuts = h.aligned_loop(seed, 0.5).unwrap().cuts;
+            if let Some(symmetry) = &before.symmetry {
+                cuts.extend(h.aligned_loop(seed.map(|id| symmetry.partners[id]), 0.5).unwrap().cuts);
+            }
+            let unique: std::collections::BTreeSet<_> = cuts.iter().map(|cut| (cut.parent, cut.axis, cut.coordinate)).collect();
+            let active = h.leaves.iter().filter(|leaf| leaf.active).count();
+            s.execute("form.prototype.insert_loop", &json!({"edge":seed,"fraction":0.5})).unwrap();
+            let f = s.forms_prototype.as_ref().unwrap();
+            let h = f.hierarchy.as_ref().unwrap();
+            assert_eq!(h.leaves.iter().filter(|leaf| leaf.active).count(), active + unique.len());
+            assert_eq!(h.base, before.hierarchy.as_ref().unwrap().base);
+            if let Some(symmetry) = &f.symmetry {
+                symmetry.validate_reflection(&f.cage).unwrap();
+            }
+            s.execute("form.prototype.undo", &json!({})).unwrap();
+            assert_eq!(s.forms_prototype.as_ref().unwrap().definition(), before);
+        }
+    }
+    #[test]
+    fn hierarchical_loop_aligned_mixed_depth_match_keeps_original_g0_g1_g2_native_stations() {
+        for order in [0, 1, 2] {
+            let (mut s, _, _) = matched_extrusion_case(order, false);
+            s.execute("form.prototype.refine", &json!({"faces":[0],"counts":[2,2]})).unwrap();
+            let f = s.forms_prototype.as_ref().unwrap();
+            let before = f.definition();
+            let h = before.hierarchy.as_ref().unwrap();
+            let sides = h.parameter_sides().unwrap();
+            let coarse = sides.iter().find(|leaf| leaf.id == 1).unwrap();
+            let seed = coarse.sides[1][0].edge;
+            let plan = h.aligned_loop(seed, 0.5).unwrap();
+            assert!(!plan.existing_edges.is_empty());
+            let old = before.matching.as_ref().unwrap();
+            let old_ring = crate::doc::forms::match_openings(&before.cage, Some(h)).unwrap().remove(0);
+            let undo = f.inspect()["undo"].as_u64().unwrap();
+            s.execute("form.prototype.insert_loop", &json!({"edge":seed,"fraction":0.5})).unwrap();
+            let f = s.forms_prototype.as_ref().unwrap();
+            let after = f.definition();
+            let matching = f.matching.as_ref().unwrap();
+            let new_ring = crate::doc::forms::match_openings(&after.cage, after.hierarchy.as_ref()).unwrap().remove(0);
+            assert_eq!(matching.source, old.source);
+            assert_eq!(matching.binding, old.binding);
+            for (&vertex, coordinate) in old_ring.iter().zip(&old.coordinates) {
+                let index = new_ring.iter().position(|&id| id == vertex).unwrap();
+                assert_eq!(&matching.coordinates[index], coordinate, "G{order}: reused rim controls keep their original native station");
+            }
+            let report = f.match_report.as_ref().unwrap();
+            assert!(report.position_mm <= matching.config.tolerances.position_mm);
+            if order > 0 {
+                assert!(report.tangent_deg <= matching.config.tolerances.tangent_deg);
+            }
+            if order == 2 {
+                assert!(report.curvature_relative <= matching.config.tolerances.curvature_relative);
+            }
+            assert_eq!(f.inspect()["undo"].as_u64().unwrap(), undo + 1);
+            s.execute("form.prototype.undo", &json!({})).unwrap();
+            assert_eq!(s.forms_prototype.as_ref().unwrap().definition(), before);
+            s.execute("form.prototype.redo", &json!({})).unwrap();
+            assert_eq!(s.forms_prototype.as_ref().unwrap().definition(), after);
+        }
+    }
+
+    fn aligned_match_seam_band(cage: &solidcraft_geom::subdivision::Cage, rim: &[usize], rows: usize) -> std::collections::BTreeSet<usize> {
+        let edges = cage.edges().unwrap();
+        let mut band: std::collections::BTreeSet<_> = rim.iter().copied().collect();
+        for _ in 0..rows {
+            let mut next = band.clone();
+            for &[a, b] in &edges {
+                if band.contains(&a) || band.contains(&b) {
+                    next.extend([a, b]);
+                }
+            }
+            band = next;
+        }
+        band
+    }
+
+    fn refine_aligned_match_and_sculpt(s: &mut Session, sculpt_face: usize, order: usize, amount: f64) -> [usize; 2] {
+        assert!(sculpt_face > 1, "keep the original refinement root and adjacent coarse seed");
+        let f = s.forms_prototype.as_ref().unwrap();
+        // One subdivision step retains old IDs, appends edge points, then
+        // appends face points in source face order. Refine an interior face
+        // as well as root 0 so the sculpt uses a genuinely new control.
+        let control = f.cage.points.len() + f.cage.edges().unwrap().len() + sculpt_face;
+        s.execute("form.prototype.refine", &json!({"faces":[0,sculpt_face],"counts":[2,2]}))
+            .unwrap_or_else(|error| panic!("G{order} initial mixed-depth refinement: {error}"));
+        let f = s.forms_prototype.as_ref().unwrap();
+        let h = f.hierarchy.as_ref().unwrap();
+        assert_eq!(h.depth, 1);
+        assert_eq!(h.controls.get(&control), Some(&1));
+        let rim = crate::doc::forms::match_openings(&f.cage, Some(h)).unwrap().remove(0);
+        assert_eq!(rim.len(), 32);
+        assert!(!aligned_match_seam_band(&f.cage, &rim, 2).contains(&control), "the fine sculpt must lie beyond both inward seam rows");
+        let rest = f.control_positions()[control];
+        let evaluated_rest = f.surface.vertices[control];
+        let old_detail = h.details[1].iter().find(|d| d.vertex == control).map_or(Vec3::ZERO, |d| d.delta);
+        let target = rest + Vec3::Z * amount;
+        s.execute("form.prototype.set_vertices", &json!({"vertices":[control],"positions":[[target.x,target.y,target.z]]})).unwrap();
+        let f = s.forms_prototype.as_ref().unwrap();
+        assert!(f.control_positions()[control].dist(target) < 1e-8, "G{order}: the edit must first reach the fine control");
+        let source = f.definition();
+        let (resolved, report) = source
+            .matching
+            .as_ref()
+            .unwrap()
+            .recompute(&source, &match_state(s).unwrap(), 0.01)
+            .unwrap_or_else(|error| panic!("G{order} sculpted baseline Match: {error}"));
+        s.forms_prototype.as_mut().unwrap().refresh_match_preview(resolved, report).unwrap();
+        let f = s.forms_prototype.as_ref().unwrap();
+        let h = f.hierarchy.as_ref().unwrap();
+        let detail = h.details[1].iter().find(|d| d.vertex == control).unwrap();
+        assert!((detail.delta - old_detail).dist(Vec3::Z * amount) < 1e-8, "G{order}: retain the authored fine detail after Match");
+        assert!(f.control_positions()[control].dist(target) < 1e-8, "G{order}: Match must retain the interior control target");
+        assert!(f.surface.vertices[control].dist(evaluated_rest) > 0.001, "G{order}: the source baseline must retain a real evaluated fine sculpt");
+        let sides = h.parameter_sides().unwrap();
+        sides.iter().find(|leaf| leaf.id == 1).unwrap().sides[1][0].edge
+    }
+
+    fn curved_aligned_loop_match_fixture(order: usize) -> (Session, [usize; 2]) {
+        use solidcraft_geom::bspline::NurbsSurface;
+        let mut s = Session::default();
+        // The pinned 5Ã—5 cage is a uniform cubic tensor spline. At each
+        // endpoint reflect the first interior coefficient through the endpoint.
+        // The extended interior cubic mask then reduces to the open boundary
+        // mask on the rim and the pinned mask at corners. A polynomial through
+        // the unextended control points is a different surface.
+        let coordinates = [-6.0, -4.0, -2.0, 0.0, 2.0, 4.0, 6.0];
+        let squares = [28.0, 16.0, 4.0, 0.0, 4.0, 16.0, 28.0];
+        let points: Vec<_> =
+            (0..7).flat_map(|v| (0..7).map(move |u| Vec3::new(coordinates[u], coordinates[v], 0.005 * squares[u] + 0.004 * squares[v]))).collect();
+        let knots: Vec<_> = (-3..=7).map(|i| f64::from(i) / 4.0).collect();
+        let patch = NurbsSurface::new([3, 3], [knots.clone(), knots], &points, &[1.0; 49]).unwrap();
+        assert!(patch.eval(0.1, 0.2).unwrap().z > patch.eval(0.5, 0.5).unwrap().z + 0.05);
+        let body = crate::kernel::nurbs_sheet(&patch).unwrap();
+        let step = crate::kernel::step_export(&[&body], "SolidCraft").unwrap();
+        let id = s
+            .doc_mut()
+            .add_feature(
+                crate::doc::FeatureKind::Import { file: "original-cubic-support.step".into(), step: step.into(), components: vec![], skip: vec![] },
+                Some("CurvedSupport"),
+            )
+            .unwrap();
+        s.doc_mut().feature_mut(id).unwrap().body_names = vec!["CurvedSupport".into()];
+        s.refresh();
+        assert!(s.model.result(id).unwrap().error.is_none());
+        assert!(
+            s.model.state().body("CurvedSupport").unwrap().body.planar_face(0).is_none(),
+            "the native source must remain curved after STEP roundtrip"
+        );
+        s.execute("form.prototype.create", &json!({"primitive":"face","dimensions":[8,8,1],"segments":[4,4,1],"levels":1})).unwrap();
+        let f = s.forms_prototype.as_ref().unwrap();
+        let ids: Vec<_> = (0..f.cage.points.len()).collect();
+        let positions: Vec<_> = f.cage.points.iter().map(|p| [p.x, p.y, 0.005 * p.x * p.x + 0.004 * p.y * p.y]).collect();
+        s.execute("form.prototype.set_vertices", &json!({"vertices":ids,"positions":positions})).unwrap();
+        let f = s.forms_prototype.as_ref().unwrap();
+        let ring = crate::doc::forms::match_openings(&f.cage, None).unwrap().remove(0);
+        s.execute("form.prototype.match", &json!({"body":"CurvedSupport","face":0,"edge":[ring[0],ring[1]],"order":order}))
+            .unwrap_or_else(|error| panic!("G{order} initial cornered Match: {error}"));
+        let f = s.forms_prototype.as_ref().unwrap();
+        assert_eq!(f.cage.vertex_creases.iter().filter(|v| v.sharpness == 10.0 && ring.contains(&v.vertex)).count(), 4);
+        // Root 5 is interior to the 4Ã—4 grid. Its fine face point is
+        // three control edges from the nearest rim vertex.
+        let seed = refine_aligned_match_and_sculpt(&mut s, 5, order, 0.025);
+        (s, seed)
+    }
+
+    fn aligned_old_seam_view(before: &crate::doc::forms::Definition, after: &crate::doc::forms::Definition) -> crate::doc::forms::Definition {
+        let mut view = after.clone();
+        // The actual continued evaluator/Matching basis remains authoritative.
+        // Restore only original logical regions so their exact old restrictions
+        // can still be requested after insertion splits those visible edges.
+        view.hierarchy.as_mut().unwrap().leaves = before.hierarchy.as_ref().unwrap().leaves.clone();
+        assert_eq!(view.hierarchy.as_ref().unwrap().evaluate().unwrap(), after.cage);
+        view
+    }
+
+    #[test]
+    fn hierarchical_loop_aligned_quarter_sculpted_cornered_support_preserves_actual_old_cad_seams() {
+        for order in [1, 2] {
+            let (mut s, seed) = curved_aligned_loop_match_fixture(order);
+            let f = s.forms_prototype.as_ref().unwrap();
+            let before = f.definition();
+            let old = before.hierarchy.as_ref().unwrap();
+            let plan = old.aligned_loop(seed, 0.25).unwrap();
+            let refined = old.split_at(&plan.cuts).unwrap();
+            assert_eq!(old.depth, 1);
+            assert_eq!(refined.depth, 2, "this fixture must raise the evaluator depth");
+            let old_edges: Vec<_> = old.layout().unwrap().paths.iter().map(|(edge, _)| *edge).collect();
+            let old_curves = crate::doc::forms::edge_curves(&before, 0.01, &old_edges).unwrap();
+            let anchors = f.surface.vertices.clone();
+            let undo = f.inspect()["undo"].as_u64().unwrap();
+            let expected = if order == 2 {
+                solidcraft_geom::subdivision::matching::refine_g2(&before.cage, 1).unwrap()
+            } else {
+                before.cage.refined(1).unwrap()
+            };
+            if order == 2 {
+                let ordinary = before.cage.refined(1).unwrap();
+                assert_eq!(
+                    solidcraft_geom::subdivision::matching::quadratic_extension(&before.cage).unwrap(),
+                    before.cage,
+                    "a rectangular native rim exercises pinned-corner G2, not a ghost ring"
+                );
+                assert_eq!(expected, ordinary);
+            }
+            s.execute("form.prototype.insert_loop", &json!({"edge":seed,"fraction":0.25})).unwrap();
+            let f = s.forms_prototype.as_ref().unwrap();
+            let after = f.definition();
+            f.verify_aligned_continuation(&before).unwrap();
+            let h = after.hierarchy.as_ref().unwrap();
+            assert_eq!(&h.details[..old.details.len()], old.details.as_slice());
+            for (&id, &birth) in &old.controls {
+                assert_eq!(h.controls.get(&id), Some(&birth));
+                assert!(f.surface.vertices[id].dist(anchors[id]) < 1e-7, "G{order}: original evaluated control {id}");
+            }
+            for (a, b) in after.cage.points.iter().zip(&expected.points) {
+                assert!(a.dist(*b) < 1e-8);
+            }
+            // The independent seam oracle is fitted CAD from actual old and
+            // Match-continued sources, never ordinary hierarchy refinement.
+            let view = aligned_old_seam_view(&before, &after);
+            let next_curves = crate::doc::forms::edge_curves(&view, 0.01, &old_edges).unwrap();
+            for (a, b) in old_curves.iter().zip(&next_curves) {
+                for index in 0..=40 {
+                    let t = index as f64 / 40.0;
+                    assert!(a.at(t).unwrap().dist(b.at(t).unwrap()) < 1e-8, "G{order}: original CAD restriction {:?} t={t}", a.edge);
+                }
+            }
+            let old_matching = before.matching.as_ref().unwrap();
+            let matching = after.matching.as_ref().unwrap();
+            assert_eq!(matching.source, old_matching.source);
+            assert_eq!(matching.binding, old_matching.binding);
+            let old_ring = crate::doc::forms::match_openings(&before.cage, Some(old)).unwrap().remove(0);
+            let ring = crate::doc::forms::match_openings(&after.cage, Some(h)).unwrap().remove(0);
+            for (&id, coordinate) in old_ring.iter().zip(&old_matching.coordinates) {
+                let at = ring.iter().position(|&other| other == id).unwrap();
+                assert_eq!(&matching.coordinates[at], coordinate);
+            }
+            let report = f.match_report.as_ref().unwrap();
+            assert!(report.position_mm <= matching.config.tolerances.position_mm);
+            assert!(report.tangent_deg <= matching.config.tolerances.tangent_deg);
+            if order == 2 {
+                assert!(report.curvature_relative <= matching.config.tolerances.curvature_relative);
+            }
+            assert_eq!(f.inspect()["undo"].as_u64(), Some(undo + 1));
+            let restored = crate::recovery::restore_bytes(&crate::recovery::capture_bytes(&s).unwrap(), None).unwrap();
+            assert_eq!(restored.forms_prototype.as_ref().unwrap().definition(), after);
+            s.execute("form.prototype.undo", &json!({})).unwrap();
+            assert_eq!(s.forms_prototype.as_ref().unwrap().definition(), before);
+            s.execute("form.prototype.redo", &json!({})).unwrap();
+            assert_eq!(s.forms_prototype.as_ref().unwrap().definition(), after);
+        }
+    }
+
+    #[test]
+    fn aligned_tensor_coefficient_certificate_covers_interior_without_sampling_and_keeps_rational_basis_exact() {
+        use solidcraft_geom::bspline::NurbsSurface;
+        let points: Vec<_> = (0..4).flat_map(|v| (0..4).map(move |u| Vec3::new(u as f64, v as f64, 0.0))).collect();
+        let mut weights = vec![1.0; 16];
+        weights[5] = 2.0;
+        let knots = [vec![0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0], vec![0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0]];
+        let original = NurbsSurface::new([3, 3], knots.clone(), &points, &weights).unwrap();
+        assert!(crate::forms_prototype::Form::aligned_surface_difference_bound(&original, &original).unwrap() < 1e-12);
+        let mut changed = points.clone();
+        changed[5].z = 0.02;
+        let changed = NurbsSurface::new([3, 3], knots.clone(), &changed, &weights).unwrap();
+        for (u, v) in [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)] {
+            assert_eq!(original.eval(u, v).unwrap(), changed.eval(u, v).unwrap());
+        }
+        let bound = crate::forms_prototype::Form::aligned_surface_difference_bound(&original, &changed).unwrap();
+        assert!((0.02..0.020000000001).contains(&bound), "the coefficient certificate is uniform even when all corner witnesses agree");
+        assert!(original.eval(0.4, 0.4).unwrap().dist(changed.eval(0.4, 0.4).unwrap()) > 0.001);
+        let mut changed_weights = weights.clone();
+        changed_weights[5] = f64::from_bits(changed_weights[5].to_bits() + 1);
+        let changed_weight = NurbsSurface::new([3, 3], knots.clone(), &points, &changed_weights).unwrap();
+        assert!(
+            crate::forms_prototype::Form::aligned_surface_difference_bound(&original, &changed_weight).is_err(),
+            "nearby rational weights are not the same basis"
+        );
+        let reparameterized = NurbsSurface::new([3, 3], [knots[0].iter().map(|u| u + 2.0).collect(), knots[1].clone()], &points, &weights).unwrap();
+        assert!(crate::forms_prototype::Form::aligned_surface_difference_bound(&original, &reparameterized).is_err());
+    }
+
+    fn smooth_circular_aligned_match_fixture(order: usize) -> (Session, [usize; 2]) {
+        use solidcraft_geom::subdivision::primitives::Parameters;
+        let mut s = Session::default();
+        s.execute("solid.cylinder", &json!({"radius":1,"height":1,"body_name":"RoundSupport"})).unwrap();
+        let body = s.model.state().body("RoundSupport").unwrap().body.clone();
+        let top = (0..body.face_count()).find(|&face| body.planar_face(face).is_some_and(|plane| plane.normal().dot(Vec3::Z) > 0.99)).unwrap();
+        let parameters = Parameters { kind: "cylinder".into(), dimensions: [2.0; 3], segments: [2, 3, 1], ..Default::default() };
+        let closed = parameters.build().unwrap();
+        let removed: Vec<_> =
+            closed.faces.iter().enumerate().filter_map(|(id, face)| face.iter().all(|&v| closed.points[v].z == 1.0).then_some(id)).collect();
+        let cage = closed.delete_faces(&removed).unwrap();
+        let ring = cage.boundary_loops().unwrap().remove(0);
+        assert_eq!(ring.len(), 16);
+        let definition = crate::doc::forms::Definition {
+            cage,
+            parameters,
+            imported: None,
+            pipe: None,
+            profile: None,
+            matching: None,
+            symmetry: None,
+            hierarchy: None,
+            placement: Default::default(),
+        };
+        s.forms_prototype = Some(crate::forms_prototype::Form::from_definition(definition, 0, None).unwrap());
+        s.execute("form.prototype.match", &json!({"body":"RoundSupport","face":top,"edge":[ring[0],ring[1]],"order":order})).unwrap();
+        if order == 2 {
+            let f = s.forms_prototype.as_ref().unwrap();
+            assert!(
+                solidcraft_geom::subdivision::matching::quadratic_extension(&f.cage).unwrap().points.len() > f.cage.points.len(),
+                "the circular opening must really use ghost continuation"
+            );
+        }
+        // Root 0 starts at the top opening. Its first non-rim child can
+        // still be one of the controls that Match solves. Use the centre of
+        // a separate coarse face entirely beyond the first inward row.
+        let f = s.forms_prototype.as_ref().unwrap();
+        let rim = crate::doc::forms::match_openings(&f.cage, None).unwrap().remove(0);
+        let band = aligned_match_seam_band(&f.cage, &rim, 1);
+        let sculpt_face = f.cage.faces.iter().enumerate().find(|(id, face)| *id > 1 && face.iter().all(|v| !band.contains(v))).unwrap().0;
+        let seed = refine_aligned_match_and_sculpt(&mut s, sculpt_face, order, 0.015);
+        (s, seed)
+    }
+    #[test]
+    fn hierarchical_loop_aligned_smooth_circular_g2_quarter_preserves_real_continuation_and_old_cad_seams() {
+        for order in [1, 2] {
+            let (mut s, seed) = smooth_circular_aligned_match_fixture(order);
+            let f = s.forms_prototype.as_ref().unwrap();
+            let before = f.definition();
+            let old = before.hierarchy.as_ref().unwrap();
+            let plan = old.aligned_loop(seed, 0.25).unwrap();
+            let proposed = old.split_at(&plan.cuts).unwrap();
+            assert_eq!((old.depth, proposed.depth), (1, 2));
+            let expected = if order == 2 {
+                solidcraft_geom::subdivision::matching::refine_g2(&before.cage, 1).unwrap()
+            } else {
+                before.cage.refined(1).unwrap()
+            };
+            if order == 2 {
+                assert!(expected.points.iter().zip(before.cage.refined(1).unwrap().points).any(|(a, b)| a.dist(b) > 1e-10));
+            }
+            let edges: Vec<_> = old.layout().unwrap().paths.iter().map(|(edge, _)| *edge).collect();
+            let curves = crate::doc::forms::edge_curves(&before, 0.01, &edges).unwrap();
+            let undo = f.inspect()["undo"].as_u64().unwrap();
+            s.execute("form.prototype.insert_loop", &json!({"edge":seed,"fraction":0.25})).unwrap();
+            let f = s.forms_prototype.as_ref().unwrap();
+            let after = f.definition();
+            f.verify_aligned_continuation(&before).unwrap();
+            assert_eq!(&after.hierarchy.as_ref().unwrap().details[..old.details.len()], old.details.as_slice());
+            assert_eq!(crate::doc::forms::match_openings(&after.cage, after.hierarchy.as_ref()).unwrap()[0].len(), 64);
+            let view = aligned_old_seam_view(&before, &after);
+            let actual = crate::doc::forms::edge_curves(&view, 0.01, &edges).unwrap();
+            for (a, b) in curves.iter().zip(&actual) {
+                for index in 0..=40 {
+                    let t = index as f64 / 40.0;
+                    let residual = a.at(t).unwrap().dist(b.at(t).unwrap());
+                    assert!(residual < 1e-8, "smooth G{order}: original CAD restriction {:?} t={t}, residual {residual:.12} mm", a.edge);
+                }
+            }
+            let old_matching = before.matching.as_ref().unwrap();
+            let matching = after.matching.as_ref().unwrap();
+            assert_eq!(matching.source, old_matching.source);
+            assert_eq!(matching.binding, old_matching.binding);
+            let old_ring = crate::doc::forms::match_openings(&before.cage, Some(old)).unwrap().remove(0);
+            let ring = crate::doc::forms::match_openings(&after.cage, after.hierarchy.as_ref()).unwrap().remove(0);
+            for (&id, coordinate) in old_ring.iter().zip(&old_matching.coordinates) {
+                let at = ring.iter().position(|&v| v == id).unwrap();
+                assert_eq!(&matching.coordinates[at], coordinate);
+            }
+            assert!(f.match_report.as_ref().unwrap().meets_tolerances(&matching.config));
+            let restored = crate::recovery::restore_bytes(&crate::recovery::capture_bytes(&s).unwrap(), None).unwrap();
+            let saved = restored.forms_prototype.as_ref().unwrap().definition();
+            assert_eq!(saved, after);
+            let state = match_state(&restored).unwrap();
+            let (recomputed, report) = saved.matching.as_ref().unwrap().recompute(&saved, &state, 0.01).unwrap();
+            assert_eq!(recomputed, saved, "unchanged support must retain the authored CAD chart after reopening");
+            assert!(report.meets_tolerances(&saved.matching.as_ref().unwrap().config));
+            if order == 1 {
+                // An actual fine detail changes the current evaluator rather
+                // than being hidden by the old fitted surface recipe.
+                let mut sculpted = saved.clone();
+                let hierarchy = sculpted.hierarchy.as_ref().unwrap();
+                let rim = crate::doc::forms::match_openings(&sculpted.cage, Some(hierarchy)).unwrap().remove(0);
+                let band = aligned_match_seam_band(&sculpted.cage, &rim, 2);
+                let vertex = (before.cage.points.len()..sculpted.cage.points.len()).find(|id| !band.contains(id)).unwrap();
+                sculpted.cage.points[vertex].z += 0.005;
+                sculpted.hierarchy = Some(hierarchy.with_evaluator(&sculpted.cage).unwrap());
+                let (updated, _) = sculpted.matching.as_ref().unwrap().recompute(&sculpted, &state, 0.01).unwrap();
+                assert!(updated.cage.points[vertex].dist(sculpted.cage.points[vertex]) < 1e-8);
+                let saved_match = serde_json::to_value(updated.matching.as_ref().unwrap()).unwrap();
+                assert!(saved_match.get("continued_surface").is_none(), "later fine sculpt uses a newly qualified current evaluator fit");
+            }
+            assert_eq!(f.inspect()["undo"].as_u64(), Some(undo + 1));
+            s.execute("form.prototype.undo", &json!({})).unwrap();
+            assert_eq!(s.forms_prototype.as_ref().unwrap().definition(), before);
+            s.execute("form.prototype.redo", &json!({})).unwrap();
+            assert_eq!(s.forms_prototype.as_ref().unwrap().definition(), after);
+        }
+    }
+
+    #[test]
+    fn hierarchical_loop_aligned_preservation_guard_rejects_an_unselected_old_control_correction() {
+        let (s, seed) = aligned_loop_fixture();
+        let f = s.forms_prototype.as_ref().unwrap();
+        let before = f.definition();
+        let h = before.hierarchy.as_ref().unwrap();
+        let plan = h.aligned_loop(seed, 0.25).unwrap();
+        let refined = h.split_at(&plan.cuts).unwrap();
+        let mut after = before.clone();
+        after.cage = refined.evaluate().unwrap();
+        after.hierarchy = Some(refined);
+        let candidate = crate::forms_prototype::Form::from_definition(after.clone(), 0, None).unwrap();
+        candidate.verify_aligned_continuation(&before).unwrap();
+        let inserted: std::collections::BTreeSet<_> =
+            candidate.hierarchy.as_ref().unwrap().aligned_loop_vertices(&plan.points).unwrap().into_iter().collect();
+        let old = *h.controls.keys().find(|id| !inserted.contains(id)).unwrap();
+        after.cage.points[old] += Vec3::Z * 0.001;
+        after.hierarchy = Some(after.hierarchy.as_ref().unwrap().with_evaluator(&after.cage).unwrap());
+        let moved = crate::forms_prototype::Form::from_definition(after, 0, None).unwrap();
+        assert!(moved.verify_aligned_continuation(&before).is_err(), "a passing target residual cannot hide another original control moving");
+    }
+
+    #[test]
+    fn hierarchical_loop_aligned_conflicting_mirror_and_subgrid_fraction_refuse_atomically() {
+        let mut s = Session::default();
+        s.execute("form.prototype.create", &json!({"primitive":"box","segments":[1,1,1],"levels":0})).unwrap();
+        s.execute("form.prototype.symmetry", &json!({"axis":0})).unwrap();
+        s.execute("form.prototype.refine", &json!({"faces":[0],"counts":[2,2]})).unwrap();
+        let f = s.forms_prototype.as_ref().unwrap();
+        let seed = {
+            let c = f.hierarchy.as_ref().unwrap().leaf_corners().unwrap()[4].unwrap();
+            [c[0], c[1]]
+        };
+        assert!(f.logical.faces.iter().any(|face| face.len() > 4));
+        let before = f.definition();
+        let inspect = f.inspect();
+        let recovery = crate::recovery::capture_bytes(&s).unwrap();
+        for fraction in [0.25, 1.0 / 32.0, 0.0, 1.0] {
+            assert!(s.execute("form.prototype.insert_loop", &json!({"edge":seed,"fraction":fraction})).is_err());
+            assert_eq!(s.forms_prototype.as_ref().unwrap().definition(), before);
+            assert_eq!(s.forms_prototype.as_ref().unwrap().inspect(), inspect);
+            assert_eq!(crate::recovery::capture_bytes(&s).unwrap(), recovery);
+        }
+        // A refusal must not poison the next supported self-mirrored station.
+        s.execute("form.prototype.insert_loop", &json!({"edge":seed,"fraction":0.5})).unwrap();
+        s.execute("form.prototype.undo", &json!({})).unwrap();
+        assert_eq!(s.forms_prototype.as_ref().unwrap().definition(), before);
     }
     fn insert_records(form: &crate::forms_prototype::Form, face: usize) -> (Value, usize, usize) {
         let h = form.hierarchy.clone().unwrap_or_else(|| solidcraft_geom::subdivision::hierarchy::Hierarchy::new(form.cage.clone()).unwrap());
@@ -3458,6 +5731,362 @@ mod tests {
         assert!(s.forms_prototype.as_ref().unwrap().hierarchy.is_some());
     }
 
+    #[test]
+    fn surface_extrusion_targets_evaluated_caps_absolutely_and_preserves_one_history_action() {
+        use solidcore_record::Vec3;
+        for (whole, hierarchical, placed) in [(false, false, false), (true, false, false), (false, true, false), (false, true, true)] {
+            let mut s = Session::default();
+            s.execute(
+                "form.prototype.create",
+                &json!({"primitive":"face","dimensions":[12,12,1],"segments":if whole {[1,1,1]} else {[2,2,1]},"levels":1}),
+            )
+            .unwrap();
+            let face = if hierarchical {
+                s.execute("form.prototype.refine", &json!({"faces":[0],"counts":[2,2]})).unwrap();
+                let form = s.forms_prototype.as_ref().unwrap();
+                let id = form.hierarchy.as_ref().unwrap().base.faces.len();
+                let vertex = form.logical.faces[id][0];
+                let p = form.surface.vertices[vertex] + Vec3::Z * 0.03;
+                s.execute("form.prototype.set_surface_vertices", &json!({"vertices":[vertex],"positions":[[p.x,p.y,p.z]]})).unwrap();
+                id
+            } else {
+                0
+            };
+            if placed {
+                let matrix = crate::doc::rigid(Vec3::new(11.0, -7.0, 9.0), Vec3::ZERO, Vec3::new(1.0, 2.0, 3.0), 0.6);
+                s.execute("form.prototype.transform", &json!({"matrix":matrix})).unwrap();
+            }
+            let form = s.forms_prototype.as_ref().unwrap();
+            let before = form.definition();
+            let recovery = crate::recovery::capture_bytes(&s).unwrap();
+            let undo = form.inspect()["undo"].as_u64().unwrap();
+            let anchors: Vec<_> = form.logical.faces[face].iter().map(|&id| form.surface.vertices[id]).collect();
+            let delta = form.placement.vector(Vec3::new(0.2, -0.1, 1.0));
+            assert!(
+                s.execute("form.prototype.extrude_drag", &json!({"surface":true,"faces":[face],"displacement":[0,0,1],"checkpoint":false})).is_err()
+            );
+            assert_eq!(crate::recovery::capture_bytes(&s).unwrap(), recovery);
+            for (checkpoint, distance) in [(true, 2.0), (false, 4.0)] {
+                let d = delta * distance;
+                s.execute(
+                    "form.prototype.extrude_drag",
+                    &json!({"surface":true,"faces":[face],"displacement":[d.x,d.y,d.z],"checkpoint":checkpoint}),
+                )
+                .unwrap();
+                let form = s.forms_prototype.as_ref().unwrap();
+                for (&id, &anchor) in form.logical.faces[face].iter().zip(&anchors) {
+                    assert!(form.surface.vertices[id].dist(anchor + d) < 1e-7, "whole={whole}, hierarchy={hierarchical}, placement={placed}");
+                }
+                assert_eq!(form.cage.faces.len(), before.cage.faces.len() + 4);
+                assert_eq!(form.inspect()["undo"].as_u64(), Some(undo + 1));
+                assert_eq!(form.placement, before.placement);
+            }
+            let after = s.forms_prototype.as_ref().unwrap().definition();
+            let accepted = crate::recovery::capture_bytes(&s).unwrap();
+            for params in [
+                json!({"surface":true,"faces":[99999],"displacement":[0,0,5],"checkpoint":false}),
+                json!({"faces":[face],"displacement":[0,0,5],"checkpoint":false}),
+                json!({"surface":true,"faces":[face],"displacement":[0,0,0],"checkpoint":false}),
+            ] {
+                assert!(s.execute("form.prototype.extrude_drag", &params).is_err());
+                assert_eq!(crate::recovery::capture_bytes(&s).unwrap(), accepted);
+            }
+            s.execute("form.prototype.undo", &json!({})).unwrap();
+            assert_eq!(s.forms_prototype.as_ref().unwrap().definition(), before);
+            s.execute("form.prototype.redo", &json!({})).unwrap();
+            assert_eq!(s.forms_prototype.as_ref().unwrap().definition(), after);
+            let decoded = serde_json::from_slice(&serde_json::to_vec(&after).unwrap()).unwrap();
+            assert_eq!(crate::forms_prototype::Form::from_definition(decoded, 1, None).unwrap().definition(), after);
+        }
+        // Omission keeps the existing coefficient-space programmatic contract.
+        let args: params::ExtrudeDrag = serde_json::from_value(json!({"faces":[0],"displacement":[0,0,2]})).unwrap();
+        assert!(!args.surface);
+        let mut raw = Session::default();
+        raw.execute("form.prototype.create", &json!({"primitive":"face","segments":[2,2,1],"levels":1})).unwrap();
+        let before = raw.forms_prototype.as_ref().unwrap().cage.clone();
+        raw.execute("form.prototype.extrude_drag", &json!({"faces":[0],"displacement":[0,0,2]})).unwrap();
+        assert_eq!(raw.forms_prototype.as_ref().unwrap().cage, before.extrude_faces(&[0], Vec3::Z * 2.0).unwrap());
+    }
+
+    #[test]
+    fn oblique_surface_extrusion_retains_coarse_box_cap_profile_and_converts_to_cad() {
+        use solidcore_record::Vec3;
+        use std::collections::BTreeSet;
+
+        let mut s = Session::default();
+        s.execute("form.prototype.create", &json!({"primitive":"box","dimensions":[20,20,20],"segments":[1,1,1],"levels":2})).unwrap();
+        let original = s.forms_prototype.as_ref().unwrap();
+        let before = original.definition();
+        let before_recovery = crate::recovery::capture_bytes(&s).unwrap();
+        let evaluator = before.cage.refined(1).unwrap();
+        let source_points = evaluator.limit_vertices().unwrap();
+        // The first subdivision appends edge points and then face centres.
+        // Cell slots 0..4 are the four children of the original top face.
+        let centre = before.cage.points.len() + before.cage.edges().unwrap().len();
+        let cap_grid: BTreeSet<_> = evaluator.faces[..4].iter().flatten().copied().collect();
+        assert_eq!(cap_grid.len(), 9);
+        assert!(cap_grid.contains(&centre));
+        assert!(source_points[centre].dist(Vec3::new(0.0, 0.0, 680.0 / 81.0)) < 1e-12);
+
+        // Actual displacement captured from the native Shift gesture.
+        let target = Vec3::new(0.9044602749883381, 2.1739930145698736, 1.2695327395815355);
+        let first = target + Vec3::Z * 0.4;
+        let ghost = original.prepare_surface_extrusion_preview(&[0], &[], first, true).unwrap().preview(target).unwrap();
+        let axis = original.prepare_surface_extrusion_preview_on_axis(&[0], &[], first, true, Vec3::Z).unwrap();
+        let axis_preview = axis.preview(target).unwrap();
+        assert_eq!(axis_preview.mesh.triangles, ghost.mesh.triangles);
+        assert_eq!(axis_preview.mesh.tri_face, ghost.mesh.tri_face);
+        assert!(axis_preview.mesh.positions.iter().zip(&ghost.mesh.positions).all(|(a, b)| a.dist(*b) < 1e-9));
+        assert!(axis.preview(target + Vec3::X * 0.02).is_err());
+        assert_eq!(crate::recovery::capture_bytes(&s).unwrap(), before_recovery);
+        let mut first_topology = None;
+        for (checkpoint, displacement) in [(true, first), (false, target)] {
+            s.execute(
+                "form.prototype.extrude_drag",
+                &json!({"surface":true,"faces":[0],"displacement":[displacement.x,displacement.y,displacement.z],"checkpoint":checkpoint}),
+            )
+            .unwrap();
+            let form = s.forms_prototype.as_ref().unwrap();
+            let hierarchy = form.hierarchy.as_ref().unwrap();
+            assert_eq!(hierarchy.base, before.cage);
+            assert_eq!(hierarchy.depth, 1);
+            assert!(hierarchy.details.iter().all(Vec::is_empty), "the authored base and its original levels stay intact");
+            assert_eq!(form.logical.faces.len(), 14);
+            assert_eq!(form.cage.faces.len(), 32);
+            assert!(!hierarchy.controls.contains_key(&centre), "the cap centre is not a new selectable control");
+            assert_eq!(form.inspect()["undo"], 1);
+            for (face, cells) in hierarchy.layout().unwrap().owners[..24].as_chunks::<4>().0.iter().enumerate() {
+                assert!(cells.iter().all(|owner| *owner == Some(face)), "every original logical face retains its four cell owners");
+                if face != 0 {
+                    let corners = &before.cage.faces[face];
+                    let retained: Vec<_> = form.logical.faces[face].iter().copied().filter(|id| corners.contains(id)).collect();
+                    assert_eq!(&retained, corners, "neighbors retain their original boundary corner identities");
+                }
+            }
+            let cap: BTreeSet<_> = form.cage.faces[..4].iter().flatten().copied().collect();
+            for (id, &point) in evaluator.points.iter().enumerate() {
+                if !cap.contains(&id) {
+                    assert_eq!(form.cage.points[id], point, "existing wall-base and neighboring coefficients stay in place");
+                }
+            }
+            for (old, new) in evaluator.faces[..4].iter().zip(&form.cage.faces[..4]) {
+                for (&old, &new) in old.iter().zip(new) {
+                    let expected = source_points[old] + displacement;
+                    assert!(form.surface.vertices[new].dist(expected) < 1e-7, "retain every cap grid station, including its centre");
+                    if !checkpoint {
+                        assert!(ghost.vertices[new].dist(expected) < 1e-7, "the same affine cap response drives the ghost and authored continuation");
+                    }
+                }
+            }
+            if let Some(topology) = &first_topology {
+                assert_eq!(&form.cage.faces, topology);
+                assert_eq!(ghost.mesh.triangles, form.surface.mesh.triangles);
+                assert_eq!(ghost.mesh.tri_face, form.surface.mesh.tri_face);
+            } else {
+                first_topology = Some(form.cage.faces.clone());
+            }
+        }
+
+        let after = s.forms_prototype.as_ref().unwrap().definition();
+        for tolerance in [0.05, 0.01] {
+            let (body, report) = crate::doc::forms::convert(&after, tolerance).unwrap();
+            assert!(report.solid && !body.is_surface() && !body.is_mesh());
+            assert!(report.sampled_deviation_mm <= tolerance);
+            let owners: BTreeSet<_> = report.patch_roots.into_iter().collect();
+            assert_eq!(owners, (0..14).collect(), "CAD conversion keeps all original and new logical face owners");
+        }
+        s.execute("form.prototype.undo", &json!({})).unwrap();
+        let restored = s.forms_prototype.as_ref().unwrap();
+        assert_eq!(restored.definition(), before);
+        assert!(restored.hierarchy.is_none(), "one Undo restores the original base cage");
+        s.execute("form.prototype.redo", &json!({})).unwrap();
+        assert_eq!(s.forms_prototype.as_ref().unwrap().definition(), after);
+        let finished = s.execute("form.prototype.commit", &json!({"operation":"new","tolerance":0.01})).unwrap();
+        let feature = finished["feature"].as_u64().unwrap();
+        assert!(s.model.result(feature).unwrap().error.is_none());
+        assert!(s.forms_prototype.is_none());
+    }
+
+    #[test]
+    fn surface_boundary_extrusion_maps_translated_rim_to_original_evaluated_points() {
+        use solidcore_record::Vec3;
+        for hierarchical in [false, true] {
+            let mut s = Session::default();
+            s.execute("form.prototype.create", &json!({"primitive":"face","dimensions":[12,12,1],"segments":[2,2,1],"levels":1})).unwrap();
+            if hierarchical {
+                s.execute("form.prototype.refine", &json!({"faces":[0],"counts":[2,2]})).unwrap();
+            }
+            let form = s.forms_prototype.as_ref().unwrap();
+            let before = form.definition();
+            let anchors = form.surface.vertices.clone();
+            let ring = form.cage.boundary_loops().unwrap().remove(0);
+            let rim: std::collections::BTreeSet<_> = ring.iter().zip(ring.iter().cycle().skip(1)).map(|(&a, &b)| [a.min(b), a.max(b)]).collect();
+            let edge = if let Some(h) = &form.hierarchy {
+                h.layout()
+                    .unwrap()
+                    .paths
+                    .into_iter()
+                    .find(|(_, path)| path.len() > 2 && path.windows(2).all(|p| rim.contains(&[p[0].min(p[1]), p[0].max(p[1])])))
+                    .unwrap()
+                    .0
+            } else {
+                *rim.first().unwrap()
+            };
+            let undo = form.inspect()["undo"].as_u64().unwrap();
+            for (checkpoint, z) in [(true, 1.0), (false, 3.0)] {
+                s.execute("form.prototype.extrude_drag", &json!({"surface":true,"edges":[edge],"displacement":[0,0,z],"checkpoint":checkpoint}))
+                    .unwrap();
+                let form = s.forms_prototype.as_ref().unwrap();
+                for wall in form.cage.faces.iter().skip(before.cage.faces.len()) {
+                    for (old, new) in [(wall[0], wall[3]), (wall[1], wall[2])] {
+                        assert!(form.surface.vertices[new].dist(anchors[old] + Vec3::Z * z) < 1e-7);
+                    }
+                }
+                assert_eq!(form.inspect()["undo"].as_u64(), Some(undo + 1));
+            }
+            s.execute("form.prototype.undo", &json!({})).unwrap();
+            assert_eq!(s.forms_prototype.as_ref().unwrap().definition(), before);
+        }
+    }
+    #[test]
+    fn surface_extrusion_keeps_mirrored_component_motion_and_projects_joined_seams() {
+        use solidcore_record::Vec3;
+        for (joined, edge_mode, placed) in [(false, false, false), (false, true, true), (true, false, true), (true, true, false)] {
+            let mut s = Session::default();
+            s.execute("form.prototype.create", &json!({"primitive":"face","dimensions":[16,12,1],"segments":[4,3,1],"levels":1})).unwrap();
+            s.execute("form.prototype.symmetry", &json!({"axis":0})).unwrap();
+            if placed {
+                let matrix = crate::doc::rigid(Vec3::new(7.0, 3.0, -4.0), Vec3::ZERO, Vec3::new(1.0, 2.0, 3.0), 0.5);
+                s.execute("form.prototype.transform", &json!({"matrix":matrix})).unwrap();
+            }
+            let form = s.forms_prototype.as_ref().unwrap();
+            let before = form.definition();
+            let undo = form.inspect()["undo"].as_u64().unwrap();
+            let anchors = form.surface.vertices.clone();
+            let face = form
+                .logical
+                .faces
+                .iter()
+                .position(|f| {
+                    f.iter().all(|&id| form.cage.points[id].x >= if joined { 0.0 } else { 4.0 })
+                        && (!joined || f.iter().any(|&id| form.cage.points[id].x == 0.0))
+                })
+                .unwrap();
+            let ring = form.cage.boundary_loops().unwrap().remove(0);
+            let edge = ring
+                .iter()
+                .zip(ring.iter().cycle().skip(1))
+                .find_map(|(&a, &b)| {
+                    let x = [form.cage.points[a].x, form.cage.points[b].x];
+                    (x.iter().all(|&x| x >= if joined { 0.0 } else { 4.0 }) && (!joined || x.contains(&0.0))).then_some([a, b])
+                })
+                .unwrap();
+            let original_faces = form.logical.faces.clone();
+            let selected = form.mirror_face_selection(&[face]).unwrap();
+            for (checkpoint, z) in [(true, 1.0), (false, 3.0)] {
+                let delta = before.placement.vector(Vec3::new(0.5, 0.0, z));
+                s.execute("form.prototype.extrude_drag", &json!({"surface":true,"faces":if edge_mode {vec![]} else {vec![face]},"edges":if edge_mode {vec![edge]} else {vec![]},"displacement":[delta.x,delta.y,delta.z],"checkpoint":checkpoint})).unwrap();
+                let form = s.forms_prototype.as_ref().unwrap();
+                let assert_pair = |old: usize, new: usize| {
+                    let x = if joined {
+                        0.0
+                    } else if before.cage.points[old].x > 0.0 {
+                        0.5
+                    } else {
+                        -0.5
+                    };
+                    let expected = anchors[old] + before.placement.vector(Vec3::new(x, 0.0, z));
+                    assert!(form.surface.vertices[new].dist(expected) < 1e-7, "joined={joined}, edge={edge_mode}, placed={placed}");
+                };
+                if edge_mode {
+                    for wall in form.cage.faces.iter().skip(before.cage.faces.len()) {
+                        assert_pair(wall[0], wall[3]);
+                        assert_pair(wall[1], wall[2]);
+                    }
+                } else {
+                    for &id in &selected {
+                        for (&old, &new) in original_faces[id].iter().zip(&form.logical.faces[id]) {
+                            assert_pair(old, new);
+                        }
+                    }
+                }
+                form.symmetry.as_ref().unwrap().validate_reflection(&form.cage).unwrap();
+                assert_eq!(form.inspect()["undo"].as_u64(), Some(undo + 1));
+            }
+            s.execute("form.prototype.undo", &json!({})).unwrap();
+            assert_eq!(s.forms_prototype.as_ref().unwrap().definition(), before);
+        }
+    }
+    #[test]
+    fn surface_extrusion_qualifies_match_and_feedback_without_moving_original_native_stations() {
+        use solidcore_record::Vec3;
+        for order in [0, 1, 2] {
+            let (mut s, face, _) = matched_extrusion_case(order, false);
+            let form = s.forms_prototype.as_ref().unwrap();
+            let before = form.definition();
+            let recovery = crate::recovery::capture_bytes(&s).unwrap();
+            let original_ids = form.logical.faces[face].clone();
+            let anchors: Vec<_> = original_ids.iter().map(|&id| form.surface.vertices[id]).collect();
+            let undo = form.inspect()["undo"].as_u64().unwrap();
+            let feedback = form.prepare_surface_extrusion_preview(&[face], &[], Vec3::Z * 0.2, true).unwrap();
+            let preview = feedback.preview(Vec3::Z * 0.8).unwrap();
+            assert_eq!(crate::recovery::capture_bytes(&s).unwrap(), recovery);
+            for (checkpoint, z) in [(true, 0.4), (false, 0.8)] {
+                s.execute("form.prototype.extrude_drag", &json!({"surface":true,"faces":[face],"displacement":[0,0,z],"checkpoint":checkpoint}))
+                    .unwrap();
+                let form = s.forms_prototype.as_ref().unwrap();
+                for (&id, &point) in form.logical.faces[face].iter().zip(&anchors) {
+                    assert!(form.surface.vertices[id].dist(point + Vec3::Z * z) < 1e-7, "G{order}");
+                    if !checkpoint {
+                        assert!(preview.vertices[id].dist(point + Vec3::Z * z) < 1e-7, "G{order} ghost");
+                    }
+                }
+                let matching = form.matching.as_ref().unwrap();
+                let old = before.matching.as_ref().unwrap();
+                assert_eq!(matching.coordinates, old.coordinates);
+                assert_eq!(matching.source, old.source);
+                assert_eq!(matching.binding, old.binding);
+                assert_eq!(form.placement, before.placement);
+                let report = form.match_report.as_ref().unwrap();
+                assert!(report.position_mm <= matching.config.tolerances.position_mm);
+                if order > 0 {
+                    assert!(report.tangent_deg <= matching.config.tolerances.tangent_deg);
+                }
+                if order > 1 {
+                    assert!(report.curvature_relative <= matching.config.tolerances.curvature_relative);
+                }
+                assert_eq!(form.inspect()["undo"].as_u64(), Some(undo + 1));
+            }
+            s.execute("form.prototype.undo", &json!({})).unwrap();
+            assert_eq!(s.forms_prototype.as_ref().unwrap().definition(), before);
+        }
+    }
+    #[test]
+    fn surface_extrusion_feedback_follows_evaluated_targets_without_authoring_history() {
+        use solidcore_record::Vec3;
+        for placed in [false, true] {
+            let mut s = Session::default();
+            s.execute("form.prototype.create", &json!({"primitive":"face","dimensions":[12,12,1],"segments":[2,2,1],"levels":1})).unwrap();
+            if placed {
+                let matrix = crate::doc::rigid(Vec3::new(31.0, -17.0, 29.0), Vec3::ZERO, Vec3::new(1.0, 2.0, 3.0), 0.7);
+                s.execute("form.prototype.transform", &json!({"matrix":matrix})).unwrap();
+            }
+            let form = s.forms_prototype.as_ref().unwrap();
+            let recovery = crate::recovery::capture_bytes(&s).unwrap();
+            let anchors: Vec<_> = form.logical.faces[0].iter().map(|&id| form.surface.vertices[id]).collect();
+            let a = form.placement.vector(Vec3::Z * 0.2);
+            let b = form.placement.vector(Vec3::new(0.3, -0.1, 2.0));
+            let response = form.prepare_surface_extrusion_preview(&[0], &[], a, true).unwrap();
+            let preview = response.preview(b).unwrap();
+            assert_eq!(crate::recovery::capture_bytes(&s).unwrap(), recovery);
+            s.execute("form.prototype.extrude_drag", &json!({"surface":true,"faces":[0],"displacement":[b.x,b.y,b.z]})).unwrap();
+            let form = s.forms_prototype.as_ref().unwrap();
+            for (&id, &point) in form.logical.faces[0].iter().zip(&anchors) {
+                assert!(preview.vertices[id].dist(point + b) < 1e-7);
+                assert!(form.surface.vertices[id].dist(preview.vertices[id]) < 1e-7);
+            }
+        }
+    }
     #[test]
     fn local_refinement_insertion_detail_and_drag_extrusion_are_atomic() {
         let mut s = Session::default();
@@ -3729,6 +6358,13 @@ mod tests {
             .find_map(|(a, b)| h.trim_attachments(&[[a, b]]).ok()?.into_iter().find(|t| t.root == 5).map(|t| t.edge))
             .unwrap();
         let undo = form.inspect()["undo"].as_u64().unwrap();
+        let mut surface = s.scratch();
+        surface.execute("form.prototype.extrude_drag", &json!({"surface":true,"edges":[edge],"displacement":[0,0,2]})).unwrap();
+        let surface_form = surface.forms_prototype.as_ref().unwrap();
+        let wall = surface_form.logical.faces.last().unwrap();
+        for (old, new) in [(wall[0], wall[3]), (wall[1], wall[2])] {
+            assert!(surface_form.surface.vertices[new].dist(form.surface.vertices[old] + Vec3::Z * 2.0) < 1e-7);
+        }
         for (checkpoint, z) in [(true, 1.0), (false, 2.0)] {
             s.execute("form.prototype.extrude_drag", &json!({"edges":[edge],"displacement":[0,0,z],"checkpoint":checkpoint})).unwrap();
         }
@@ -3738,6 +6374,11 @@ mod tests {
         let extruded = form.definition();
         let [front] = form.extruded_edges() else { panic!("missing translated trim rim") };
         let front = *front;
+        let mut unsupported = s.scratch();
+        let recovery = crate::recovery::capture_bytes(&unsupported).unwrap();
+        let error = unsupported.execute("form.prototype.topology", &json!({"tool":"crease","edges":[front],"distance":10})).unwrap_err();
+        assert!(error.to_string().contains("remove the derived trim wall"), "{error}");
+        assert_eq!(crate::recovery::capture_bytes(&unsupported).unwrap(), recovery);
         let targets = front.map(|v| {
             let p = form.surface.vertices[v] + Vec3::Z;
             [p.x, p.y, p.z]
@@ -3936,6 +6577,131 @@ mod tests {
         s.execute("form.edit", &json!({"feature":feature})).unwrap();
         assert_eq!(s.forms_prototype.as_ref().unwrap().cage, definition);
     }
+    #[test]
+    fn prepared_form_transforms_match_the_commands_and_preserve_live_document_state() {
+        use crate::forms_prototype::FormTargetSpace;
+        use solidcore_record::Vec3;
+        use std::sync::Arc;
+
+        let mut s = Session::default();
+        s.execute("sketch.create", &json!({"plane":"XY"})).unwrap();
+        s.execute("edit.undo", &json!({})).unwrap();
+        assert!(!s.redo.is_empty(), "the CAD redo is real document history");
+        s.execute("form.prototype.create", &json!({"levels":1})).unwrap();
+        s.execute("form.prototype.refine", &json!({"faces":[0],"counts":[2,2]})).unwrap();
+        let form = s.forms_prototype.as_ref().unwrap();
+        let vertex = *form.hierarchy.as_ref().unwrap().controls.iter().find(|(_, level)| **level == 1).unwrap().0;
+        let start = form.surface.vertices[vertex];
+        let original = form.definition();
+        let undo = form.inspect()["undo"].as_u64().unwrap();
+        let snapshot = s.checkpoint();
+        let doc = s.doc.clone();
+        let model = s.model.state();
+        let redo = s.redo.last().unwrap().doc.clone();
+        let revision = s.revision;
+        s.pending_moves.insert(999, crate::doc::rigid(Vec3::X * 3.0, Vec3::ZERO, Vec3::Z, 0.0));
+        let moves = s.pending_moves.clone();
+        let frame = |delta: Vec3, checkpoint| {
+            let p = start + delta;
+            json!({"vertices":[vertex],"positions":[[p.x,p.y,p.z]],"checkpoint":checkpoint})
+        };
+
+        let preview = s.forms_prototype.as_ref().unwrap().surface.clone();
+        let shares = Arc::strong_count(&preview);
+        let noop = s.prepare_form_transform(FormTargetSpace::Surface, frame(Vec3::ZERO, true)).unwrap();
+        assert_eq!(Arc::strong_count(&preview), shares + 1, "capture pins the existing preview instead of cloning its mesh");
+        let (changed, _) = s.accept_form_transform(noop.compute().unwrap()).unwrap();
+        assert!(!changed);
+        assert_eq!(s.forms_prototype.as_ref().unwrap().inspect()["undo"], undo);
+
+        let mut sync = s.scratch();
+        for (delta, first) in [(Vec3::Z * 0.4, true), (Vec3::new(0.2, 0.0, 0.7), false)] {
+            let p = frame(delta, first);
+            let prepared = s.prepare_form_transform(FormTargetSpace::Surface, p.clone()).unwrap().compute().unwrap();
+            let expected = sync.execute("form.prototype.set_surface_vertices", &p).unwrap();
+            // A view selection can change while the worker runs. Keep the new
+            // live selection, not a worker copy of it.
+            let selection = vec![crate::Sel::Feature { id: 999 }];
+            s.selection = selection.clone();
+            let (changed, reply) = s.accept_form_transform(prepared).unwrap();
+            assert!(changed);
+            assert_eq!(reply, expected);
+            assert_eq!(s.selection, selection);
+            assert!(Arc::ptr_eq(&s.doc, &doc));
+            assert!(Arc::ptr_eq(&s.model.state(), &model));
+            assert!(Arc::ptr_eq(&s.redo.last().unwrap().doc, &redo));
+            assert!(s.undo.is_empty());
+            assert_eq!(s.pending_moves, moves);
+            assert_eq!(s.revision, revision);
+        }
+        let form = s.forms_prototype.as_ref().unwrap();
+        assert!(form.surface.vertices[vertex].dist(start + Vec3::new(0.2, 0.0, 0.7)) < 1e-8);
+        let authored = form.definition();
+        assert_eq!(form.inspect()["undo"], undo + 1);
+        s.execute("form.prototype.undo", &json!({})).unwrap();
+        assert_eq!(s.forms_prototype.as_ref().unwrap().definition(), original);
+        s.execute("form.prototype.redo", &json!({})).unwrap();
+        assert_eq!(s.forms_prototype.as_ref().unwrap().definition(), authored);
+        s.restore_checkpoint(snapshot).unwrap();
+        assert_eq!(s.forms_prototype.as_ref().unwrap().definition(), original);
+    }
+
+    #[test]
+    fn prepared_form_transforms_refuse_stale_sources_and_preserve_command_checks() {
+        use crate::forms_prototype::FormTargetSpace;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let mut s = Session::default();
+        s.execute("form.prototype.create", &json!({"levels":1})).unwrap();
+        let params = json!({"vertices":[0],"positions":[[-20,-20,4]]});
+        let before = s.forms_prototype.as_ref().unwrap().inspect();
+        let checks = Arc::new(AtomicUsize::new(0));
+        let host_checks = checks.clone();
+        s.set_command_check(Some(Arc::new(move |id, p, live| {
+            host_checks.fetch_add(1, Ordering::Relaxed);
+            if id == "form.prototype.set_vertices" && p["vertices"] == json!([0]) && live.forms_prototype.is_some() {
+                Ok(())
+            } else {
+                Err("unexpected command or source".into())
+            }
+        })));
+        let job = s.prepare_form_transform(FormTargetSpace::Control, params.clone()).unwrap();
+        assert_eq!(checks.load(Ordering::Relaxed), 1);
+        let ready = job.compute().unwrap();
+        assert_eq!(checks.load(Ordering::Relaxed), 1, "the worker does not repeat the host check on a copy");
+        s.pending_moves.insert(99, crate::doc::IDENTITY);
+        assert!(s.accept_form_transform(ready).is_err());
+        assert_eq!(s.forms_prototype.as_ref().unwrap().inspect(), before);
+        s.pending_moves.clear();
+
+        let ready = s.prepare_form_transform(FormTargetSpace::Control, params.clone()).unwrap().compute().unwrap();
+        s.active_occurrence_path = Some(vec![12]);
+        assert!(s.accept_form_transform(ready).is_err(), "a moved authoring context invalidates the job");
+        s.active_occurrence_path = None;
+
+        s.param_check = crate::schema::ParamCheck::Strict;
+        let malformed = json!({"vertices":[0],"positions":[[-20,-20,4]],"positons":[]});
+        let mut sync = s.scratch();
+        sync.set_command_check(None);
+        let expected = sync.execute("form.prototype.set_vertices", &malformed).unwrap_err().to_string();
+        let job = s.prepare_form_transform(FormTargetSpace::Control, malformed).unwrap();
+        assert!(matches!(job.compute(), Err(e) if e.to_string() == expected));
+
+        let ready = s.prepare_form_transform(FormTargetSpace::Control, params.clone()).unwrap().compute().unwrap();
+        s.set_command_check(None);
+        s.execute("form.prototype.close", &json!({})).unwrap();
+        s.execute("form.prototype.create", &json!({"levels":1})).unwrap();
+        s.set_command_check(Some(Arc::new(|_, _, _| Ok(()))));
+        assert!(s.accept_form_transform(ready).is_err());
+        assert_eq!(s.forms_prototype.as_ref().unwrap().inspect(), before, "identical geometry from a new draft cannot accept old work");
+
+        s.set_command_check(Some(Arc::new(|_, _, _| Err("denied by host".into()))));
+        assert!(matches!(s.prepare_form_transform(FormTargetSpace::Control, params), Err(EngineError::Refused { .. })));
+        assert_eq!(s.forms_prototype.as_ref().unwrap().inspect(), before);
+    }
+
     #[test]
     fn drag_is_atomic_one_undo_and_never_changes_the_cad_document() {
         let mut s = Session::default();

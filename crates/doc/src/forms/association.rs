@@ -6,11 +6,14 @@ use super::{
 use crate::{BodyName, DocError, ModelBody, ModelState, Result};
 use serde::{Deserialize, Serialize};
 use solidcore_record::Vec3;
-use solidcraft_geom::subdivision::{
-    Cage, EdgeCrease, VertexCrease,
-    fitting::RootBasis,
-    hierarchy::{Hierarchy, Layout, LevelSharpness},
-    matching::{self, Config, Domain, Report, Tolerances},
+use solidcraft_geom::{
+    Vec3Geom,
+    subdivision::{
+        Cage, EdgeCrease, VertexCrease,
+        fitting::{Fit, RootBasis},
+        hierarchy::{Hierarchy, Layout, LevelSharpness},
+        matching::{self, Config, Domain, Report, Tolerances},
+    },
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -186,6 +189,9 @@ pub struct Matching {
     pub config: Config,
     pub coordinates: Vec<BoundaryCoordinate>,
     pub basis: RootBasis,
+    /// The tensor before a topology-only evaluator continuation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    continued_surface: Option<ContinuedSurface>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub vertices: Vec<VertexBackup>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -194,6 +200,14 @@ pub struct Matching {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub crease_ancestors: Vec<LevelSharpness>,
 }
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ContinuedSurface {
+    depth: usize,
+    order: usize,
+    basis: RootBasis,
+}
+
 pub struct MatchRequest {
     pub adjacent_faces: bool,
     pub source: SupportRef,
@@ -232,6 +246,12 @@ impl Matching {
             .and_then(|domain| self.config.validate_domain(domain))
             .map_err(|e| invalid(e.to_string()))?;
         self.basis.validate().map_err(|e| invalid(e.to_string()))?;
+        if let Some(surface) = &self.continued_surface {
+            if surface.order > 2 || hierarchy.is_none_or(|h| surface.depth >= h.depth) {
+                return Err(invalid("invalid retained Match surface depth or order"));
+            }
+            surface.basis.validate().map_err(|e| invalid(e.to_string()))?;
+        }
         if self.coordinates.len() != self.config.coordinates.len()
             || self.coordinates.iter().any(|c| c.curve >= 1024 || !c.fraction.is_finite() || !(0.0..=1.0).contains(&c.fraction))
             || self.vertices.len() > 256
@@ -270,6 +290,77 @@ impl Matching {
             .and_then(|domain| domain.evaluation_order(&self.config))
             .map_err(|e| invalid(e.to_string()))
     }
+    fn continued_prefix(&self, definition: &Definition) -> Result<Option<(&ContinuedSurface, Cage)>> {
+        let Some(surface) = &self.continued_surface else { return Ok(None) };
+        let hierarchy = definition.hierarchy.as_ref().ok_or_else(|| invalid("retained Match has no hierarchy"))?;
+        let levels = hierarchy
+            .depth
+            .checked_sub(surface.depth)
+            .filter(|&levels| levels > 0 && levels <= solidcraft_geom::subdivision::hierarchy::MAX_DEPTH)
+            .ok_or_else(|| invalid("invalid retained Match refinement depth"))?;
+        if self.evaluation_order(&definition.cage, Some(hierarchy))? != surface.order {
+            return Ok(None);
+        }
+        let prefix = hierarchy.evaluate_at_depth(surface.depth).map_err(|e| invalid(e.to_string()))?;
+        if prefix.points.len().saturating_mul(1_usize << (2 * levels)) > 262_144 {
+            return Err(invalid("retained Match continuation exceeds its evaluator control budget"));
+        }
+        let Ok(expected) = (if surface.order == 2 { matching::refine_g2(&prefix, levels) } else { prefix.refined(levels) }) else {
+            return Ok(None);
+        };
+        let cage = &definition.cage;
+        if expected.faces != cage.faces
+            || expected.edge_creases != cage.edge_creases
+            || expected.vertex_creases != cage.vertex_creases
+            || expected.points.len() != cage.points.len()
+            || expected.points.iter().zip(&cage.points).any(|(a, b)| {
+                let scale = a.x.abs().max(a.y.abs()).max(a.z.abs()).max(b.x.abs()).max(b.y.abs()).max(b.z.abs()).max(1.0);
+                !a.is_finite() || !b.is_finite() || a.dist(*b) > 128.0 * f64::EPSILON * scale * (levels + 1).pow(2) as f64
+            })
+        {
+            // A later sculpt may add a real fine coefficient. Its new shape
+            // must be recomputed with the ordinary current evaluator fit.
+            return Ok(None);
+        }
+        Ok(Some((surface, prefix)))
+    }
+
+    fn continued_fit(&self, definition: &Definition, tolerance: f64) -> Result<Option<Fit>> {
+        let Some((surface, prefix)) = self.continued_prefix(definition)? else { return Ok(None) };
+        let depth = definition.hierarchy.as_ref().ok_or_else(|| invalid("retained Match has no hierarchy"))?.depth;
+        let fit = fit_match_core(&prefix, surface.order, &surface.basis, tolerance)?;
+        fit.continued_quad_patches(prefix.faces.len(), depth - surface.depth).map(Some).map_err(|e| invalid(e.to_string()))
+    }
+
+    pub(super) fn cad_fit(&self, definition: &Definition, tolerance: f64) -> Result<Fit> {
+        if let Some(fit) = self.continued_fit(definition, tolerance)? {
+            return Ok(fit);
+        }
+        let order = self.evaluation_order(&definition.cage, definition.hierarchy.as_ref())?;
+        fit_match_core(&definition.cage, order, &self.basis, tolerance)
+    }
+
+    fn source_surface(&self, definition: &Definition) -> Result<(ContinuedSurface, Cage)> {
+        if let Some((surface, prefix)) = self.continued_prefix(definition)? {
+            return Ok((surface.clone(), prefix));
+        }
+        let depth = definition.hierarchy.as_ref().map_or(0, |hierarchy| hierarchy.depth);
+        let order = self.evaluation_order(&definition.cage, definition.hierarchy.as_ref())?;
+        Ok((ContinuedSurface { depth, order, basis: self.basis.clone() }, definition.cage.clone()))
+    }
+
+    /// Qualify the retained tensor ancestry independently of the current
+    /// evaluator net. The output patches restrict this very same original fit.
+    pub fn verify_continued_surface(&self, original: &Definition, refined: &Definition) -> Result<()> {
+        let previous = original.matching.as_ref().ok_or_else(|| invalid("missing original Match surface"))?;
+        let (expected, old) = previous.source_surface(original)?;
+        let (actual, prefix) = self.source_surface(refined)?;
+        if expected != actual || old != prefix {
+            return Err(invalid("aligned insertion changed its original fitted Match surface"));
+        }
+        Ok(())
+    }
+
     fn restore(&self, definition: &mut Definition, detach: bool) -> Result<()> {
         self.validate(&definition.cage, definition.hierarchy.as_ref())?;
         if detach && let Some(hierarchy) = &mut definition.hierarchy {
@@ -356,19 +447,48 @@ impl Matching {
             config,
             coordinates,
             basis: solution.basis,
+            continued_surface: None,
             vertices,
             edges,
             crease_ancestors: Vec::new(),
         }));
         Ok((definition, solution.report))
     }
+    /// Check the current fitted surface against its bound support before a topology-only edit.
+    pub fn qualify_aligned_source(&self, definition: &Definition, state: &ModelState, tolerance: f64) -> Result<(Definition, Report)> {
+        let (support, binding) = self.bound_support(definition, state)?;
+        let mut config = self.config.clone();
+        config.coordinates = self.coordinates.iter().map(|c| support.fraction(c)).collect::<Result<Vec<_>>>()?;
+        let report = support.measure_fitted(definition, &config, &self.cad_fit(definition, tolerance)?)?;
+        if !report.meets_tolerances(&config) {
+            return Err(invalid("refresh Match before inserting a topology-only loop"));
+        }
+        let mut out = definition.clone();
+        let mut matching = self.clone();
+        matching.binding = Some(binding);
+        matching.config = config;
+        out.matching = Some(Box::new(matching));
+        Ok((out, report))
+    }
+
     pub fn recompute(&self, definition: &Definition, state: &ModelState, tolerance: f64) -> Result<(Definition, Report)> {
         let (support, binding) = self.bound_support(definition, state)?;
+        let mut config = self.config.clone();
+        config.coordinates = self.coordinates.iter().map(|c| support.fraction(c)).collect::<Result<Vec<_>>>()?;
+        if let Some(fit) = self.continued_fit(definition, tolerance)? {
+            let report = support.measure_fitted(definition, &config, &fit)?;
+            if report.meets_tolerances(&config) {
+                let mut out = definition.clone();
+                let mut matching = self.clone();
+                matching.binding = Some(binding);
+                matching.config = config;
+                out.matching = Some(Box::new(matching));
+                return Ok((out, report));
+            }
+        }
         let mut base = definition.clone();
         base.matching = None;
         self.restore(&mut base, false)?;
-        let mut config = self.config.clone();
-        config.coordinates = self.coordinates.iter().map(|c| support.fraction(c)).collect::<Result<Vec<_>>>()?;
         let solution = support.solve(&base, &config, tolerance)?;
         let (vertices, edges) = Self::history(&base.cage, &solution.cage);
         install_evaluator(&mut base, solution.cage)?;
@@ -379,6 +499,7 @@ impl Matching {
             config,
             coordinates: self.coordinates.clone(),
             basis: solution.basis,
+            continued_surface: None,
             vertices,
             edges,
             crease_ancestors: self.crease_ancestors.clone(),
@@ -419,13 +540,44 @@ impl Matching {
     }
     /// Follow a subdivision of the bound loop using the old vertex and curve
     /// identities. New controls get coordinates only within their parent span.
-    pub fn rebind_refinement(
+    pub fn rebind_refinement(&self, original: &Definition, refined: Definition, state: &ModelState, tolerance: f64) -> Result<(Definition, Report)> {
+        self.rebind_refinement_with_targets(original, refined, state, tolerance, &BTreeMap::new())
+    }
+    /// Rebind a topology insertion at its original CAD targets. Existing rim
+    /// coordinates remain unchanged; only new controls use these world points,
+    /// each projected within its already identified parent support span.
+    pub fn rebind_refinement_with_targets(
+        &self,
+        original: &Definition,
+        refined: Definition,
+        state: &ModelState,
+        tolerance: f64,
+        targets: &BTreeMap<usize, Vec3>,
+    ) -> Result<(Definition, Report)> {
+        self.rebind(original, refined, state, tolerance, targets, false)
+    }
+    pub fn rebind_aligned_refinement(
+        &self,
+        original: &Definition,
+        refined: Definition,
+        state: &ModelState,
+        tolerance: f64,
+        targets: &BTreeMap<usize, Vec3>,
+    ) -> Result<(Definition, Report)> {
+        self.rebind(original, refined, state, tolerance, targets, true)
+    }
+    fn rebind(
         &self,
         original: &Definition,
         mut refined: Definition,
         state: &ModelState,
         tolerance: f64,
+        targets: &BTreeMap<usize, Vec3>,
+        retain_surface: bool,
     ) -> Result<(Definition, Report)> {
+        if targets.len() > 256 || targets.iter().any(|(&id, point)| id >= refined.cage.points.len() || !point.is_finite()) {
+            return Err(invalid("invalid inserted Match targets"));
+        }
         self.validate(&original.cage, original.hierarchy.as_ref())?;
         let old_depth = original.hierarchy.as_ref().map_or(0, |h| h.depth);
         let depth = refined.hierarchy.as_ref().ok_or_else(|| invalid("expected a refined Match hierarchy"))?.depth;
@@ -455,7 +607,7 @@ impl Matching {
             .into_iter()
             .find(|ring| ring.iter().copied().filter(|&v| v < original.cage.points.len()).eq(old_ring.iter().copied()))
             .ok_or_else(|| invalid("local refinement changed the matched opening"))?;
-        if new_ring.len() == old_ring.len() && depth == old_depth {
+        if !retain_surface && new_ring.len() == old_ring.len() && depth == old_depth {
             return self.recompute(&refined, state, tolerance);
         }
         if new_ring.len() > 64 {
@@ -465,7 +617,19 @@ impl Matching {
         let mut config = self.config.clone();
         config.edge =
             [*new_ring.first().ok_or_else(|| invalid("empty refined opening"))?, *new_ring.get(1).ok_or_else(|| invalid("short refined opening"))?];
-        let coordinates = support.refined_coordinates(&self.coordinates, &old_ring, &new_ring, &refined, &config)?;
+        let retained = if retain_surface {
+            let (surface, prefix) = self.source_surface(original)?;
+            let levels = depth.checked_sub(surface.depth).ok_or_else(|| invalid("aligned Match lost the original fit depth"))?;
+            let fit = fit_match_core(&prefix, surface.order, &surface.basis, tolerance)?;
+            let fit = if levels == 0 { fit } else { fit.continued_quad_patches(prefix.faces.len(), levels).map_err(|e| invalid(e.to_string()))? };
+            Some((surface, fit, levels))
+        } else {
+            None
+        };
+        let exact_targets =
+            retained.as_ref().map(|(_, fit, _)| fitted_rim_targets(&refined, fit, &new_ring, original.cage.points.len(), targets)).transpose()?;
+        let coordinates =
+            support.refined_coordinates(&self.coordinates, &old_ring, &new_ring, &refined, &config, exact_targets.as_ref().unwrap_or(targets))?;
         config.coordinates = coordinates.iter().map(|c| support.fraction(c)).collect::<Result<Vec<_>>>()?;
         let mut crease_ancestors = self.crease_ancestors.clone();
         if depth > old_depth && (!self.edges.is_empty() || !self.vertices.is_empty()) {
@@ -474,6 +638,28 @@ impl Matching {
                 edges: self.edges.iter().map(|e| EdgeCrease { edge: e.edge, sharpness: e.previous.unwrap_or(0.0) }).collect(),
                 vertices: self.vertices.iter().map(|v| VertexCrease { vertex: v.vertex, sharpness: v.previous.unwrap_or(0.0) }).collect(),
             });
+        }
+        if let Some((surface, fit, levels)) = retained {
+            let report = support.measure_fitted(&refined, &config, &fit)?;
+            if !report.meets_tolerances(&config) {
+                return Err(invalid(format!(
+                    "preserved CAD surface does not meet rebound Match: position {:.6} mm, tangent {:.6} degrees, curvature {:.6}",
+                    report.position_mm, report.tangent_deg, report.curvature_relative
+                )));
+            }
+            refined.matching = Some(Box::new(Self {
+                adjacent_faces: self.adjacent_faces,
+                source: self.source.clone(),
+                binding: Some(binding),
+                config,
+                coordinates,
+                basis: self.basis.clone(),
+                continued_surface: (levels > 0).then_some(surface),
+                vertices: if depth == old_depth { self.vertices.clone() } else { Vec::new() },
+                edges: if depth == old_depth { self.edges.clone() } else { Vec::new() },
+                crease_ancestors,
+            }));
+            return Ok((refined, report));
         }
         let solution = support.solve(&refined, &config, tolerance)?;
         let (vertices, edges) = Self::history(&refined.cage, &solution.cage);
@@ -485,6 +671,7 @@ impl Matching {
             config,
             coordinates,
             basis: solution.basis,
+            continued_surface: None,
             vertices,
             edges,
             crease_ancestors,
@@ -492,6 +679,53 @@ impl Matching {
         Ok((refined, solution.report))
     }
 }
+fn fit_match_core(cage: &Cage, order: usize, basis: &RootBasis, tolerance: f64) -> Result<Fit> {
+    let evaluator = if order == 2 {
+        std::borrow::Cow::Owned(matching::quadratic_extension(cage).map_err(|e| invalid(e.to_string()))?)
+    } else {
+        std::borrow::Cow::Borrowed(cage)
+    };
+    let mut fit = basis.fit_checked(&evaluator, tolerance).map_err(|e| invalid(e.to_string()))?;
+    fit.patches.truncate(cage.faces.len());
+    fit.patch_roots.truncate(cage.faces.len());
+    fit.charts.truncate(cage.faces.len());
+    Ok(fit)
+}
+
+fn fitted_rim_targets(
+    definition: &Definition,
+    fit: &Fit,
+    ring: &[usize],
+    old_vertices: usize,
+    requested: &BTreeMap<usize, Vec3>,
+) -> Result<BTreeMap<usize, Vec3>> {
+    let needed: BTreeSet<_> = ring.iter().copied().filter(|&id| id >= old_vertices).collect();
+    let mut exact = BTreeMap::<usize, Vec3>::new();
+    let layout = domain_layout(definition.hierarchy.as_ref())?;
+    let uv = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+    for (face, vertices) in definition.cage.faces.iter().enumerate() {
+        if layout.as_ref().is_some_and(|layout| !layout.owners.get(face).is_some_and(Option::is_some)) {
+            continue;
+        }
+        for (&id, [u, v]) in vertices.iter().zip(uv).filter(|(id, _)| needed.contains(*id)) {
+            let patch = fit.patches.get(face).ok_or_else(|| invalid("retained Match rim has no fitted chart"))?;
+            let point = definition.placement.point(patch.eval(u, v).map_err(|e| invalid(e.to_string()))?);
+            if !point.is_finite()
+                || requested.get(&id).is_some_and(|old| old.dist(point) > 1e-7)
+                || exact.insert(id, point).is_some_and(|old| old.dist(point) > 1e-7)
+            {
+                return Err(invalid("retained Match rim charts disagree at a new control"));
+            }
+        }
+    }
+    if needed.iter().any(|id| !exact.contains_key(id)) {
+        return Err(invalid("retained Match rim is missing a new fitted control station"));
+    }
+    let mut targets = requested.clone();
+    targets.extend(exact);
+    Ok(targets)
+}
+
 impl crate::walk::Walk for Matching {
     fn walk_refs<'a>(&'a self, f: &mut dyn FnMut(crate::walk::RefItem<'a>)) {
         self.source.walk_refs(f)

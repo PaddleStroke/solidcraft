@@ -1,6 +1,50 @@
 //! Exact tensor patches in a smooth regular quad neighborhood.
 use super::*;
 
+/// Reuse exact original patches and fit the remaining roots on a compact
+/// cage when the full next-level reference grid would exceed its budget.
+pub(super) fn fit_neighborhood(cage: &Cage, tolerance: f64) -> Result<Option<Fit>> {
+    let Some(level) = (2..=6).find(|&level| grid_samples_exceed_budget(cage.faces.len(), (1 << (level + 1)) + 1)) else { return Ok(None) };
+    let exact = patches(cage)?;
+    let needed: BTreeSet<_> = cage.faces.iter().zip(&exact).filter(|(_, patch)| patch.is_none()).flat_map(|(face, _)| face.iter().copied()).collect();
+    if needed.is_empty() {
+        return Ok(None);
+    }
+    // Include every face incident to a target corner. One subdivision step
+    // then preserves the entire star of each child corner: an old corner
+    // uses its complete fan, an edge point uses both incident parent faces,
+    // and a face point uses its parent. New faces around other old corners
+    // cannot touch these child corners. Induction retains the target limit
+    // grids even if the exterior of the cropped cage acquires a boundary.
+    let roots: Vec<_> = cage.faces.iter().enumerate().filter_map(|(id, face)| face.iter().any(|v| needed.contains(v)).then_some(id)).collect();
+    if roots.len() == cage.faces.len() {
+        return Ok(None);
+    }
+    let mut neighborhood = cage.clone();
+    neighborhood.faces = roots.iter().map(|&id| cage.faces[id].clone()).collect();
+    let local = neighborhood.finish_edit()?.fit_root_patches_at(tolerance, level)?;
+    if local.patches.len() != roots.len() {
+        return Err(bad("compact CAD fit lost its source charts"));
+    }
+    let mut fitted: BTreeMap<_, _> = roots.into_iter().zip(local.patches).collect();
+    // The common symmetric stations preserve reversed fitted seams. Beside
+    // an exact patch its boundary is already cubic, so interpolation at the
+    // same stations reproduces that same boundary.
+    let patches: Vec<_> = exact
+        .into_iter()
+        .enumerate()
+        .map(|(root, patch)| patch.or_else(|| fitted.remove(&root)).ok_or_else(|| bad("missing compact CAD source patch")))
+        .collect::<Result<_>>()?;
+    Ok(Some(Fit {
+        root_basis: None,
+        patch_roots: (0..patches.len()).collect(),
+        charts: (0..patches.len()).map(PatchChart::whole).collect(),
+        patches,
+        sampled_deviation: local.sampled_deviation,
+        subdivision_level: local.subdivision_level,
+    }))
+}
+
 pub(super) fn patches(cage: &Cage) -> Result<Vec<Option<NurbsSurface>>> {
     let topology = cage.topology()?;
     let sharp_edges: BTreeSet<_> = cage.edge_creases.iter().filter(|e| e.sharpness > 0.0).map(|e| super::super::key(e.edge[0], e.edge[1])).collect();

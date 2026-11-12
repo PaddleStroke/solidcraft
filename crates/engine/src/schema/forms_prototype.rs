@@ -207,6 +207,8 @@ pub struct Topology {
     pub sharp: bool,
     #[serde(default)]
     pub fill_mode: FillMode,
+    /// CAD fit tolerance in millimetres for refined Fill, Erase and Fill or cap removal.
+    pub tolerance: Option<f64>,
 }
 #[derive(Default, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -216,13 +218,28 @@ pub enum FillMode {
     Single,
     Minimal,
     ReducedStar,
+    NewCap,
+}
+#[derive(Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum InsertLoop {
+    Edge(InsertLoopEdge),
+    Face(InsertLoopFace),
 }
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct InsertLoop {
+pub struct InsertLoopEdge {
     pub edge: [usize; 2],
     #[serde(default = "half")]
     pub fraction: f64,
+    pub tolerance: Option<f64>,
+}
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct InsertLoopFace {
+    pub face: usize,
+    pub axis: usize,
+    pub tolerance: Option<f64>,
 }
 fn half() -> f64 {
     0.5
@@ -292,6 +309,22 @@ pub struct Weld {
 }
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct RefinedWeld {
+    pub features: [u64; 2],
+    pub edges: Option<[[usize; 2]; 2]>,
+    pub name: Option<String>,
+}
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RemoveRefinedWeld {
+    pub feature: u64,
+}
+#[derive(Serialize, JsonSchema)]
+pub struct RemovedRefinedWeld {
+    pub feature: u64,
+}
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct Refine {
     pub faces: Vec<usize>,
     #[serde(default = "two")]
@@ -329,6 +362,9 @@ pub struct ExtrudeDrag {
     #[serde(default)]
     pub edges: Vec<[usize; 2]>,
     pub displacement: [f64; 3],
+    /// Target the original evaluated surface plus displacement instead of raw cap controls.
+    #[serde(default)]
+    pub surface: bool,
     #[serde(default = "yes")]
     pub checkpoint: bool,
 }
@@ -383,4 +419,61 @@ pub struct Reply {
     pub redo: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub revision: Option<u64>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Validate {
+    pub tolerance: Option<f64>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckStatus {
+    Passed,
+    Failed,
+    NotSupported,
+    NotRun,
+}
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema)]
+pub struct CheckResult {
+    pub status: CheckStatus,
+    pub message: Option<String>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum FitBasis {
+    SubdivisionSamples,
+    BoundaryAndGuideSamples,
+}
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema)]
+pub struct SampledFit {
+    pub sampled_deviation_mm: f64,
+    pub basis: FitBasis,
+    pub patches: usize,
+    pub subdivision_level: Option<usize>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckedShape {
+    Solid,
+    Surface,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckStage {
+    Source,
+    Fitting,
+    Complete,
+}
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema)]
+pub struct ValidationReply {
+    pub tolerance_mm: f64,
+    /// The active Form before any Finish boolean; staged Forms are outside this report.
+    pub staged_forms_not_checked: usize,
+    pub stage: CheckStage,
+    pub shape: Option<CheckedShape>,
+    pub fit: Option<SampledFit>,
+    pub conversion: CheckResult,
+    pub record: CheckResult,
+    pub smlib: CheckResult,
 }

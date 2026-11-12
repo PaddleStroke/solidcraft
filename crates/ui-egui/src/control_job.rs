@@ -22,8 +22,9 @@
 //!
 //! Done within the app's wait ([`crate::dialogs::APPLY_AT_ONCE`]), a request just runs, as
 //! before. Headless use, tests and the web build ([`SolveApp::apply_off_thread`] unset) run
-//! everything at once, and so does the app unless the preference is on (Preferences > AI,
-//! `agent_off_thread`, off by default).
+//! everything at once. In a configured native host, Form CAD reads instead share an immutable
+//! producer input and use a bounded awaiting queue, regardless of the agent preference; they
+//! never fall back to synchronous execution when answer slots are full.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -86,6 +87,79 @@ const READ_ON_A_COPY: &[&str] = &[
 
 /// Exports and readings computing at once; more run here.
 const MAX_ANSWERING: usize = 4;
+#[cfg(not(target_arch = "wasm32"))]
+const MAX_FORM_VALIDATION_WAITING: usize = 256;
+
+const FORM_VALIDATION: &str = "form.prototype.validate";
+
+fn is_form_validation(req: &ControlRequest) -> bool {
+    matches!(req.method.as_str(), "engine.execute" | "command")
+        && req.params.get("command").or_else(|| req.params.get("id")).and_then(Value::as_str).and_then(spec_id) == Some(FORM_VALIDATION)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+type FormInput = solidcraft_engine::forms_prototype::validation::Input;
+#[cfg(not(target_arch = "wasm32"))]
+type FormStamp = solidcraft_engine::forms_prototype::validation::Stamp;
+#[cfg(not(target_arch = "wasm32"))]
+type AnswerTask = Box<dyn FnOnce() -> Option<Value> + Send>;
+#[cfg(not(target_arch = "wasm32"))]
+type AnswerChannel = Option<Receiver<Option<Value>>>;
+
+#[cfg(not(target_arch = "wasm32"))]
+enum FormValidationSource {
+    /// None pins the absence of a Form at receipt, rather than targeting a later one.
+    Ready(Option<Arc<FormInput>>),
+    Preparing(FormStamp),
+}
+
+/// Read requests waiting for their producer snapshot or a bounded answer slot.
+/// A ready input stays pinned even if the live document changes afterwards.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) struct FormValidationRequest {
+    req: ControlRequest,
+    params: Value,
+    level: solidcraft_engine::schema::ParamCheck,
+    echo: Option<solidcraft_engine::schema::ParamCheck>,
+    scope: Option<solidcraft_engine::io::vfs::PathScope>,
+    source: FormValidationSource,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn validation_reply(result: solidcraft_engine::Result<Value>, echo: Option<solidcraft_engine::schema::ParamCheck>) -> Value {
+    let mut reply = match result {
+        Ok(value) => json!({"ok":true,"result":value}),
+        Err(error) => json!({"ok":false,"error":error.to_string()}),
+    };
+    if let Some(level) = echo {
+        reply["param_check"] = json!(level.name());
+    }
+    reply
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn validation_failed(request: FormValidationRequest, message: impl Into<String>) {
+    if !request.req.refuse_cancelled_chat() {
+        let reply = validation_reply(Err(solidcraft_engine::EngineError::Other(message.into())), request.echo);
+        let _ = request.req.reply.send(reply);
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn compute_validation(
+    params: &Value,
+    level: solidcraft_engine::schema::ParamCheck,
+    echo: Option<solidcraft_engine::schema::ParamCheck>,
+    input: Option<Arc<FormInput>>,
+) -> Value {
+    let result = solidcraft_engine::schema::run_read_query_checked(level, params, FORM_VALIDATION, || {
+        let args: solidcraft_engine::schema::forms_prototype::Validate =
+            serde_json::from_value(params.clone()).map_err(|error| solidcraft_engine::EngineError::Other(error.to_string()))?;
+        let input = input.ok_or_else(|| solidcraft_engine::EngineError::Other("create a Form first".into()))?;
+        Ok(json!(input.check(&args)?))
+    });
+    validation_reply(result, echo)
+}
 
 /// How often a design change is computed again because the design changed under it before it
 /// runs here anyway.
@@ -169,6 +243,8 @@ pub struct ControlJob {
     pub(crate) label: String,
     /// How far it has got (evaluated ahead).
     steps: Option<Arc<Steps>>,
+    /// A cancelled Form read drains its worker before releasing its answer slot.
+    cancelled: bool,
 }
 
 impl ControlJob {
@@ -258,6 +334,186 @@ fn begin_ahead(
 }
 
 impl SolveApp {
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    pub(crate) fn hold_form_answer_for_test(
+        &mut self,
+        turn: Option<Arc<std::sync::atomic::AtomicBool>>,
+    ) -> (std::sync::mpsc::Sender<Option<Value>>, Receiver<Value>) {
+        let (mut req, reply) = ControlRequest::new("engine.execute", json!({"command":FORM_VALIDATION,"params":{}}));
+        req.chat_turn = turn;
+        let (tx, done) = std::sync::mpsc::channel();
+        self.control_answering.push(ControlJob {
+            req,
+            work: Work::Answer,
+            done,
+            started: crate::now_ms(),
+            label: FORM_VALIDATION.into(),
+            steps: None,
+            cancelled: false,
+        });
+        (tx, reply)
+    }
+
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    pub(crate) fn finish_control_answers_for_test(&mut self) -> Result<(), std::sync::mpsc::RecvError> {
+        for job in std::mem::take(&mut self.control_answering) {
+            let reply = job.done.recv()?;
+            self.answered(job, reply);
+        }
+        Ok(())
+    }
+
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    pub(crate) fn advance_form_validation_for_test(&mut self, stamp: Option<&FormStamp>, input: Option<&Arc<FormInput>>, error: Option<&str>) {
+        self.poll_form_validation_prepared(stamp, input, error);
+    }
+
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    pub(crate) fn fail_form_validation_spawn_for_test(&mut self) -> Result<Option<solidcraft_engine::io::vfs::PathScope>, &'static str> {
+        let request = self.control_form_validation.pop_front().ok_or("no Form CAD read is awaiting a worker")?;
+        let mut forwarded = None;
+        self.start_form_validation_with(request, |scope, _work| {
+            forwarded = scope;
+            None
+        });
+        Ok(forwarded)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn queue_form_validation(&mut self, req: ControlRequest) {
+        if req.refuse_cancelled_chat() {
+            return;
+        }
+        // Match control::handle's metadata error ordering and echo policy.
+        let echo = match crate::control::request_param_check(&req.method, &req.params) {
+            Ok(level) => level,
+            Err(error) => {
+                let _ = req.reply.send(json!({"ok":false,"error":error}));
+                return;
+            }
+        };
+        let scope = match crate::control::request_scope(self, &req.params) {
+            Ok(scope) => scope,
+            Err(error) => {
+                let _ = req.reply.send(json!({"ok":false,"error":error}));
+                return;
+            }
+        };
+        let Some((_, params)) = executed(&req.params) else {
+            let _ = req.reply.send(json!({"ok":false,"error":"missing Form validation command"}));
+            return;
+        };
+        let level = echo.unwrap_or(self.session.param_check);
+        if let Some(spec) = solidcraft_engine::find_command(FORM_VALIDATION) {
+            let own = self.session.param_check;
+            self.session.param_check = level;
+            let allowed = solidcraft_engine::io::vfs::scoped(scope.clone(), || self.session.check_command(spec, &params));
+            self.session.param_check = own;
+            if let Err(error) = allowed {
+                let _ = req.reply.send(validation_reply(Err(error), echo));
+                return;
+            }
+        }
+        let (stamp, input) = crate::forms_prototype::validation_prepared(self);
+        let source = match (input, stamp) {
+            (Some(input), _) => FormValidationSource::Ready(Some(input)),
+            (None, Some(stamp)) => FormValidationSource::Preparing(stamp),
+            (None, None) => FormValidationSource::Ready(None),
+        };
+        let request = FormValidationRequest { req, params, level, echo, scope, source };
+        if self.control_form_validation.is_empty()
+            && self.control_answering.len() < MAX_ANSWERING
+            && matches!(request.source, FormValidationSource::Ready(_))
+        {
+            self.start_form_validation(request);
+        } else if self.control_form_validation.len() < MAX_FORM_VALIDATION_WAITING {
+            self.control_form_validation.push_back(request);
+        } else {
+            validation_failed(request, "too many Form CAD checks are awaiting preparation or an answer slot (maximum 256)");
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn start_form_validation(&mut self, request: FormValidationRequest) {
+        self.start_form_validation_with(request, spawn);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn start_form_validation_with(
+        &mut self,
+        request: FormValidationRequest,
+        launch: impl FnOnce(Option<solidcraft_engine::io::vfs::PathScope>, AnswerTask) -> AnswerChannel,
+    ) {
+        if request.req.refuse_cancelled_chat() {
+            return;
+        }
+        let FormValidationRequest { req, params, level, echo, scope, source } = request;
+        let FormValidationSource::Ready(input) = source else {
+            let _ = req.reply.send(validation_reply(Err(solidcraft_engine::EngineError::Other("the Form CAD input was not prepared".into())), echo));
+            return;
+        };
+        let rx = launch(scope, Box::new(move || Some(compute_validation(&params, level, echo, input))));
+        match rx {
+            Some(done) => self.control_answering.push(ControlJob {
+                label: label(self, FORM_VALIDATION),
+                req,
+                work: Work::Answer,
+                done,
+                started: crate::now_ms(),
+                steps: None,
+                cancelled: false,
+            }),
+            None => {
+                let _ = req
+                    .reply
+                    .send(validation_reply(Err(solidcraft_engine::EngineError::Other("could not start the Form CAD check worker".into())), echo));
+            }
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn poll_form_validation(&mut self, ctx: &egui::Context) {
+        if self.control_form_validation.is_empty() {
+            return;
+        }
+        // One source lookup per frame, independent of the number waiting.
+        let (current, input) = crate::forms_prototype::validation_prepared(self);
+        let error = current.as_ref().and_then(|stamp| crate::forms_prototype::validation_preparation_error(self, stamp)).map(str::to_owned);
+        self.poll_form_validation_prepared(current.as_ref(), input.as_ref(), error.as_deref());
+        if !self.control_form_validation.is_empty() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn poll_form_validation_prepared(&mut self, current: Option<&FormStamp>, input: Option<&Arc<FormInput>>, error: Option<&str>) {
+        let count = self.control_form_validation.len();
+        for _ in 0..count {
+            let Some(mut request) = self.control_form_validation.pop_front() else { break };
+            if request.req.refuse_cancelled_chat() {
+                continue;
+            }
+            if let FormValidationSource::Preparing(given) = &request.source {
+                if current != Some(given) {
+                    validation_failed(request, "the Form source changed while its CAD check input was preparing; request the check again");
+                    continue;
+                }
+                if let Some(error) = error {
+                    validation_failed(request, format!("the Form CAD check input could not be prepared: {error}"));
+                    continue;
+                }
+                if let Some(input) = input {
+                    request.source = FormValidationSource::Ready(Some(input.clone()));
+                }
+            }
+            if self.control_answering.len() < MAX_ANSWERING && matches!(request.source, FormValidationSource::Ready(_)) {
+                self.start_form_validation(request);
+            } else {
+                self.control_form_validation.push_back(request);
+            }
+        }
+    }
+
     /// Run a control request here with what was computed ahead for it at hand ([`KeptResults`]):
     /// its features are found there rather than computed again on the window thread.
     pub(crate) fn run_with_kept<R>(&mut self, kept: Option<Arc<KeptResults>>, run: impl FnOnce(&mut SolveApp) -> R) -> R {
@@ -387,6 +643,13 @@ impl SolveApp {
     /// Take a control request off the window thread when it computes long (see the module
     /// notes). Returns it when it should simply run here now.
     pub(crate) fn offload_control(&mut self, ctx: &egui::Context, req: ControlRequest) -> Option<ControlRequest> {
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.apply_off_thread.is_some() && is_form_validation(&req) {
+            // No session/editor copy, wait-on-worker, or synchronous saturation
+            // fallback. A ready producer Arc is pinned at request receipt.
+            self.queue_form_validation(req);
+            return None;
+        }
         if self.apply_off_thread.is_none() || self.file_load.busy() || self.file_picker.is_some() {
             return Some(req);
         }
@@ -412,7 +675,7 @@ impl SolveApp {
         let commands = ahead_commands(&req.method, &req.params);
         let Some(first) = commands.first().map(|(c, _)| c.clone()) else { return Some(req) };
         let Some((work, rx, steps)) = begin_ahead(self, &req, commands, 0) else { return Some(req) };
-        let job = ControlJob { label: label(self, &first), req, work, done: rx, started: crate::now_ms(), steps: Some(steps) };
+        let job = ControlJob { label: label(self, &first), req, work, done: rx, started: crate::now_ms(), steps: Some(steps), cancelled: false };
         if within_wait(self, &job.done).is_some() {
             // Computed within the wait: it runs now, as before, finding what was computed.
             let Work::Ahead { kept, .. } = job.work else { return Some(job.req) };
@@ -456,7 +719,7 @@ impl SolveApp {
             Some(reply)
         });
         let Some(rx) = rx else { return Some(req) };
-        let job = ControlJob { label: label(self, id), req, work: Work::Answer, done: rx, started: crate::now_ms(), steps: None };
+        let job = ControlJob { label: label(self, id), req, work: Work::Answer, done: rx, started: crate::now_ms(), steps: None, cancelled: false };
         match within_wait(self, &job.done) {
             Some(reply) => self.answered(job, reply),
             None => self.control_answering.push(job),
@@ -467,7 +730,7 @@ impl SolveApp {
     /// An export's or a reading's reply, from its copy, with the echo an export leaves when it
     /// runs here.
     fn answered(&mut self, job: ControlJob, reply: Option<Value>) {
-        if job.req.refuse_cancelled_chat() {
+        if job.cancelled || job.req.refuse_cancelled_chat() {
             return;
         }
         let reply = reply.unwrap_or_else(|| json!({"ok": false, "error": format!("`{}` ended without a reply", job.label)}));
@@ -484,9 +747,18 @@ impl SolveApp {
         if !self.control_answering.is_empty() {
             let mut i = 0;
             while i < self.control_answering.len() {
-                if self.control_answering.get(i).is_some_and(|job| job.req.refuse_cancelled_chat()) {
-                    self.control_answering.remove(i);
-                    continue;
+                if let Some(job) = self.control_answering.get_mut(i)
+                    && !job.cancelled
+                    && job.req.refuse_cancelled_chat()
+                {
+                    if is_form_validation(&job.req) {
+                        // The request is answered once, but its bounded CPU
+                        // worker still owns this slot until it drains.
+                        job.cancelled = true;
+                    } else {
+                        self.control_answering.remove(i);
+                        continue;
+                    }
                 }
                 match self.control_answering.get(i).and_then(ControlJob::poll) {
                     Some(reply) => {
@@ -498,6 +770,8 @@ impl SolveApp {
             }
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        self.poll_form_validation(ctx);
         let Some(job) = &self.control_job else { return };
         if job.req.refuse_cancelled_chat() {
             self.control_job = None;

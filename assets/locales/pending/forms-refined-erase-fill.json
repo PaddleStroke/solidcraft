@@ -1,0 +1,32 @@
+{
+  "de": {
+    "forms.fill.erase_desktop_required": "Löschen und Füllen auf einer lokal unterteilten Form erfordert die Desktop-App.",
+    "forms.fill.erase_faces_only": "Wählen Sie nur Flächen aus einem vierseitigen Innenbereich aus.",
+    "forms.fill.erase_refined_help": "Ersetzt einen vierseitigen Innenbereich durch eine neue Abdeckung.",
+    "forms.fill.erase_refined_unavailable": "Löschen und Füllen auf einer lokal unterteilten Form erfordert eine Form ohne Anpassung, Symmetrie, Extrusion oder Schnittwand."
+  },
+  "en": {
+    "forms.fill.erase_desktop_required": "Erase and Fill on a refined Form requires the desktop app.",
+    "forms.fill.erase_faces_only": "Select only faces of one four-sided interior region.",
+    "forms.fill.erase_refined_help": "Replaces one four-sided interior region with a new cap.",
+    "forms.fill.erase_refined_unavailable": "Erase and Fill on a refined Form requires a Form without Match, symmetry, extrusion or a trim wall."
+  },
+  "ja": {
+    "forms.fill.erase_desktop_required": "局所細分化したフォームで消去して埋めるにはデスクトップアプリが必要です。",
+    "forms.fill.erase_faces_only": "1 つの四辺の内部領域の面だけを選択してください。",
+    "forms.fill.erase_refined_help": "1 つの四辺の内部領域を新しいキャップに置き換えます。",
+    "forms.fill.erase_refined_unavailable": "局所細分化したフォームで消去して埋めるには、マッチ、対称、押し出し、トリム壁がないことが必要です。"
+  },
+  "ko": {
+    "forms.fill.erase_desktop_required": "국부 세분화한 폼에서 지우고 채우려면 데스크톱 앱이 필요합니다.",
+    "forms.fill.erase_faces_only": "네 변으로 둘러싸인 내부 영역 하나의 면만 선택하세요.",
+    "forms.fill.erase_refined_help": "네 변으로 둘러싸인 내부 영역 하나를 새 캡으로 바꿉니다.",
+    "forms.fill.erase_refined_unavailable": "국부 세분화한 폼에서 지우고 채우려면 맞춤, 대칭, 돌출 또는 트림 벽이 없어야 합니다."
+  },
+  "zh": {
+    "forms.fill.erase_desktop_required": "在局部细分形状上擦除并填充需要使用桌面应用。",
+    "forms.fill.erase_faces_only": "只选择一个四边内部区域的面。",
+    "forms.fill.erase_refined_help": "用新封盖替换一个四边内部区域。",
+    "forms.fill.erase_refined_unavailable": "在局部细分形状上擦除并填充时，形状不得含有匹配、对称、拉伸或修剪壁。"
+  }
+}

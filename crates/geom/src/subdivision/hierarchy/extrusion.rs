@@ -33,6 +33,20 @@ pub(super) struct LevelExtrusion {
 }
 
 impl LevelExtrusion {
+    pub(super) fn wall_count_bound(&self) -> Option<usize> {
+        // A selected quad can contribute at most four wall sides. A selected
+        // free edge contributes one. Shared sides can only reduce the count.
+        self.cells.iter().try_fold(self.edges.len(), |count, chart| count.checked_add(chart.len().checked_mul(4)?))
+    }
+
+    pub(super) fn is_single_face_for_preview_compaction(&self) -> bool {
+        self.level == 1
+            && self.cells.len() == 1
+            && self.edges.is_empty()
+            && self.face_offsets.is_empty()
+            && self.edge_offsets.is_empty()
+            && self.sharpness.is_none()
+    }
     pub(super) fn replay(&self, cage: &Cage, influence: bool) -> Result<Extrusion> {
         if self.first_vertex != cage.points.len()
             || self.cells.is_empty() == self.edges.is_empty()

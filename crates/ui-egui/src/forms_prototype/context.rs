@@ -4,9 +4,20 @@ use solidcraft_engine::{Session, doc};
 
 pub(super) struct Entry {
     pub name: Option<String>,
-    pub index: Option<solidcraft_engine::geom::MeshIndex>,
+    pub index: Option<Arc<solidcraft_engine::geom::MeshIndex>>,
     pub mesh: Arc<Mesh>,
     pub color: Option<[f32; 3]>,
+    pub exact: Option<doc::kernel::Body>,
+    pub detached_companion: bool,
+}
+impl Entry {
+    pub(super) fn display_color(&self, tokens: &Tokens) -> egui::Color32 {
+        if self.detached_companion {
+            let [r, g, b, _] = tokens.body_selected.to_srgba_unmultiplied();
+            return egui::Color32::from_rgb(r, g, b);
+        }
+        self.color.map_or(tokens.body, crate::theme::srgb)
+    }
 }
 struct Pending {
     key: u64,
@@ -70,17 +81,27 @@ fn build(session: Session, other: Option<u64>, tolerance: f64, matching: bool) -
     let mut entries = Vec::new();
     let mut triangles = 0usize;
     let mut edge_points = 0usize;
-    let mut push = |mesh: Arc<Mesh>, color: Option<[f32; 3]>, name: Option<String>| -> Result<(), String> {
-        triangles = triangles.saturating_add(mesh.triangles.len());
-        edge_points = edge_points.saturating_add(mesh.edges.iter().map(Vec::len).sum::<usize>());
-        if triangles > 2_000_000 || edge_points > 8_000_000 {
-            return Err("context preview geometry budget exceeded".into());
-        }
-        // Shared display/picking occlusion uses this worker-built index as well as source settings.
-        let index = Some(solidcraft_engine::geom::MeshIndex::new(&mesh));
-        entries.push(Entry { mesh, color, name, index });
-        Ok(())
-    };
+    let mut push =
+        |mesh: Arc<Mesh>, body: doc::kernel::Body, color: Option<[f32; 3]>, name: Option<String>, detached_companion: bool| -> Result<(), String> {
+            if entries.len() >= 256 {
+                return Err("context preview source budget exceeded".into());
+            }
+            live_cad::validate_display_mesh(&mesh)?;
+            triangles = triangles.saturating_add(mesh.triangles.len());
+            edge_points = mesh
+                .edges
+                .iter()
+                .try_fold(edge_points, |n, edge| n.checked_add(edge.len()).filter(|n| *n <= 8_000_000))
+                .ok_or("context preview geometry budget exceeded")?;
+            if triangles > 2_000_000 || edge_points > 8_000_000 {
+                return Err("context preview geometry budget exceeded".into());
+            }
+            // Shared display/picking occlusion uses this worker-built index as well as source settings.
+            let index = Some(Arc::new(solidcraft_engine::geom::MeshIndex::new(&mesh)));
+            let exact = (!body.is_mesh()).then_some(body);
+            entries.push(Entry { mesh, color, name, index, exact, detached_companion });
+            Ok(())
+        };
     let mut visible = std::collections::BTreeSet::new();
     let mut visible_names = std::collections::BTreeSet::new();
     let mut hidden_names = std::collections::BTreeSet::new();
@@ -96,17 +117,18 @@ fn build(session: Session, other: Option<u64>, tolerance: f64, matching: bool) -
         }
         visible.insert(body.feature);
         visible_names.insert(body.name.clone());
-        let mesh = if !matching
+        let (mesh, exact) = if !matching
             && let Some(profile) = &form.profile
             && profile.source.body().as_ref() == body.name
         {
             let (_, face) = profile.resolve(&state).map_err(|e| e.to_string())?;
             let open = doc::kernel::remove_faces(&body.body, &[face]).map_err(|e| e.to_string())?;
-            Arc::new(open.mesh(&doc::kernel::MeshTolerance::chord(tolerance.min(0.05))).map_err(|e| e.to_string())?)
+            let mesh = Arc::new(open.mesh(&doc::kernel::MeshTolerance::chord(tolerance.min(0.05))).map_err(|e| e.to_string())?);
+            (mesh, open)
         } else {
-            body.mesh()
+            (body.mesh(), body.body.clone())
         };
-        push(mesh, body.body.color(), Some(body.name.clone()))?;
+        push(mesh, exact, body.body.color(), Some(body.name.clone()), false)?;
     }
     let final_state = doc::world_state(&document, &session.model.state()).map_err(|e| e.to_string())?;
     for body in &final_state.bodies {
@@ -116,11 +138,12 @@ fn build(session: Session, other: Option<u64>, tolerance: f64, matching: bool) -
         }
         visible.insert(body.feature);
         visible_names.insert(body.name.clone());
-        push(body.mesh(), body.body.color(), Some(body.name.clone()))?;
+        push(body.mesh(), body.body.clone(), body.body.color(), Some(body.name.clone()), false)?;
     }
     for part in form.parts.values() {
-        let (mesh, _) = live_cad::compute(part.definition.as_ref().clone(), tolerance).map_err(|e| format!("{}: {e}", part.name))?;
-        push(Arc::new(mesh), None, None)?;
+        let (mesh, body) = live_cad::compute_context_body(part.definition.as_ref().clone(), tolerance).map_err(|e| format!("{}: {e}", part.name))?;
+        let detached_companion = part.definition.hierarchy.as_ref().is_some_and(|hierarchy| hierarchy.has_detached_material());
+        push(mesh, body, None, None, detached_companion)?;
     }
     if let Some(id) = other.filter(|id| !visible.contains(id) && !form.consumes(*id))
         && let Some(feature) = document.feature(id)
@@ -130,8 +153,8 @@ fn build(session: Session, other: Option<u64>, tolerance: f64, matching: bool) -
         definition.placement =
             doc::forms::Placement::from_matrix(&doc::mat_mul(&document.component_transform(feature.component), &definition.placement.matrix()))
                 .map_err(|e| e.to_string())?;
-        let (mesh, _) = live_cad::compute(definition, tolerance)?;
-        push(Arc::new(mesh), None, None)?;
+        let (mesh, body) = live_cad::compute_context_body(definition, tolerance)?;
+        push(mesh, body, None, None, false)?;
     }
     Ok(entries)
 }
@@ -213,7 +236,7 @@ pub(super) fn tick(app: &mut SolveApp, ctx: &egui::Context) {
         state.version = state.version.wrapping_add(1);
     }
 }
-fn retained_entries(app: &SolveApp) -> impl Iterator<Item = &Entry> {
+pub(super) fn retained_entries(app: &SolveApp) -> impl Iterator<Item = &Entry> {
     let combined = combine_preview::ready(app);
     app.forms_prototype
         .context
@@ -241,8 +264,7 @@ pub(super) fn append(app: &SolveApp, scene: &mut GpuScene) {
     let tokens = Tokens::get();
     let edge = scene.color(tokens.body_edge.to_array());
     for entry in render_entries(app) {
-        let color = entry.color.map_or(tokens.body, crate::theme::srgb);
-        let color = scene.color(color.to_array());
+        let color = scene.color(entry.display_color(&tokens).to_array());
         for triangle in &entry.mesh.triangles {
             for &id in triangle {
                 if let (Some(p), Some(n)) = (entry.mesh.positions.get(id as usize), entry.mesh.normals.get(id as usize)) {
@@ -280,6 +302,8 @@ mod tests {
         assert_eq!(picking.len(), 1);
         assert_eq!(editing[0].mesh.tri_face.iter().copied().collect::<BTreeSet<_>>().len(), 5);
         assert_eq!(picking[0].mesh.tri_face.iter().copied().collect::<BTreeSet<_>>().len(), 6);
+        assert_eq!(editing[0].exact.as_ref().unwrap().face_count(), 5);
+        assert_eq!(picking[0].exact.as_ref().unwrap().face_count(), 6);
         assert!(editing[0].index.is_some());
         assert!(picking[0].index.is_some());
     }
@@ -310,8 +334,9 @@ mod tests {
             let (mesh, _) =
                 definition.profile.as_ref().unwrap().display(&app.session.model.state(), &definition.cage, &definition.placement, 0.01).unwrap();
             let form = app.session.forms_prototype.as_mut().unwrap();
-            form.surface.index = solidcraft_engine::geom::MeshIndex::new(&mesh);
-            form.surface.mesh = mesh;
+            let surface = Arc::make_mut(&mut form.surface);
+            surface.index = solidcraft_engine::geom::MeshIndex::new(&mesh);
+            surface.mesh = mesh;
             let points = [form.surface.vertices[5], form.surface.vertices[6]];
             app.forms_prototype.context.entries = build(app.session.scratch(), None, 0.01, false).unwrap();
             assert_eq!(app.forms_prototype.context.entries.len(), 1);
@@ -336,7 +361,7 @@ mod tests {
                 let hit = app.forms_prototype.context.entries[0].mesh.raycast(origin, direction).unwrap().0;
                 assert!(hit < depth - 2.0, "the actual opaque support bottom, not own-skin roundoff, blocks the guide");
                 assert!(!surface::visible(&app, &bottom, point));
-                assert!(!app.forms_prototype.projected.iter().any(|&(i, _)| i == id));
+                assert!(!app.forms_prototype.projected.iter().any(|&(i, _, _)| i == id));
                 assert_eq!(surface::nearest_with(&app, &bottom, screen, Pick::Vertex), None);
                 assert_eq!(surface::nearest_with(&app, &bottom, screen, Pick::Face), None);
             }
@@ -356,7 +381,7 @@ mod tests {
             draw(&mut app, &bottom);
             for (id, point) in [5, 6].into_iter().zip(points) {
                 assert!(surface::visible(&app, &bottom, point));
-                assert!(app.forms_prototype.projected.iter().any(|&(i, _)| i == id));
+                assert!(app.forms_prototype.projected.iter().any(|&(i, _, _)| i == id));
                 assert_eq!(surface::nearest_with(&app, &bottom, bottom.to_screen(point).unwrap(), Pick::Vertex), Some(Element::Vertex(id)));
             }
             app.session.execute("browser.visibility", &json!({"items":["Support"],"visible":true})).unwrap();

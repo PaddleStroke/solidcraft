@@ -80,18 +80,53 @@ impl Form {
         self.adopt_hierarchy(h, true)
     }
     pub fn hierarchical_creases(&mut self, edges: &[[usize; 2]], vertices: &[usize], sharpness: f64) -> Result<()> {
-        let mut h = self.hierarchy.clone().ok_or_else(|| error("missing local topology"))?;
-        let base_edges: BTreeSet<_> = h.base.edges().map_err(error)?.into_iter().map(|e| (e[0].min(e[1]), e[0].max(e[1]))).collect();
-        if sharpness > 0.0
-            && (edges.iter().any(|e| !base_edges.contains(&(e[0].min(e[1]), e[0].max(e[1])))) || vertices.iter().any(|&v| v >= h.base.points.len()))
-        {
-            return Err(error("sharpness on newly inserted local seams is not supported by smooth root surfaces"));
+        if !sharpness.is_finite() || !(0.0..=10.0).contains(&sharpness) || (edges.is_empty() && vertices.is_empty()) {
+            return Err(error("select crease elements and sharpness 0..10"));
         }
-        let base = h.base.with_creases(edges, vertices, sharpness).map_err(error)?;
-        if base == h.base {
+        let original = self.hierarchy.as_ref().ok_or_else(|| error("missing local topology"))?;
+        if self.matching.is_some() {
+            return Err(error("detach Match before changing a hierarchical crease"));
+        }
+        if original.has_trim_wall() {
+            return Err(error("remove the derived trim wall before changing a hierarchical crease"));
+        }
+        let mut h = original.clone();
+        let base_edges: BTreeSet<_> = h.base.edges().map_err(error)?.into_iter().collect();
+        let (coarse_edges, local_edges): (Vec<_>, Vec<_>) =
+            edges.iter().map(|&[a, b]| [a.min(b), a.max(b)]).partition(|edge| base_edges.contains(edge));
+        let (coarse_vertices, local_vertices): (Vec<_>, Vec<_>) = vertices.iter().copied().partition(|&v| v < h.base.points.len());
+        if !coarse_edges.is_empty() || !coarse_vertices.is_empty() {
+            h.base = h.base.with_creases(&coarse_edges, &coarse_vertices, sharpness).map_err(error)?;
+        }
+        if !local_edges.is_empty() || !local_vertices.is_empty() {
+            let layout = original.layout().map_err(error)?;
+            let paths: BTreeMap<_, _> = layout.paths.into_iter().collect();
+            let active: BTreeSet<_> = layout.faces.into_iter().flatten().collect();
+            let mut segments = BTreeSet::new();
+            for edge in local_edges {
+                let path = paths
+                    .get(&edge)
+                    .filter(|path| path.len() >= 2 && path.first() == Some(&edge[0]) && path.last() == Some(&edge[1]))
+                    .ok_or_else(|| error("select an active logical edge to change its crease"))?;
+                for pair in path.windows(2) {
+                    segments.insert([pair[0].min(pair[1]), pair[0].max(pair[1])]);
+                }
+            }
+            if local_vertices.iter().any(|v| !active.contains(v)) {
+                return Err(error("select an active logical point to change its crease"));
+            }
+            let cage = h.evaluate().map_err(error)?;
+            let edited = cage.with_creases(&segments.into_iter().collect::<Vec<_>>(), &local_vertices, sharpness).map_err(error)?;
+            if edited != cage {
+                if let Some(symmetry) = &self.symmetry {
+                    symmetry.validate_reflection(&edited).map_err(error)?;
+                }
+                h = h.with_evaluator(&edited).map_err(error)?;
+            }
+        }
+        if h == *original {
             return Ok(());
-        };
-        h.base = base;
+        }
         self.adopt_hierarchy(h, true)
     }
 }

@@ -50,6 +50,9 @@ impl Hierarchy {
         if !self.extrusions.is_empty() {
             return Err(bad("trim attachment requires the original fitted root charts"));
         }
+        if self.has_local_sharpness() {
+            return Err(bad("trim attachment requires a source without local crease overrides"));
+        }
         let keys: BTreeSet<_> = selected.iter().map(|&[a, b]| key(a, b)).collect();
         if keys.len() != selected.len() {
             return Err(bad("select distinct trim edges"));

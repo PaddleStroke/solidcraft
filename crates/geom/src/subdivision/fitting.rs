@@ -9,6 +9,10 @@ use std::collections::{BTreeMap, BTreeSet};
 mod regular;
 pub(super) mod root_grid;
 
+fn grid_samples_exceed_budget(roots: usize, width: usize) -> bool {
+    roots.saturating_mul(width.saturating_mul(width)) > 500_000
+}
+
 #[derive(Clone, Debug)]
 pub struct Fit {
     pub root_basis: Option<RootBasis>,
@@ -18,6 +22,46 @@ pub struct Fit {
     pub charts: Vec<PatchChart>,
     pub sampled_deviation: f64,
     pub subdivision_level: usize,
+}
+
+impl Fit {
+    /// Continue the original tensor fit through the ordered quad children of
+    /// Catmull–Clark refinement. Evaluation-only trailing faces are excluded.
+    pub fn continued_quad_patches(&self, core_faces: usize, levels: usize) -> Result<Self> {
+        if levels > super::hierarchy::MAX_DEPTH || core_faces == 0 {
+            return Err(bad("invalid continued tensor depth or face count"));
+        }
+        let children = 1usize << (2 * levels);
+        let old = self.patches.get(..core_faces).ok_or_else(|| bad("missing original tensor patches"))?;
+        if old.iter().enumerate().any(|(i, patch)| patch.domain() != [[0.0, 1.0], [0.0, 1.0]] || self.charts.get(i) != Some(&PatchChart::whole(i))) {
+            return Err(bad("continued tensors require complete original quad charts"));
+        }
+        let coefficients = old.iter().fold(0usize, |sum, patch| sum.saturating_add(patch.homogeneous().len()));
+        if coefficients.saturating_mul(children) > 1_000_000 {
+            return Err(bad("continued tensor restriction exceeds its coefficient budget"));
+        }
+        let mut patches = Vec::with_capacity(core_faces * children);
+        for patch in old {
+            for child in 0..children {
+                let mut corners = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+                for level in (0..levels).rev() {
+                    let i = (child >> (2 * level)) & 3;
+                    let a = corners[i];
+                    let midpoint = |b: [f64; 2]| [(a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5];
+                    corners = [a, midpoint(corners[(i + 1) % 4]), midpoint(corners[(i + 2) % 4]), midpoint(corners[(i + 3) % 4])];
+                }
+                patches.push(patch.restricted_chart(corners).map_err(|e| bad(&e.to_string()))?);
+            }
+        }
+        Ok(Self {
+            root_basis: None,
+            patch_roots: (0..patches.len()).collect(),
+            charts: (0..patches.len()).map(PatchChart::whole).collect(),
+            patches,
+            sampled_deviation: self.sampled_deviation,
+            subdivision_level: self.subdivision_level,
+        })
+    }
 }
 
 /// One exact fitted patch's rectangle in its source quad chart.
@@ -237,7 +281,7 @@ impl Cage {
         self.refined_budget_at(level, 7, super::MAX_EVAL_FACES)?;
         let n = 1_usize << level;
         let width = n + 1;
-        if self.faces.len().saturating_mul(width * width) > 500_000 {
+        if grid_samples_exceed_budget(self.faces.len(), width) {
             return Err(bad("patch sample budget exceeded"));
         }
         let tags: Vec<_> = (0..self.faces.len()).map(|f| (f, [[0, 0], [n, 0], [n, n], [0, n]])).collect();
@@ -264,7 +308,13 @@ impl Cage {
         if let Ok(fit) = self.fit_root_patches(tolerance) {
             return Ok(fit);
         }
-        self.fit_tiled_patches(tolerance, 2..=6)
+        let tiled = self.fit_tiled_patches(tolerance, 2..=6);
+        if tiled.is_err()
+            && let Ok(Some(fit)) = regular::fit_neighborhood(self, tolerance)
+        {
+            return Ok(fit);
+        }
+        tiled
     }
     fn fit_tiled_patches(&self, tolerance: f64, levels: std::ops::RangeInclusive<usize>) -> Result<Fit> {
         let mut last = f64::INFINITY;
@@ -330,7 +380,7 @@ pub(super) fn sample_grids(
     roots: usize,
 ) -> Result<Vec<Vec<Vec3>>> {
     let width = span + 1;
-    if roots.saturating_mul(width.saturating_mul(width)) > 500_000 {
+    if grid_samples_exceed_budget(roots, width) {
         return Err(bad("patch sample budget exceeded"));
     }
     for _ in 0..steps {
@@ -611,6 +661,37 @@ mod tests {
                 fit.patches.iter().map(|p| p.count()).max(),
                 fit.sampled_deviation
             );
+        }
+    }
+    #[test]
+    fn compact_sphere_fit_matches_full_cage_samples_and_preserves_shared_seams() {
+        let cage = super::super::primitives::Parameters { kind: "sphere".into(), dimensions: [10.0; 3], segments: [4, 4, 2], ..Default::default() }
+            .build()
+            .unwrap();
+        let fit = super::regular::fit_neighborhood(&cage, 0.01).unwrap().unwrap();
+        assert!(fit.root_basis.is_none(), "a compact fit cannot reuse the full-cage fixed basis");
+        assert!(fit.sampled_deviation <= 0.01);
+        assert_eq!(fit.patches.len(), cage.faces.len());
+        assert_eq!(fit.patch_roots, (0..cage.faces.len()).collect::<Vec<_>>());
+        let full_reference = cage.patch_grids(4).unwrap();
+        for (patch, grid) in fit.patches.iter().zip(full_reference) {
+            for u in 0..=16 {
+                for v in 0..=16 {
+                    let point = patch.eval(u as f64 / 16.0, v as f64 / 16.0).unwrap();
+                    assert!(point.dist(grid[u * 17 + v]) <= fit.sampled_deviation + 1e-10);
+                }
+            }
+        }
+        for charts in cage.edge_charts_many(&cage.edges().unwrap()).unwrap() {
+            let [a, b] = charts.as_slice() else { panic!("closed Sphere needs both source charts") };
+            let point = |chart: &super::EdgeChart, t: f64| {
+                let [u, v] = std::array::from_fn(|axis| chart.uv[0][axis] * (1.0 - t) + chart.uv[1][axis] * t);
+                fit.patches[chart.face].eval(u, v).unwrap()
+            };
+            for i in 0..=32 {
+                let t = i as f64 / 32.0;
+                assert!(point(a, t).dist(point(b, t)) < 1e-10);
+            }
         }
     }
     #[test]

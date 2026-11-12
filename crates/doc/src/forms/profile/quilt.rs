@@ -26,6 +26,7 @@ struct Node {
     anchor: Option<kernel::DisplayGuidePoint>,
 }
 
+#[cfg(test)]
 pub(in crate::forms) fn display(
     patch: &kernel::Body,
     open: &kernel::Body,
@@ -35,13 +36,28 @@ pub(in crate::forms) fn display(
     samples: &[Vec<Vec3>],
     tolerance: f64,
 ) -> Result<kernel::GuidedMesh> {
+    display_routed(patch, open, source, edges, rim, samples, tolerance).map(|display| display.sampled)
+}
+pub(super) struct RoutedDisplay {
+    pub sampled: kernel::GuidedMesh,
+    pub exact: super::super::NativeGuides,
+}
+pub(super) fn display_routed(
+    patch: &kernel::Body,
+    open: &kernel::Body,
+    source: &kernel::Body,
+    edges: &[[usize; 2]],
+    rim: &QuiltRim,
+    samples: &[Vec<Vec3>],
+    tolerance: f64,
+) -> Result<RoutedDisplay> {
     let (pieces, groups) = route(patch, open, source, edges, rim, samples)?;
     let mut sampled = patch.mesh_with_guides(&kernel::MeshTolerance::chord(tolerance.min(0.05)), &pieces)?;
     let mut guides = Vec::with_capacity(groups.len());
-    for group in groups {
+    for group in &groups {
         let mut curve = Vec::new();
         for id in group {
-            let piece = sampled.guides.get(id).ok_or_else(|| unsupported("lost a routed guide piece"))?;
+            let piece = sampled.guides.get(*id).ok_or_else(|| unsupported("lost a routed guide piece"))?;
             let first = *piece.first().ok_or_else(|| unsupported("empty routed guide piece"))?;
             if let Some(&last) = curve.last() {
                 if last != first {
@@ -55,7 +71,18 @@ pub(in crate::forms) fn display(
         guides.push(curve);
     }
     sampled.guides = guides;
-    Ok(sampled)
+    let routes = edges
+        .iter()
+        .zip(groups)
+        .map(|(&edge, group)| {
+            let pieces = group
+                .into_iter()
+                .map(|id| pieces.get(id).cloned().ok_or_else(|| unsupported("lost exact routed guide piece")))
+                .collect::<Result<_>>()?;
+            Ok(super::super::NativeGuide { edge, pieces })
+        })
+        .collect::<Result<_>>()?;
+    Ok(RoutedDisplay { sampled, exact: super::super::NativeGuides { body: patch.clone(), edges: routes } })
 }
 
 fn route(

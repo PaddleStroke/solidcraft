@@ -1,0 +1,22 @@
+{
+  "de": {
+    "cmd.form.refined_weld": "Verfeinerte Formen verschweißen",
+    "cmd.form.refined_weld.remove": "Schweißnaht verfeinerter Formen entfernen"
+  },
+  "en": {
+    "cmd.form.refined_weld": "Weld Refined Forms",
+    "cmd.form.refined_weld.remove": "Remove Refined Form Weld"
+  },
+  "ja": {
+    "cmd.form.refined_weld": "細分化したフォームを接合",
+    "cmd.form.refined_weld.remove": "細分化フォームの接合を削除"
+  },
+  "ko": {
+    "cmd.form.refined_weld": "세분화된 자유형 형상 접합",
+    "cmd.form.refined_weld.remove": "세분화된 자유형 형상 접합 제거"
+  },
+  "zh": {
+    "cmd.form.refined_weld": "焊接细分造型",
+    "cmd.form.refined_weld.remove": "移除细分造型焊接"
+  }
+}

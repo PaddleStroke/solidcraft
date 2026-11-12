@@ -164,6 +164,138 @@ const GAUSS6: [(f64, f64); 6] = [
     (0.932_469_514_203_152, 0.171_324_492_379_170),
 ];
 
+/// One exact homogeneous curve on its share of a directed quad rim side.
+/// The curve itself runs on [0, 1].
+pub type QuadCapPiece = ([f64; 2], crate::bspline::CurveN<4>);
+
+const CAP_MAX_PIECES: usize = 64;
+const CAP_MAX_AXIS_CONTROLS: usize = 256;
+const CAP_JOIN_MM: f64 = 1e-9;
+
+/// A single G0 tensor cap for four explicit, ordered source sides. The cap
+/// walks the sides around its unit square. Its boundary rows are exact
+/// embeddings of the supplied curves. No rim curve is fitted or sampled
+/// to determine its identity, shape or parameterization.
+pub fn quad_cap(sides: [&[QuadCapPiece]; 4]) -> SplineResult<NurbsSurface> {
+    if sides.iter().any(|side| side.is_empty() || side.len() > CAP_MAX_PIECES) || sides.iter().map(|side| side.len()).sum::<usize>() > CAP_MAX_PIECES
+    {
+        return invalid("quad cap needs four complete bounded sides");
+    }
+    let mut curves = Vec::with_capacity(4);
+    let mut first = None;
+    let mut previous = None;
+    for (index, side) in sides.into_iter().enumerate() {
+        let degree = side.iter().map(|(_, curve)| curve.degree).max().unwrap_or(0);
+        if !(1..=MAX_SPLINE_DEGREE).contains(&degree) {
+            return invalid("invalid quad cap curve degree");
+        }
+        let mut knots = vec![0.0; degree + 1];
+        let mut points = Vec::new();
+        let mut end = 0.0;
+        for (piece, ([a, b], curve)) in side.iter().enumerate() {
+            if *a != end
+                || !(a < b && *b <= 1.0)
+                || curve.degree > degree
+                || curve.ctrl.len() > CAP_MAX_AXIS_CONTROLS
+                || curve.knots.len() != curve.ctrl.len() + curve.degree + 1
+            {
+                return invalid("quad cap curve pieces must partition a bounded unit side");
+            }
+            let space = Space::new(curve.degree, curve.knots.clone())?;
+            if space.domain() != [0.0, 1.0] {
+                return invalid("quad cap piece has a non-unit curve domain");
+            }
+            let mut row: Vec<_> = curve.ctrl.iter().map(|&[x, y, z, w]| HPoint { x, y, z, w }).collect();
+            if row.iter().any(|p| !p.is_finite() || p.w <= 0.0 || p.project().is_none()) {
+                return invalid("quad cap curve needs positive finite homogeneous controls");
+            }
+            let start = *row.first().ok_or_else(|| SplineError::Invalid("empty quad cap curve".into()))?;
+            if previous.is_some_and(|old: HPoint| !cap_join(old, start, false)) {
+                return invalid("quad cap boundary pieces do not meet");
+            }
+            let scale = previous.map_or(1.0, |old: HPoint| old.w) / start.w;
+            for p in &mut row {
+                *p = *p * scale;
+            }
+            if row.iter().any(|p| !p.is_finite() || p.w <= 0.0 || p.project().is_none()) {
+                return invalid("quad cap weights cannot be normalized");
+            }
+            first = first.or_else(|| row.first().copied());
+            previous = row.last().copied();
+            let space = if curve.degree == degree {
+                space
+            } else {
+                let raised = Space::polynomial(degree, 0.0, 1.0)?;
+                row = crate::spline_space::embed(&space, &row, &raised)?;
+                raised
+            };
+            if points.len().saturating_add(row.len()) > CAP_MAX_AXIS_CONTROLS + usize::from(piece > 0) {
+                return Err(SplineError::TooLarge("quad cap side exceeds the control budget".into()));
+            }
+            knots.extend(space.knots()[degree + 1..space.count()].iter().map(|&k| a + (b - a) * k));
+            knots.extend(std::iter::repeat_n(*b, degree + usize::from(piece + 1 == side.len())));
+            points.extend(row.into_iter().skip(usize::from(piece > 0)));
+            end = *b;
+        }
+        if end != 1.0 {
+            return invalid("quad cap boundary side is incomplete");
+        }
+        if index >= 2 {
+            knots = knots.into_iter().rev().map(|k| 1.0 - k).collect();
+            points.reverse();
+        }
+        curves.push(Curve { space: Space::new(degree, knots)?, points });
+    }
+    if !first.zip(previous).is_some_and(|(a, b)| cap_join(a, b, true)) {
+        return invalid("quad cap boundary positions or weights do not close");
+    }
+    let [bottom, right, top, left]: [Curve; 4] = curves.try_into().map_err(|_| SplineError::Invalid("quad cap side count".into()))?;
+    let (u, [bottom, top]) = cap_rows(bottom, top)?;
+    let (v, [left, right]) = cap_rows(left, right)?;
+    let patch = coons([u, v], &bottom, &top, &left, &right, false)?;
+    if folds(&patch) {
+        return invalid("quad cap has a folded or singular chart");
+    }
+    patch.surface()
+}
+
+fn cap_join(a: HPoint, b: HPoint, compare_weights: bool) -> bool {
+    a.project().zip(b.project()).is_some_and(|(a, b)| a.dist(b) <= CAP_JOIN_MM)
+        && (!compare_weights || (a.w - b.w).abs() <= 256.0 * f64::EPSILON * a.w.max(b.w))
+}
+
+fn cap_rows(a: Curve, b: Curve) -> SplineResult<(Space, [Vec<HPoint>; 2])> {
+    let degree = a.space.degree().max(b.space.degree());
+    let mut breaks: Vec<(f64, usize)> = Vec::new();
+    for row in [&a, &b] {
+        // embed raises only a single Bezier piece. Keep the exact refusal for
+        // an opposite side that would require general spline degree elevation.
+        if row.space.degree() != degree && row.space.count() != row.space.degree() + 1 {
+            return invalid("quad cap opposite sides have incompatible spline degrees");
+        }
+        for (knot, multiplicity) in interior_knots(&row.space) {
+            if let Some((_, count)) = breaks.iter_mut().find(|(k, _)| *k == knot) {
+                *count = (*count).max(multiplicity);
+            } else {
+                breaks.push((knot, multiplicity));
+            }
+        }
+    }
+    if degree + 1 + breaks.iter().map(|(_, count)| *count).sum::<usize>() > CAP_MAX_AXIS_CONTROLS {
+        return Err(SplineError::TooLarge("quad cap tensor axis exceeds the control budget".into()));
+    }
+    breaks.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut knots = vec![0.0; degree + 1];
+    for (knot, count) in breaks {
+        knots.extend(std::iter::repeat_n(knot, count));
+    }
+    knots.extend(std::iter::repeat_n(1.0, degree + 1));
+    let space = Space::new(degree, knots)?;
+    let a = crate::spline_space::embed(&a.space, &a.points, &space)?;
+    let b = crate::spline_space::embed(&b.space, &b.points, &space)?;
+    Ok((space, [a, b]))
+}
+
 /// One edge of the loop: a B-spline from the loop's corner before it to the one after (the
 /// loop's direction), rational when it has weights.
 #[derive(Clone, Debug, PartialEq)]

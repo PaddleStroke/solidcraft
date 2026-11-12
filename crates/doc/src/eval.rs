@@ -5236,8 +5236,23 @@ fn form_tool(doc: &Document, vals: &BTreeMap<String, Value>, f: &Feature, st: &M
         resolved = std::borrow::Cow::Owned(matching.recompute(&resolved, &source, tolerance)?.0);
     }
     let (body, report) = crate::forms::convert(&resolved, tolerance)?;
-    let roles =
-        Some(report.patch_roots.iter().enumerate().map(|(i, root)| vec![format!("FormPatch{}", root + 1), format!("FormPiece{}", i + 1)]).collect());
+    let hierarchy = resolved.hierarchy.as_ref();
+    let roles = Some(
+        report
+            .patch_roots
+            .iter()
+            .enumerate()
+            .map(|(i, &root)| {
+                let mut roles = vec![format!("FormPatch{}", root + 1)];
+                // A cap may use several exact native charts. Its persistent name follows the
+                // reserved slot, never an ordinal that the skin can later acquire.
+                if !hierarchy.is_some_and(|h| h.is_quad_cap_face(root) || h.has_detached_material() || h.has_boundary_collapse()) {
+                    roles.push(format!("FormPiece{}", i + 1));
+                }
+                roles
+            })
+            .collect(),
+    );
     let tool = Traced::made(body, roles);
     if *operation == Operation::NewBody || !tool.body.is_surface() {
         return Ok(PreparedForm { tool, note: None, replacement: None });
@@ -6986,6 +7001,7 @@ pub use model_cache::SavedModel;
 pub(crate) mod frame_member;
 #[path = "eval_surface.rs"]
 mod surface;
+pub use surface::refined_symmetric_uses_half_walls;
 #[path = "eval_thread.rs"]
 mod thread;
 use thread::thread_on;
@@ -7420,6 +7436,7 @@ fn eval_feature(
         FeatureKind::Boss { .. } | FeatureKind::Lip { .. } | FeatureKind::SnapFit { .. } | FeatureKind::Rest { .. } => {
             more::plastic_eval(doc, vals, f, st)
         }
+        FeatureKind::Stitch { form_seam: Some(_), .. } => surface::eval_refined_weld(doc, vals, f, st, history),
         FeatureKind::Patch { .. }
         | FeatureKind::Stitch { .. }
         | FeatureKind::Thicken { .. }

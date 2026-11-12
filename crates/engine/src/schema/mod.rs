@@ -99,7 +99,10 @@ pub mod surface_match;
 pub mod ui_prefs;
 pub mod view_navigation;
 
-pub use check::{Contract, Issue, ParamCheck, TypedContract, input_schema_for, issues, output_schema_for, run_checked, run_checked_as};
+pub(crate) use check::run_detached_checked;
+pub use check::{
+    Contract, Issue, ParamCheck, TypedContract, input_schema_for, issues, output_schema_for, run_checked, run_checked_as, run_read_query_checked,
+};
 pub use types::*;
 
 /// A command's `run` that checks the call against the contract command `$id` publishes

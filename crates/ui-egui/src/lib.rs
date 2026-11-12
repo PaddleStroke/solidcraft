@@ -529,6 +529,8 @@ pub struct SolveApp {
     pub(crate) viewport_status: ui_kit::StatusPresentation,
     pub(crate) viewport_status_fixture: viewport_status_fixture::Fixture,
     pub(crate) forms_prototype: forms_prototype::State,
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) browser_form_check: Option<std::rc::Rc<dyn forms_prototype::BrowserCheckHost>>,
     /// Compact browser embed: retain model panels and joint controls without application chrome.
     pub embedded: bool,
     /// Editing embed (#8517): the host page owns the files and the window's chrome. No
@@ -741,6 +743,8 @@ pub struct SolveApp {
     /// The viewport's frame-rate readout ([`frame_rate`]).
     pub frame_rate: frame_rate::FrameRate,
     pub synthetic: Vec<egui::Event>,
+    /// Whether this frame's control-channel input began a primary gesture.
+    synthetic_primary_press: bool,
     /// The modifiers of the synthetic press in progress (a Ctrl-drag keeps Ctrl while it moves).
     pub synthetic_mods: egui::Modifiers,
     control_rx: Option<Receiver<ControlRequest>>,
@@ -751,6 +755,9 @@ pub struct SolveApp {
     control_job: Option<control_job::ControlJob>,
     /// Agent exports computing on copies of the design.
     control_answering: Vec<control_job::ControlJob>,
+    /// Native Form CAD reads awaiting an immutable input or a bounded answer slot.
+    #[cfg(not(target_arch = "wasm32"))]
+    control_form_validation: std::collections::VecDeque<control_job::FormValidationRequest>,
     /// The agent cursor acting out control requests.
     pub agent: agent_cursor::AgentCursor,
     /// The agent chat panel (docs/design/in-app-agent-chat.md).
@@ -822,6 +829,8 @@ impl SolveApp {
             blur_session: Default::default(),
             viewport_status_fixture: Default::default(),
             forms_prototype: Default::default(),
+            #[cfg(target_arch = "wasm32")]
+            browser_form_check: None,
             session,
             ui: UiState::default(),
             shell: Default::default(),
@@ -925,6 +934,7 @@ impl SolveApp {
             frame_ms: 0.0,
             frame_rate: frame_rate::FrameRate::default(),
             synthetic: Vec::new(),
+            synthetic_primary_press: false,
             synthetic_mods: egui::Modifiers::default(),
             control_rx: None,
             agent_chat: Default::default(),
@@ -932,6 +942,8 @@ impl SolveApp {
             control_held: Default::default(),
             control_job: None,
             control_answering: Vec::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            control_form_validation: Default::default(),
             agent: Default::default(),
             pending_shots: Vec::new(),
             shot_chat_turns: Default::default(),
@@ -1199,6 +1211,12 @@ impl SolveApp {
 
     pub fn with_control(mut self, rx: Receiver<ControlRequest>) -> Self {
         self.control_rx = Some(rx);
+        self
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub fn with_browser_form_check(mut self, host: std::rc::Rc<dyn forms_prototype::BrowserCheckHost>) -> Self {
+        self.browser_form_check = Some(host);
         self
     }
 
@@ -3087,6 +3105,7 @@ impl SolveApp {
 
     /// Inject synthetic events (one pointer event per frame).
     fn synthetic_input(&mut self, raw: &mut egui::RawInput) {
+        self.synthetic_primary_press = false;
         if self.synthetic.is_empty() {
             return;
         }
@@ -3115,7 +3134,8 @@ impl SolveApp {
             }
             match &event {
                 egui::Event::ModifiersChanged(modifiers) => self.synthetic_mods = *modifiers,
-                egui::Event::PointerButton { pos, modifiers, pressed, .. } => {
+                egui::Event::PointerButton { pos, modifiers, button, pressed } => {
+                    self.synthetic_primary_press = *button == egui::PointerButton::Primary && *pressed;
                     raw.events.push(egui::Event::PointerMoved(*pos));
                     raw.events.push(egui::Event::ModifiersChanged(*modifiers));
                     // A drag keeps its press's modifiers until the release.

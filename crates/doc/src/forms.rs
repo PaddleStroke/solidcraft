@@ -6,17 +6,35 @@ use solidcraft_geom::subdivision::{Cage, primitives::Parameters};
 
 mod association;
 mod capping;
+mod collapse;
 mod edge_curve;
 mod pipe;
 mod placement;
+mod planar_wall;
+mod preview_compaction;
 mod profile;
+mod quad_cap;
+mod selection_frame;
+mod selection_guides;
 pub mod support;
+mod unweld;
+mod weld_native;
+mod weld_seam;
 pub use association::{MatchRequest, Matching, NamedEdge, SupportRef, match_openings};
 pub(crate) use capping::cap;
+pub use collapse::{PreparedBoundaryCollapse, author_boundary_collapse, prepare_boundary_collapse};
 pub use edge_curve::{EdgeCurve, edge_curves};
 pub use pipe::{Pipe, PipeSource};
 pub use placement::Placement;
-pub use profile::{Profile, ProfileFit};
+pub(crate) use planar_wall::build as build_planar_wall;
+pub use planar_wall::can_build_planar_wall;
+pub use profile::{Profile, ProfileDisplay, ProfileFit};
+pub use quad_cap::{PreparedQuadCap, author_quad_cap, prepare_quad_cap};
+pub use selection_frame::SelectionFrames;
+pub use selection_guides::{NativeGuide, NativeGuides, SelectionGuides};
+pub use unweld::prepare_refined_unweld;
+pub use weld_native::{PreparedRefinedWeld, RefinedWeldFace, prepare_refined_weld};
+pub use weld_seam::RefinedWeldSeam;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -93,6 +111,12 @@ fn validate_definition(definition: &Definition) -> Result<()> {
         symmetry.validate(&definition.cage).map_err(|e| DocError::Invalid(e.to_string()))?;
     }
     if let Some(hierarchy) = &definition.hierarchy {
+        if hierarchy.has_boundary_collapse() && (definition.matching.is_some() || definition.symmetry.is_some() || definition.pipe.is_some()) {
+            return Err(DocError::Invalid("a retained Collapse requires an independent Form without symmetry".into()));
+        }
+        if hierarchy.has_quad_cap() && (definition.matching.is_some() || definition.symmetry.is_some()) {
+            return Err(DocError::Invalid("a derived quad cap requires an independent Form without symmetry".into()));
+        }
         let evaluated = hierarchy.evaluate().map_err(|e| DocError::Invalid(e.to_string()))?;
         if evaluated.faces != definition.cage.faces
             || evaluated.points.len() != definition.cage.points.len()
@@ -106,14 +130,76 @@ fn validate_definition(definition: &Definition) -> Result<()> {
     Ok(())
 }
 pub fn convert(definition: &Definition, tolerance: f64) -> Result<(crate::kernel::Body, ConversionReport)> {
+    let (body, report, _) = convert_source(definition, tolerance)?;
+    Ok((body, report))
+}
+/// Exact skin and logical guide routes from the very same source fit.
+pub fn convert_with_guides(definition: &Definition, tolerance: f64) -> Result<(crate::kernel::Body, ConversionReport, SelectionGuides)> {
+    let (body, report, source) = convert_source(definition, tolerance)?;
+    let guides = selection_guides::from_source(definition, source);
+    Ok((body, report, guides))
+}
+/// Exact logical editing frames derived from the accepted fitted source. The
+/// axes are Form-local, including when the sewn native body uses new charts.
+pub fn convert_with_selection(
+    definition: &Definition,
+    tolerance: f64,
+) -> Result<(crate::kernel::Body, ConversionReport, SelectionGuides, SelectionFrames)> {
+    let (body, report, source) = convert_source_with_preview(definition, tolerance, true)?;
+    let mut frames = SelectionFrames::from_faces(definition, &source);
+    let guides = selection_guides::from_source(definition, source);
+    frames.add_guides(definition, &guides);
+    Ok((body, report, guides, frames))
+}
+fn convert_source(definition: &Definition, tolerance: f64) -> Result<(crate::kernel::Body, ConversionReport, FittedSource)> {
+    convert_source_with_preview(definition, tolerance, false)
+}
+fn convert_source_with_preview(
+    definition: &Definition,
+    tolerance: f64,
+    compact_preview: bool,
+) -> Result<(crate::kernel::Body, ConversionReport, FittedSource)> {
     validate_definition(definition)?;
     #[cfg(test)]
     let timing = std::time::Instant::now();
-    let FittedSource { fit, sheets, trimmed_roots } = fitted_source(definition, tolerance)?;
+    let caps = definition
+        .hierarchy
+        .as_ref()
+        .map(|h| h.validated_quad_caps())
+        .transpose()
+        .map_err(|error| DocError::Invalid(error.to_string()))?
+        .unwrap_or_default();
+    let mut source = fitted_source(definition, tolerance)?;
+    for (face, rim) in caps {
+        quad_cap::FittedQuadCap::append(definition, &mut source, face, rim)?;
+    }
+    let site =
+        definition.hierarchy.as_ref().map(|h| h.validated_boundary_collapse()).transpose().map_err(|e| DocError::Invalid(e.to_string()))?.flatten();
+    let collapsed = site.map(|site| collapse::stitch(&mut source, site)).transpose()?;
+    let FittedSource { fit, sheets, trimmed_roots, quad_caps } = &source;
     #[cfg(test)]
     eprintln!("Forms fit ({} patches): {:?}", fit.patches.len(), timing.elapsed());
-    let mut body = crate::kernel::stitch(&sheets.iter().collect::<Vec<_>>(), 1e-7)?;
-    let patch_roots = stitched_roots(&body, &sheets, &fit.patch_roots)?;
+    // Caps add sewing operands. The fitted skin's patches, charts and owners stay aligned.
+    let sheet_roots = if quad_caps.is_empty() {
+        std::borrow::Cow::Borrowed(fit.patch_roots.as_slice())
+    } else {
+        std::borrow::Cow::Owned(fit.patch_roots.iter().copied().chain(quad_caps.iter().map(|cap| cap.face)).collect())
+    };
+    let prepared = if let Some((body, owners)) = collapsed {
+        Some((body, owners, fit.sampled_deviation))
+    } else if compact_preview {
+        preview_compaction::stitch(definition, &source, tolerance)
+    } else {
+        None
+    };
+    let (mut body, patch_roots, sampled_deviation) = match prepared {
+        Some(preview) => preview,
+        None => {
+            let body = crate::kernel::stitch(&sheets.iter().collect::<Vec<_>>(), 1e-7)?;
+            let owners = stitched_roots(&body, sheets, &sheet_roots)?;
+            (body, owners, fit.sampled_deviation)
+        }
+    };
     #[cfg(test)]
     eprintln!("Forms stitch: {:?}", timing.elapsed());
     if body.is_mesh() {
@@ -128,6 +214,9 @@ pub fn convert(definition: &Definition, tolerance: f64) -> Result<(crate::kernel
         }
     }
     let closed = uses.values().all(|&n| n == 2);
+    if !quad_caps.is_empty() {
+        quad_cap::qualify(quad_caps, &body, &patch_roots, &sheet_roots, closed)?;
+    }
     if closed && body.is_surface() {
         return Err(DocError::Invalid("Forms CAD patches did not sew into a closed solid".into()));
     }
@@ -145,14 +234,15 @@ pub fn convert(definition: &Definition, tolerance: f64) -> Result<(crate::kernel
     Ok((
         body,
         ConversionReport {
-            sampled_deviation_mm: fit.sampled_deviation,
+            sampled_deviation_mm: sampled_deviation,
             subdivision_level: fit.subdivision_level,
             patches: patch_roots.len(),
-            root_surfaces: fit.patches.len(),
-            trimmed_roots,
+            root_surfaces: fit.patches.len() + quad_caps.len(),
+            trimmed_roots: *trimmed_roots,
             patch_roots,
             solid: closed,
         },
+        source,
     ))
 }
 /// Logical owners in the sewn body's canonical face order. A stitch may reorder
@@ -242,6 +332,7 @@ struct FittedSource {
     fit: solidcraft_geom::subdivision::fitting::Fit,
     sheets: Vec<crate::kernel::Body>,
     trimmed_roots: bool,
+    quad_caps: Vec<quad_cap::FittedQuadCap>,
 }
 fn fitted_source(definition: &Definition, tolerance: f64) -> Result<FittedSource> {
     if let Some(hierarchy) = &definition.hierarchy
@@ -251,35 +342,27 @@ fn fitted_source(definition: &Definition, tolerance: f64) -> Result<FittedSource
             return Err(DocError::Invalid("trim walls require a Form without Match or symmetry".into()));
         }
         let (fit, sheets) = root_sheets(hierarchy, tolerance)?;
-        return Ok(FittedSource { fit, sheets, trimmed_roots: true });
+        return Ok(FittedSource { fit, sheets, trimmed_roots: true, quad_caps: Vec::new() });
     }
     if let Some(matching) = &definition.matching {
-        let evaluator = if matching.evaluation_order(&definition.cage, definition.hierarchy.as_ref())? == 2 {
-            solidcraft_geom::subdivision::matching::quadratic_extension(&definition.cage).map_err(|e| DocError::Invalid(e.to_string()))?
-        } else {
-            definition.cage.clone()
-        };
-        let mut fit = matching.basis.fit_checked(&evaluator, tolerance).map_err(|e| DocError::Invalid(e.to_string()))?;
-        fit.patches.truncate(definition.cage.faces.len());
-        fit.patch_roots.truncate(definition.cage.faces.len());
-        fit.charts.truncate(definition.cage.faces.len());
+        let mut fit = matching.cad_fit(definition, tolerance)?;
         if let Some(hierarchy) = &definition.hierarchy {
             filter_evaluator_patches(&mut fit, hierarchy)?;
         }
         let sheets = fitted_sheets(&mut fit, tolerance)?;
-        return Ok(FittedSource { fit, sheets, trimmed_roots: false });
+        return Ok(FittedSource { fit, sheets, trimmed_roots: false, quad_caps: Vec::new() });
     }
     if let Some(hierarchy) = &definition.hierarchy
         && let Ok((fit, sheets)) = root_sheets(hierarchy, tolerance)
     {
-        return Ok(FittedSource { fit, sheets, trimmed_roots: true });
+        return Ok(FittedSource { fit, sheets, trimmed_roots: true, quad_caps: Vec::new() });
     }
     let mut fit = definition.cage.fit_patches(tolerance).map_err(|e| DocError::Invalid(e.to_string()))?;
     if let Some(hierarchy) = &definition.hierarchy {
         filter_evaluator_patches(&mut fit, hierarchy)?;
     }
     let sheets = fitted_sheets(&mut fit, tolerance)?;
-    Ok(FittedSource { fit, sheets, trimmed_roots: false })
+    Ok(FittedSource { fit, sheets, trimmed_roots: false, quad_caps: Vec::new() })
 }
 fn filter_evaluator_patches(
     fit: &mut solidcraft_geom::subdivision::fitting::Fit,
@@ -1110,6 +1193,107 @@ mod tests {
         }
         assert_eq!(serde_json::to_value((&profile, &cage)).unwrap(), before);
     }
+    #[test]
+    fn native_surface_selection_frames_follow_directed_stations_and_owned_material() {
+        use crate::kernel::{DisplayGuide, DisplayGuidePoint};
+        use solidcore_record::Vec3;
+        use solidcraft_geom::bspline::NurbsSurface;
+
+        let support = crate::kernel::box_solid(Vec3::ZERO, Vec3::new(10.0, 6.0, 2.0)).unwrap();
+        let face = (0..support.face_count()).find(|&i| support.planar_face(i).is_some_and(|p| p.normal().z > 0.99)).unwrap();
+        let support = crate::ModelBody::new("Support".into(), support, 1);
+        let (profile, mut cage) = Profile::seed(&support, face, [1, 1], 0).unwrap();
+        let point = |u: f64, v: f64| Vec3::new(10.0 * u, 6.0 * v, 2.0 * u * v);
+        let uv = [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]];
+        cage.points = uv.map(|[u, v]| point(u, v)).to_vec();
+        let surface = NurbsSurface::new([1, 1], std::array::from_fn(|_| vec![0.0, 0.0, 1.0, 1.0]), &cage.points, &[1.0; 4]).unwrap();
+        let body = crate::kernel::nurbs_region_sheet(&surface, &[vec![uv[0], uv[1], uv[3], uv[2]]]).unwrap();
+        let mut native = NativeGuides { body: body.clone(), edges: Vec::new() };
+        for edge @ [a, b] in cage.edges().unwrap() {
+            let (id, parameters) = body
+                .record()
+                .edges
+                .iter()
+                .enumerate()
+                .find_map(|(id, native)| {
+                    let [first, last] = native.vertices.map(|vertex| {
+                        let [x, y, z] = body.record().vertices[vertex as usize].point;
+                        Vec3::new(x, y, z)
+                    });
+                    if first.dist(cage.points[a]) < 1e-10 && last.dist(cage.points[b]) < 1e-10 {
+                        Some((id, native.interval))
+                    } else if last.dist(cage.points[a]) < 1e-10 && first.dist(cage.points[b]) < 1e-10 {
+                        Some((id, [native.interval[1], native.interval[0]]))
+                    } else {
+                        None
+                    }
+                })
+                .unwrap();
+            native.edges.push(NativeGuide {
+                edge,
+                pieces: vec![DisplayGuide {
+                    face: 0,
+                    points: parameters.map(|parameter| DisplayGuidePoint::Edge { edge: id as u32, parameter }).to_vec(),
+                }],
+            });
+        }
+        // Two ordered chart restrictions that meet at the centre. This
+        // station is derived from native UV, independent of any display mesh.
+        native.edges.push(NativeGuide {
+            edge: [4, 5],
+            pieces: vec![DisplayGuide { face: 0, points: [[0.2, 0.4], [0.5, 0.4], [0.8, 0.4]].map(DisplayGuidePoint::Surface).to_vec() }],
+        });
+        let definition = Definition {
+            imported: None,
+            pipe: None,
+            profile: Some(Box::new(profile)),
+            matching: None,
+            placement: Placement::default(),
+            cage,
+            parameters: Parameters::default(),
+            symmetry: None,
+            hierarchy: None,
+        };
+        let guides = SelectionGuides::Native(native.clone());
+        let frames = SelectionFrames::from_profile(&definition, &body, Some(&[0]), &guides);
+        let normal = |u: f64, v: f64| Vec3::new(10.0, 0.0, 2.0 * v).cross(Vec3::new(0.0, 6.0, 2.0 * u)).normalized().unwrap();
+        let on_cell = frames.faces[&0];
+        let on_edge = frames.edges[&[0, 1]];
+        let at_point = frames.points[&0];
+        let routed = frames.edges[&[4, 5]];
+        assert!(on_cell[0].dist(Vec3::new(10.0, 0.0, 1.0).normalized().unwrap()) < 1e-10);
+        assert!(on_cell[2].dist(normal(0.5, 0.5)) < 1e-10);
+        assert!(on_edge[0].dist(Vec3::X) < 1e-10);
+        assert!(on_edge[2].dist(normal(0.5, 0.0)) < 1e-10);
+        assert!(at_point[0].dist(Vec3::X) < 1e-10 && at_point[2].dist(Vec3::Z) < 1e-10);
+        assert!(routed[0].dist(Vec3::new(10.0, 0.0, 0.8).normalized().unwrap()) < 1e-10);
+        assert!(routed[2].dist(normal(0.5, 0.4)) < 1e-10);
+        for frame in [on_cell, on_edge, at_point, routed] {
+            assert!(frame[0].cross(frame[1]).dist(frame[2]) < 1e-10);
+        }
+
+        let unowned = SelectionFrames::from_profile(&definition, &body, None, &guides);
+        assert!(unowned.faces.is_empty());
+        assert_eq!(unowned.edges[&[4, 5]], routed);
+        let mut kinked = native.clone();
+        kinked.edges.last_mut().unwrap().pieces[0].points[2] = DisplayGuidePoint::Surface([0.5, 0.8]);
+        let refused = SelectionFrames::from_profile(&definition, &body, Some(&[0]), &SelectionGuides::Native(kinked));
+        assert!(!refused.edges.contains_key(&[4, 5]), "two incompatible sided tangents cannot define the central station");
+        assert_eq!(refused.faces[&0], on_cell);
+
+        let matrix = crate::rigid(Vec3::new(2.0, 4.0, -3.0), Vec3::ZERO, Vec3::Y, 0.7);
+        let moved = crate::kernel::transform_matrix(&body, matrix).unwrap();
+        let mut placed = definition;
+        placed.placement = Placement::from_matrix(&matrix).unwrap();
+        native.body = moved.clone();
+        let frames = SelectionFrames::from_profile(&placed, &moved, Some(&[0]), &SelectionGuides::Native(native));
+        for (actual, original) in [(frames.faces[&0], on_cell), (frames.edges[&[0, 1]], on_edge), (frames.points[&0], at_point)] {
+            for (actual, original) in actual.into_iter().zip(original) {
+                assert!(actual.dist(original) < 1e-10, "native world derivatives are stored in Form-local axes once");
+            }
+        }
+    }
+
     #[test]
     fn surface_cad_cells_follow_skewed_guides_without_refitting_the_skin() {
         use solidcore_record::Vec3;
@@ -2070,6 +2254,723 @@ mod tests {
         assert!(!body.mesh(&crate::kernel::MeshTolerance::chord(0.05)).unwrap().triangles.is_empty());
         assert_eq!(serde_json::from_str::<Definition>(&serde_json::to_string(&definition).unwrap()).unwrap(), definition);
     }
+    fn collapse_plane_fixture(detail: bool) -> Definition {
+        use solidcore_record::Vec3;
+        use solidcraft_geom::subdivision::hierarchy::Hierarchy;
+        let parameters = Parameters { kind: "plane".into(), dimensions: [8., 8., 1.], segments: [1, 1, 1], ..Default::default() };
+        let mut h = Hierarchy::new(parameters.build().unwrap()).unwrap().subdivide(&[0], [2, 1]).unwrap();
+        if detail {
+            let cage = h.evaluate().unwrap();
+            let mid = h.controls.iter().find(|&(&id, &birth)| birth == 1 && cage.points[id].x.abs() < 1e-9).map(|(&id, _)| id).unwrap();
+            h.add_deltas(&[mid], &[Vec3::X * 0.125]).unwrap();
+            assert_ne!(h.evaluate().unwrap(), cage);
+        }
+        Definition {
+            cage: h.evaluate().unwrap(),
+            hierarchy: Some(h),
+            placement: Placement { origin: Vec3::new(2., -3., 4.), ..Default::default() },
+            parameters,
+            symmetry: None,
+            imported: None,
+            pipe: None,
+            profile: None,
+            matching: None,
+        }
+    }
+    #[test]
+    fn boundary_collapse_keeps_native_neighbor_and_creates_a_true_triangle() {
+        use crate::kernel;
+        use solidcore_record::Vec3;
+        for detail in [false, true] {
+            let source = collapse_plane_fixture(detail);
+            let before = source.clone();
+            let layout = source.hierarchy.as_ref().unwrap().layout().unwrap();
+            let left = &layout.faces[1];
+            let picks = [left[3], left[0]];
+            let prepared = prepare_boundary_collapse(&source, picks, 0.05).unwrap();
+            let opposite = prepare_boundary_collapse(&source, [picks[1], picks[0]], 0.05).unwrap();
+            assert_eq!(prepared.site, opposite.site);
+            assert_eq!(prepared.site.face, 1);
+            assert_eq!(prepared.site.retained_neighbor, 2);
+            assert!(!left.contains(&prepared.site.point));
+            assert_eq!(prepared.site.boundary[0], prepared.site.point);
+            assert_eq!(prepared.site.parameters, [[0., 0.5], [0.5, 0.], [0.5, 1.]]);
+            assert_eq!(prepared.body.face_count(), 2);
+            assert_eq!(prepared.body.edge_count(), 6);
+            assert_eq!(prepared.body.shell_count(), 1);
+            assert!(prepared.body.is_surface() && kernel::validity(&prepared.body).ok());
+            let old = convert(&source, 0.05).unwrap().0;
+            let old_area = kernel::measure(&old).unwrap().area;
+            let new_area = kernel::measure(&prepared.body).unwrap().area;
+            assert!(new_area < old_area - 1.);
+            println!("detail {detail}, apex {:?}, original area {old_area}, collapsed area {new_area}", prepared.point);
+            if !detail {
+                assert!(prepared.point.dist(Vec3::new(2. - 11. / 3., -3., 4.)) < 1e-8);
+            }
+            assert_eq!(prepared.face_owners.iter().copied().collect::<std::collections::BTreeSet<_>>(), [1, 2].into_iter().collect());
+            assert_eq!(source, before);
+        }
+    }
+    #[test]
+    fn mixed_depth_collapse_retains_both_fine_sculpted_neighbors() {
+        use crate::kernel;
+        use solidcore_record::Vec3;
+        let mut source = collapse_plane_fixture(false);
+        let mut h = source.hierarchy.as_ref().unwrap().subdivide(&[2], [2, 1]).unwrap();
+        assert_eq!(h.depth, 2);
+        let cage = h.evaluate().unwrap();
+        let fine = h.controls.iter().find(|&(&_, &birth)| birth == 2).map(|(&id, _)| id).unwrap();
+        h.add_deltas(&[fine], &[Vec3::X * 0.125]).unwrap();
+        assert_ne!(h.evaluate().unwrap(), cage);
+        source.cage = h.evaluate().unwrap();
+        source.hierarchy = Some(h);
+        let source_before = source.clone();
+        let layout = source.hierarchy.as_ref().unwrap().layout().unwrap();
+        let left = &layout.faces[1];
+        let prepared = prepare_boundary_collapse(&source, [left[3], left[0]], 0.05).unwrap();
+        assert_eq!((prepared.site.face, prepared.site.retained_neighbor), (1, 3));
+        assert_eq!(prepared.face_owners.iter().copied().collect::<std::collections::BTreeSet<_>>(), [1, 3, 4].into_iter().collect());
+        assert_eq!((prepared.body.face_count(), prepared.body.edge_count()), (3, 9));
+        assert!(kernel::validity(&prepared.body).ok());
+        assert_eq!(source, source_before);
+        println!("preserved mixed-depth owners 1,3,4 and fine source sculpt");
+    }
+
+    #[test]
+    fn authored_boundary_collapse_replays_exact_diagonals_and_retires_original_endpoints() {
+        use crate::{Document, FeatureKind, Operation};
+        let source = collapse_plane_fixture(true);
+        let before = source.hierarchy.as_ref().unwrap().layout().unwrap();
+        let face = &before.faces[1];
+        let endpoints = [face[3], face[0]];
+        let saved = author_boundary_collapse(&source, endpoints, 0.05).unwrap();
+        let hierarchy = saved.hierarchy.as_ref().unwrap();
+        let layout = hierarchy.layout().unwrap();
+        let site = hierarchy.validated_boundary_collapse().unwrap().unwrap();
+        assert_eq!(hierarchy.collapsed_face(), Some(1));
+        assert_eq!(layout.faces[1], site.boundary);
+        assert_eq!(layout.faces[2], before.faces[2]);
+        assert_eq!(saved.cage, source.cage);
+        assert_eq!(hierarchy.details, source.hierarchy.as_ref().unwrap().details);
+        assert!(endpoints.iter().all(|&id| hierarchy.is_retired_collapse_control(id)));
+        assert!(layout.visible_edges().all(|edge| !edge.iter().any(|id| endpoints.contains(id))));
+        let (native, report, guides, _) = convert_with_selection(&saved, 0.05).unwrap();
+        assert_eq!(report.patch_roots.len(), 2);
+        let points = guides.points().unwrap();
+        assert!(endpoints.iter().all(|id| !points.contains_key(id)));
+        let expected = prepare_boundary_collapse(&source, endpoints, 0.05).unwrap();
+        assert!(points[&site.point].dist(expected.point) < 1e-8);
+        let SelectionGuides::Subdivision(curves) = guides else { panic!("expected exact source routes") };
+        for edge in site.diagonal_edges() {
+            let curve = curves.iter().find(|curve| curve.edge == edge).unwrap();
+            let pieces = curve.rational_pieces().unwrap();
+            assert!(!pieces.is_empty());
+            assert!(curve.at(0.0).unwrap().dist(points[&edge[0]]) < 1e-8);
+            assert!(curve.at(1.0).unwrap().dist(points[&edge[1]]) < 1e-8);
+        }
+        let mut document = Document::new("Refined Collapse");
+        let id = document
+            .add_feature(
+                FeatureKind::Form {
+                    definition: Box::new(saved.clone()),
+                    tolerance: "0.05 mm".into(),
+                    operation: Operation::NewBody,
+                    targets: Vec::new(),
+                },
+                None,
+            )
+            .unwrap();
+        let reopened = Document::from_json(&document.to_json()).unwrap();
+        let FeatureKind::Form { definition, .. } = &reopened.feature(id).unwrap().kind else { panic!("expected saved Form") };
+        assert_eq!(definition.as_ref(), &saved);
+        let (body, reopened_report) = convert(definition, 0.05).unwrap();
+        assert_eq!(native.record(), body.record());
+        assert_eq!(report.patch_roots, reopened_report.patch_roots);
+        let mut forged = serde_json::to_value(&saved).unwrap();
+        forged["hierarchy"]["boundary_collapse"]["site"]["retained_neighbor"] = serde_json::json!(1);
+        let forged: Definition = serde_json::from_value(forged).unwrap();
+        assert!(convert(&forged, 0.05).is_err());
+    }
+
+    fn refined_weld_source(lower: bool) -> crate::FeatureKind {
+        use crate::{FeatureKind, Operation};
+        use solidcore_record::Vec3;
+        use solidcraft_geom::subdivision::hierarchy::Hierarchy;
+
+        let parameters = Parameters { kind: "box".into(), dimensions: [8.0, 8.0, 5.0], ..Default::default() };
+        let mut points = Vec::new();
+        for z in [-5.0, 0.0] {
+            for (x, y) in [(-4.0, -4.0), (4.0, -4.0), (4.0, 4.0), (-4.0, 4.0)] {
+                points.push(Vec3::new(x, y, z));
+            }
+        }
+        let mut faces = (0..4)
+            .map(|a| {
+                let b = (a + 1) % 4;
+                vec![a, b, b + 4, a + 4]
+            })
+            .collect::<Vec<_>>();
+        faces.push(if lower { vec![3, 2, 1, 0] } else { vec![4, 5, 6, 7] });
+        let count = if lower { 2 } else { 4 };
+        let mut hierarchy = Hierarchy::new(Cage { points, faces, ..Default::default() }).unwrap().subdivide(&[4], [count, count]).unwrap();
+        let cage = hierarchy.evaluate().unwrap();
+        let center = hierarchy
+            .controls
+            .iter()
+            .find(|&(&id, &level)| {
+                let p = cage.points[id];
+                level == 1 && p.x == 0.0 && p.y == 0.0
+            })
+            .map(|(&id, _)| id)
+            .unwrap();
+        hierarchy.add_deltas(&[center], &[Vec3::Z * 0.25]).unwrap();
+        assert_ne!(hierarchy.evaluate().unwrap(), cage);
+        let placement = Placement { origin: if lower { Vec3::ZERO } else { Vec3::Z * 5.0 }, ..Default::default() };
+        FeatureKind::Form {
+            definition: Box::new(Definition {
+                cage: hierarchy.evaluate().unwrap(),
+                hierarchy: Some(hierarchy),
+                placement,
+                parameters,
+                symmetry: None,
+                imported: None,
+                pipe: None,
+                profile: None,
+                matching: None,
+            }),
+            tolerance: "0.05 mm".into(),
+            operation: Operation::NewBody,
+            targets: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn refined_weld_seam_replays_source_namespaces_and_refuses_retired_rim_owners() {
+        use crate::walk::{Ref, Walk};
+        use crate::{Document, FeatureId, FeatureKind};
+
+        let mut doc = Document::new("Refined weld sources");
+        let first = FeatureId(doc.add_feature(refined_weld_source(true), Some("Lower")).unwrap());
+        let second = FeatureId(doc.add_feature(refined_weld_source(false), Some("Upper")).unwrap());
+        let sources = [first, second];
+        let seam = RefinedWeldSeam::capture(&doc, sources, [[4, 5], [0, 1]]).unwrap();
+        assert_eq!(seam.sources(), sources);
+        assert!(RefinedWeldSeam::capture(&doc, [first, first], [[4, 5], [4, 5]]).is_err());
+        let expected = seam.replay(&doc).unwrap();
+        assert_eq!(expected.len(), 4);
+        assert_eq!(expected[0].each_ref().map(|side| side.owner), [0, 0], "the same local ID has two source namespaces");
+        assert_eq!(expected[0].each_ref().map(|side| side.edge), [[5, 4], [0, 1]]);
+        let mut refs = Vec::new();
+        seam.walk_refs(&mut |reference| {
+            if let Ref::Feature(id) = reference {
+                refs.push(*id);
+            }
+        });
+        assert_eq!(refs, sources);
+        let json = serde_json::to_value(&seam).unwrap();
+        let saved: RefinedWeldSeam = serde_json::from_value(json.clone()).unwrap();
+        let mut reopened = Document::from_json(&doc.to_json()).unwrap();
+        assert_eq!(saved.replay(&reopened).unwrap(), expected);
+        assert_eq!(reopened.feature(first.0), doc.feature(first.0));
+        assert_eq!(reopened.feature(second.0), doc.feature(second.0));
+
+        let edit = |doc: &mut Document, leaf, split| {
+            let FeatureKind::Form { definition, .. } = &mut doc.feature_mut(first.0).unwrap().kind else { panic!("source Form") };
+            let old = definition.hierarchy.as_ref().unwrap();
+            let next = old.subdivide(&[leaf], split).unwrap();
+            assert_eq!(old.details, next.details[..old.details.len()]);
+            definition.cage = next.evaluate().unwrap();
+            definition.hierarchy = Some(next);
+        };
+        edit(&mut reopened, 5, [2, 2]);
+        let refined = saved.replay(&reopened).unwrap();
+        assert_eq!(refined[0][0].owner, expected[0][0].owner);
+        assert_eq!(refined[0][0].edge, expected[0][0].edge);
+        assert_eq!(refined[0][0].path.len(), 5);
+        assert_eq!(refined[0][1], expected[0][1]);
+        edit(&mut reopened, 0, [2, 1]);
+        let failed = reopened.to_json();
+        assert!(saved.replay(&reopened).is_err());
+        assert_eq!(reopened.to_json(), failed, "a refused replay never changes either source");
+
+        let mut wrong_owner = json.clone();
+        wrong_owner["sides"][0][0]["owner"] = serde_json::json!(2);
+        assert!(serde_json::from_value::<RefinedWeldSeam>(wrong_owner).unwrap().replay(&doc).is_err());
+        let mut over_budget = json.clone();
+        let side = json["sides"][0].clone();
+        over_budget["sides"] = serde_json::json!(vec![side; 257]);
+        assert!(serde_json::from_value::<RefinedWeldSeam>(over_budget).is_err());
+    }
+
+    #[test]
+    fn refined_weld_qualifies_real_native_coedges_and_preserves_both_source_face_namespaces() {
+        use crate::{Document, FeatureId, FeatureKind};
+        use std::collections::BTreeSet;
+        let mut doc = Document::new("Refined weld CAD");
+        let a = FeatureId(doc.add_feature(refined_weld_source(true), Some("Lower")).unwrap());
+        let b = FeatureId(doc.add_feature(refined_weld_source(false), Some("Upper")).unwrap());
+        let seam = RefinedWeldSeam::capture(&doc, [a, b], [[4, 5], [0, 1]]).unwrap();
+        let before = doc.to_json();
+        let made = prepare_refined_weld(&doc, &seam, [0.05; 2]).unwrap();
+        assert_eq!((made.body.face_count(), made.body.edge_count(), made.body.shell_count()), (28, 64, 1));
+        assert!(!made.body.is_surface());
+        assert!(crate::kernel::validity(&made.body).ok());
+        for (source, count) in [(a, 8), (b, 20)] {
+            let FeatureKind::Form { definition, .. } = &doc.feature(source.0).unwrap().kind else { panic!("expected Form") };
+            let expected = definition
+                .hierarchy
+                .as_ref()
+                .unwrap()
+                .layout()
+                .unwrap()
+                .faces
+                .iter()
+                .enumerate()
+                .filter_map(|(id, face)| (!face.is_empty()).then_some(id))
+                .collect::<BTreeSet<_>>();
+            let actual = made.face_owners.iter().filter(|face| face.source == source).map(|face| face.face).collect::<BTreeSet<_>>();
+            assert_eq!(actual.len(), count);
+            assert_eq!(actual, expected);
+        }
+        let restored = Document::from_json(&before).unwrap();
+        let replayed = prepare_refined_weld(&restored, &seam, [0.05; 2]).unwrap();
+        assert!(made.matches_operands(replayed.operands()));
+        let [first, second] = replayed.operands();
+        assert!(!made.matches_operands([second, first]));
+        assert_eq!(made.face_owners, replayed.face_owners);
+        assert_eq!(before, doc.to_json());
+
+        let wrong = RefinedWeldSeam::capture(&doc, [a, b], [[4, 5], [1, 2]]).unwrap();
+        let error = prepare_refined_weld(&doc, &wrong, [0.05; 2]).err().unwrap().to_string();
+        assert!(error.contains("do not coincide"), "{error}");
+        let mut offset = restored.clone();
+        let FeatureKind::Form { definition, .. } = &mut offset.feature_mut(b.0).unwrap().kind else { panic!("expected Form") };
+        definition.placement.origin.z += 0.01;
+        let frozen = offset.to_json();
+        let error = prepare_refined_weld(&offset, &seam, [0.05; 2]).err().unwrap().to_string();
+        assert!(error.contains("do not coincide"), "{error}");
+        assert_eq!(frozen, offset.to_json());
+
+        let mut opened = restored;
+        let FeatureKind::Form { definition, .. } = &mut opened.feature_mut(b.0).unwrap().kind else { panic!("expected Form") };
+        let hierarchy = definition.hierarchy.as_ref().unwrap();
+        let cap = hierarchy.leaves.iter().enumerate().filter_map(|(id, leaf)| (leaf.active && leaf.root == 4).then_some(id)).collect::<Vec<_>>();
+        let hierarchy = hierarchy.delete_faces(&cap).unwrap();
+        definition.cage = hierarchy.evaluate().unwrap();
+        definition.hierarchy = Some(hierarchy);
+        assert_eq!(seam.replay(&opened).unwrap().len(), 4, "the selected rim still exists");
+        let frozen = opened.to_json();
+        let error = prepare_refined_weld(&opened, &seam, [0.05; 2]).err().unwrap().to_string();
+        assert!(error.contains("no other free edges"), "{error}");
+        assert_eq!(frozen, opened.to_json());
+    }
+
+    fn quad_cap_opening_fixture() -> (Definition, [usize; 2], [usize; 2]) {
+        use solidcore_record::Vec3;
+        use solidcraft_geom::subdivision::hierarchy::Hierarchy;
+
+        let parameters = Parameters { kind: "face".into(), dimensions: [8.0, 8.0, 1.0], segments: [4, 4, 1], ..Default::default() };
+        let original = Hierarchy::new(parameters.build().unwrap()).unwrap();
+        let mut refined = original.subdivide(&[0], [2, 2]).unwrap();
+        let layout = refined.layout().unwrap();
+        let children = &layout.faces[original.leaves.len()..];
+        let center = *children[0].iter().find(|vertex| children.iter().all(|face| face.contains(vertex))).unwrap();
+        refined.add_deltas(&[center], &[Vec3::Z * 0.01]).unwrap();
+        let mut ring = layout.faces[10].clone();
+        assert_eq!(ring.len(), 4);
+        ring.rotate_left(1);
+        let seed = [ring[0], ring[1]];
+        let hierarchy = refined.delete_faces(&[10]).unwrap();
+        let definition = Definition {
+            placement: Placement { origin: Vec3::new(2.0, -3.0, 4.0), ..Default::default() },
+            cage: hierarchy.evaluate().unwrap(),
+            parameters,
+            symmetry: None,
+            hierarchy: Some(hierarchy),
+            imported: None,
+            pipe: None,
+            profile: None,
+            matching: None,
+        };
+        let interior = layout.faces[5][..2].try_into().unwrap();
+        (definition, seed, interior)
+    }
+
+    #[test]
+    fn quad_cap_preparation_sews_new_owned_face_without_reactivating_sculpted_source() {
+        use solidcore_record::Vec3;
+        let (definition, seed, interior) = quad_cap_opening_fixture();
+        let before = definition.clone();
+        let (_, original_report) = convert(&definition, 0.05).unwrap();
+        let cap = prepare_quad_cap(&definition, 0.05, &[seed], &[]).unwrap();
+        assert_eq!(cap.face, definition.hierarchy.as_ref().unwrap().leaves.len());
+        assert!(!cap.rim.closes_skin && cap.body.is_surface() && !cap.body.is_mesh());
+        assert_eq!(cap.face_owners.iter().filter(|&&owner| owner == cap.face).count(), 1);
+        assert!(!cap.face_owners.contains(&10), "the original material remains deleted");
+        let mut expected: std::collections::BTreeSet<_> = original_report.patch_roots.into_iter().collect();
+        expected.insert(cap.face);
+        assert_eq!(cap.face_owners.iter().copied().collect::<std::collections::BTreeSet<_>>(), expected);
+        assert!(crate::kernel::validity(&cap.body).ok());
+        let face = cap.face_owners.iter().position(|&owner| owner == cap.face).unwrap();
+        let edges = crate::kernel::face_boundaries(&cap.body, face).unwrap();
+        let record = cap.body.record();
+        for uv in [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]] {
+            let expected = definition.placement.point(cap.surface.eval(uv[0], uv[1]).unwrap());
+            assert!(edges.iter().flatten().flat_map(|edge| record.edges[edge.edge].vertices).any(|vertex| {
+                let [x, y, z] = record.vertices[vertex as usize].point;
+                expected.dist(Vec3::new(x, y, z)) < 1e-7
+            }));
+        }
+        assert!(prepare_quad_cap(&definition, 0.05, &[seed, interior], &[]).is_err());
+        assert_eq!(definition, before);
+    }
+    #[test]
+    fn nonplanar_cap_on_original_rounded_rim_keeps_one_logical_owner() {
+        use solidcore_record::Vec3;
+        use solidcraft_geom::subdivision::hierarchy::Hierarchy;
+
+        let parameters = Parameters { kind: "face".into(), dimensions: [64.0, 64.0, 1.0], segments: [8, 8, 1], ..Default::default() };
+        let cage = parameters.build().unwrap();
+        let seed = <[usize; 2]>::try_from(&cage.faces[18][..2]).unwrap();
+        let mut hierarchy = Hierarchy::new(cage.delete_faces(&[18]).unwrap()).unwrap().subdivide(&[0], [2, 2]).unwrap();
+        let rim = hierarchy.quad_cap_rim(&[seed], &[]).unwrap();
+        let vertex = rim.sides[0].edge[0];
+        hierarchy.add_deltas(&[vertex], &[Vec3::Z * 0.05]).unwrap();
+        let face = hierarchy.leaves.len();
+        let definition = Definition {
+            cage: hierarchy.evaluate().unwrap(),
+            parameters,
+            hierarchy: Some(hierarchy),
+            placement: Placement::default(),
+            symmetry: None,
+            imported: None,
+            pipe: None,
+            profile: None,
+            matching: None,
+        };
+        let prepared = prepare_quad_cap(&definition, 0.05, &[seed], &[]).unwrap();
+        assert_eq!(prepared.face, face);
+        assert_eq!(prepared.rim, rim);
+        assert!(prepared.body.is_surface() && crate::kernel::validity(&prepared.body).ok());
+        assert!(prepared.face_owners.iter().filter(|&&id| id == face).count() > 1);
+
+        let authored = author_quad_cap(&definition, 0.05, &[seed], &[]).unwrap();
+        let hierarchy = authored.hierarchy.as_ref().unwrap();
+        assert_eq!(hierarchy.validated_quad_cap().unwrap(), Some((face, rim)));
+        assert_eq!(authored.cage, definition.cage);
+        let saved: Definition = serde_json::from_value(serde_json::to_value(&authored).unwrap()).unwrap();
+        let (_, report) = convert(&saved, 0.05).unwrap();
+        assert_eq!(report.patch_roots, prepared.face_owners);
+
+        // The preview for a second cap still groups every atlas chart of
+        // the existing cap under the earlier reserved face ID.
+        let next_seed = <[usize; 2]>::try_from(&hierarchy.layout().unwrap().faces[44][..2]).unwrap();
+        let mut opened = authored.clone();
+        let next = hierarchy.delete_faces(&[44]).unwrap();
+        let next_face = next.leaves.len();
+        opened.hierarchy = Some(next);
+        let preview = prepare_quad_cap(&opened, 0.05, &[next_seed], &[]).unwrap();
+        assert_eq!(preview.face, next_face);
+        let atlas_faces = preview.face_owners.iter().filter(|&&id| id == face).count();
+        assert!(atlas_faces > 1);
+        assert_eq!(preview.face_owners.iter().filter(|&&id| id == next_face).count(), 1);
+        let both = author_quad_cap(&opened, 0.05, &[next_seed], &[]).unwrap();
+
+        let mut document = crate::Document::new("Nonplanar cap and planar cap");
+        let feature = document
+            .add_feature(
+                crate::FeatureKind::Form {
+                    definition: Box::new(both.clone()),
+                    tolerance: "0.05 mm".into(),
+                    operation: crate::Operation::NewBody,
+                    targets: Vec::new(),
+                },
+                None,
+            )
+            .unwrap();
+        let reopened = crate::Document::from_json(&document.to_json()).unwrap();
+        let mut model = crate::Model::new();
+        model.evaluate(&reopened);
+        assert!(model.results.iter().all(|result| result.error.is_none()), "{:?}", model.results);
+        let state = model.state();
+        let names = crate::naming::face_names(&state.bodies[0]);
+        let atlas_name = format!("F{feature}:FormPatch{}", face + 1);
+        let planar_name = format!("F{feature}:FormPatch{}", next_face + 1);
+        assert_eq!(names.iter().filter(|name| crate::naming::strip_piece(name) == atlas_name).count(), atlas_faces);
+        assert_eq!(names.iter().filter(|name| *name == &planar_name).count(), 1);
+
+        let mut removed = both.clone();
+        removed.hierarchy = Some(both.hierarchy.as_ref().unwrap().delete_faces(&[face]).unwrap());
+        let (_, report) = convert(&removed, 0.05).unwrap();
+        assert!(!report.patch_roots.contains(&face));
+        assert!(report.patch_roots.contains(&next_face));
+        let recapped = author_quad_cap(&removed, 0.05, &[seed], &[]).unwrap();
+        let recapped = recapped.hierarchy.as_ref().unwrap();
+        assert_eq!(recapped.quad_cap_faces().collect::<Vec<_>>(), [next_face, next_face + 1]);
+        assert!(recapped.layout().unwrap().faces[face].is_empty());
+    }
+
+    #[test]
+    fn authored_quad_cap_keeps_its_face_after_leaf_allocation_and_design_reopen() {
+        let (source, seed, _) = quad_cap_opening_fixture();
+        let before = source.clone();
+        let mut definition = author_quad_cap(&source, 0.05, &[seed], &[]).unwrap();
+        let hierarchy = definition.hierarchy.as_ref().unwrap();
+        let original = source.hierarchy.as_ref().unwrap();
+        let (face, rim) = hierarchy.validated_quad_cap().unwrap().unwrap();
+        let vertices = rim.sides.each_ref().map(|side| side.edge[0]);
+        assert_eq!(face, original.leaves.len());
+        assert_eq!(hierarchy.layout().unwrap().faces[face], vertices);
+        assert_eq!(hierarchy.base, original.base);
+        assert_eq!(hierarchy.details, original.details);
+        assert_eq!(hierarchy.controls, original.controls);
+        assert_eq!(hierarchy.sharpness, original.sharpness);
+        assert_eq!(definition.cage, source.cage);
+        assert_eq!(definition.placement, source.placement);
+        assert!(author_quad_cap(&definition, 0.05, &[seed], &[]).is_err());
+        let support = rim.sides[0].owner;
+        assert!(hierarchy.subdivide(&[support], [2, 2]).is_err(), "a cap side cannot silently gain a different owner");
+        assert!(hierarchy.delete_faces(&[support]).is_err(), "the bound rim must survive source edits");
+        assert!(hierarchy.delete_faces(&[face, support]).is_err(), "delete the derived face on its own");
+        assert!(hierarchy.restore_deleted_holes(&[seed], &[], false).is_err(), "the new cap and original material cannot overlap");
+        assert_eq!(hierarchy.validated_quad_cap().unwrap(), Some((face, rim.clone())));
+        assert_eq!(source, before);
+
+        let refined = hierarchy.subdivide(&[3], [4, 4]).unwrap();
+        assert!(refined.depth > hierarchy.depth && refined.leaves.len() > face + 1);
+        assert_eq!(refined.validated_quad_cap().unwrap(), Some((face, rim.clone())));
+        assert_eq!(refined.layout().unwrap().faces[face], vertices);
+        assert_eq!(&refined.details[..hierarchy.details.len()], &hierarchy.details);
+        definition.cage = refined.evaluate().unwrap();
+        definition.hierarchy = Some(refined);
+
+        let mut document = crate::Document::new("Quad cap");
+        let id = document
+            .add_feature(
+                crate::FeatureKind::Form {
+                    definition: Box::new(definition.clone()),
+                    tolerance: "0.05 mm".into(),
+                    operation: crate::Operation::NewBody,
+                    targets: Vec::new(),
+                },
+                None,
+            )
+            .unwrap();
+        let reopened = crate::Document::from_json(&document.to_json()).unwrap();
+        assert_eq!(reopened.feature(id), document.feature(id));
+        let crate::FeatureKind::Form { definition: saved, .. } = &reopened.feature(id).unwrap().kind else { panic!("saved Form") };
+        assert_eq!(saved.hierarchy.as_ref().unwrap().validated_quad_cap().unwrap(), Some((face, rim.clone())));
+        let mut model = crate::Model::new();
+        model.evaluate(&reopened);
+        assert!(model.results.iter().all(|result| result.error.is_none()), "{:?}", model.results);
+        let state = model.state();
+        assert_eq!(state.bodies.len(), 1);
+        assert!(state.bodies[0].body.is_surface());
+        let (body, report) = convert(saved, 0.05).unwrap();
+        assert_eq!(report.patch_roots.iter().filter(|&&owner| owner == face).count(), 1);
+        assert!(crate::kernel::validity(&body).ok());
+
+        let mut hostile = serde_json::to_value(saved).unwrap();
+        hostile["hierarchy"]["quad_cap"]["sides"][0]["owner"] = serde_json::json!(face);
+        let moved: Definition = serde_json::from_value(hostile).unwrap();
+        assert!(convert(&moved, 0.05).is_err(), "a changed saved owner cannot retarget the cap");
+        let old = serde_json::to_value(source).unwrap();
+        assert!(old["hierarchy"].get("quad_cap").is_none());
+        assert_eq!(serde_json::from_value::<Definition>(old).unwrap(), before);
+    }
+    #[test]
+    fn disjoint_quad_caps_replay_and_reshape_independently_with_stable_ids() {
+        use solidcore_record::Vec3;
+        use solidcraft_geom::subdivision::hierarchy::Hierarchy;
+
+        let parameters = Parameters { kind: "face".into(), dimensions: [64.0, 64.0, 1.0], segments: [8, 8, 1], ..Default::default() };
+        let refined = Hierarchy::new(parameters.build().unwrap()).unwrap().subdivide(&[0], [2, 2]).unwrap();
+        let layout = refined.layout().unwrap();
+        let [first_edge, second_edge] = [18, 45].map(|id| <[usize; 2]>::try_from(&layout.faces[id][..2]).unwrap());
+        let hierarchy = refined.delete_faces(&[18, 45]).unwrap();
+        let first = hierarchy.leaves.len();
+        let second = first + 1;
+        let source = Definition {
+            cage: hierarchy.evaluate().unwrap(),
+            hierarchy: Some(hierarchy),
+            parameters,
+            placement: Placement::default(),
+            imported: None,
+            pipe: None,
+            profile: None,
+            symmetry: None,
+            matching: None,
+        };
+        let single = author_quad_cap(&source, 0.05, &[first_edge], &[]).unwrap();
+        let legacy = serde_json::to_value(&single).unwrap();
+        assert!(legacy["hierarchy"].get("additional_quad_caps").is_none());
+        assert_eq!(serde_json::from_value::<Definition>(legacy).unwrap(), single);
+        let prepared = prepare_quad_cap(&single, 0.05, &[second_edge], &[]).unwrap();
+        assert_eq!(prepared.face, second);
+        assert!(prepared.body.is_surface());
+        for owner in [first, second] {
+            assert_eq!(prepared.face_owners.iter().filter(|&&id| id == owner).count(), 1);
+        }
+        let both = author_quad_cap(&single, 0.05, &[second_edge], &[]).unwrap();
+        let hierarchy = both.hierarchy.as_ref().unwrap();
+        assert_eq!(hierarchy.quad_cap_faces().collect::<Vec<_>>(), [first, second]);
+        let rims = hierarchy.validated_quad_caps().unwrap();
+        assert_eq!(rims[0].1.sides.each_ref().map(|side| side.owner), [10, 19, 26, 17]);
+        assert_eq!(rims[1].1.sides.each_ref().map(|side| side.owner), [37, 46, 53, 44]);
+        assert!(author_quad_cap(&both, 0.05, &[first_edge], &[]).is_err());
+        assert!(author_quad_cap(&both, 0.05, &[second_edge], &[]).is_err());
+        assert!(hierarchy.delete_faces(&[first, second]).is_err());
+
+        let mut document = crate::Document::new("Disjoint caps");
+        let feature = document
+            .add_feature(
+                crate::FeatureKind::Form {
+                    definition: Box::new(both.clone()),
+                    tolerance: "0.05 mm".into(),
+                    operation: crate::Operation::NewBody,
+                    targets: Vec::new(),
+                },
+                None,
+            )
+            .unwrap();
+        let reopened = crate::Document::from_json(&document.to_json()).unwrap();
+        assert_eq!(reopened.feature(feature), document.feature(feature));
+
+        let (body, report, fitted) = convert_source(&both, 0.05).unwrap();
+        assert!(crate::kernel::validity(&body).ok());
+        assert!(!report.patch_roots.iter().any(|id| [18, 45].contains(id)));
+        let center = |cap: &quad_cap::FittedQuadCap| cap.surface.eval(0.5, 0.5).unwrap();
+        let mut sculpted = both.clone();
+        let sculpted_h = sculpted.hierarchy.as_mut().unwrap();
+        sculpted_h.add_deltas(&[rims[0].1.sides[0].edge[0]], &[Vec3::X * 0.05]).unwrap();
+        sculpted.cage = sculpted_h.evaluate().unwrap();
+        let (body, report, sculpted_fit) = convert_source(&sculpted, 0.05).unwrap();
+        assert!(crate::kernel::validity(&body).ok());
+        assert_eq!(sculpted_fit.quad_caps.iter().map(|cap| cap.face).collect::<Vec<_>>(), [first, second]);
+        let movement = center(&sculpted_fit.quad_caps[0]) - center(&fitted.quad_caps[0]);
+        assert!((0.01..0.05).contains(&movement.x), "{movement:?}");
+        assert!(center(&sculpted_fit.quad_caps[1]).dist(center(&fitted.quad_caps[1])) < 1e-12);
+        assert_eq!(report.patch_roots.iter().filter(|&&id| id == second).count(), 1);
+
+        for (removed, retained, seed) in [(first, second, first_edge), (second, first, second_edge)] {
+            let mut open = both.clone();
+            let next = hierarchy.delete_faces(&[removed]).unwrap();
+            let cap = next.leaves.len();
+            assert_eq!(next.quad_cap_faces().collect::<Vec<_>>(), [retained]);
+            assert!(next.layout().unwrap().faces[removed].is_empty());
+            open.hierarchy = Some(next);
+            let (_, report) = convert(&open, 0.05).unwrap();
+            assert!(report.patch_roots.contains(&retained));
+            assert!(!report.patch_roots.contains(&removed));
+            let recapped = author_quad_cap(&open, 0.05, &[seed], &[]).unwrap();
+            let recapped_h = recapped.hierarchy.as_ref().unwrap();
+            assert_eq!(recapped_h.quad_cap_faces().collect::<Vec<_>>(), [retained, cap]);
+            assert!(recapped_h.layout().unwrap().faces[removed].is_empty());
+            // The old survivor may precede a previously retired slot.
+            let retired = recapped_h.delete_faces(&[retained]).unwrap();
+            assert_eq!(retired.quad_cap_faces().collect::<Vec<_>>(), [cap]);
+            let layout = retired.layout().unwrap();
+            assert!(layout.faces[retained].is_empty());
+            assert!(layout.faces[removed].is_empty());
+        }
+
+        let mut invalid = serde_json::to_value(&both).unwrap();
+        let saved_first = invalid["hierarchy"]["quad_cap"].clone();
+        invalid["hierarchy"]["additional_quad_caps"][0]["sides"] = saved_first["sides"].clone();
+        let repeated_rim: Definition = serde_json::from_value(invalid).unwrap();
+        assert!(convert(&repeated_rim, 0.05).is_err());
+    }
+
+    #[test]
+    fn disjoint_quad_caps_close_a_box_and_either_cap_can_reopen_it() {
+        use solidcraft_geom::subdivision::hierarchy::Hierarchy;
+
+        let parameters = Parameters { kind: "box".into(), dimensions: [20.0; 3], segments: [1; 3], ..Default::default() };
+        let base = parameters.build().unwrap();
+        let opposite = base.faces.iter().position(|face| face.iter().all(|v| !base.faces[0].contains(v))).unwrap();
+        let [a, b] = [0, opposite].map(|id| [base.faces[id][0], base.faces[id][1]]);
+        let hierarchy = Hierarchy::new(base).unwrap().delete_faces(&[0, opposite]).unwrap();
+        let first = hierarchy.leaves.len();
+        let second = first + 1;
+        let source = Definition {
+            cage: hierarchy.evaluate().unwrap(),
+            hierarchy: Some(hierarchy),
+            parameters,
+            placement: Placement::default(),
+            symmetry: None,
+            imported: None,
+            pipe: None,
+            profile: None,
+            matching: None,
+        };
+        let single = author_quad_cap(&source, 0.05, &[a], &[]).unwrap();
+        let both = author_quad_cap(&single, 0.05, &[b], &[]).unwrap();
+        let (body, report) = convert(&both, 0.05).unwrap();
+        assert!(report.solid && !body.is_surface() && crate::kernel::validity(&body).ok());
+        assert_eq!(report.patch_roots.len(), 6);
+        assert!(report.patch_roots.contains(&first) && report.patch_roots.contains(&second));
+        let hierarchy = both.hierarchy.as_ref().unwrap();
+        for (removed, retained) in [(first, second), (second, first)] {
+            let mut reopened = both.clone();
+            reopened.hierarchy = Some(hierarchy.delete_faces(&[removed]).unwrap());
+            let (body, report) = convert(&reopened, 0.05).unwrap();
+            assert!(!report.solid && body.is_surface() && crate::kernel::validity(&body).ok());
+            assert!(report.patch_roots.contains(&retained) && !report.patch_roots.contains(&removed));
+        }
+    }
+
+    #[test]
+    fn refined_erase_and_fill_replaces_a_real_fine_sculpt_with_a_native_cap() {
+        use solidcore_record::Vec3;
+        use solidcraft_geom::subdivision::hierarchy::Hierarchy;
+        let parameters = Parameters { kind: "face".into(), dimensions: [8.0, 8.0, 1.0], segments: [4, 4, 1], ..Default::default() };
+        let mut hierarchy = Hierarchy::new(parameters.build().unwrap()).unwrap().subdivide(&[10], [4, 4]).unwrap();
+        let selected: Vec<_> = hierarchy.leaves.iter().enumerate().filter_map(|(id, leaf)| (leaf.active && leaf.root == 10).then_some(id)).collect();
+        let center = hierarchy.leaf_corners().unwrap()[selected[5]].unwrap()[2];
+        hierarchy.add_deltas(&[center], &[Vec3::Z * 0.25]).unwrap();
+        let before = Definition {
+            placement: Default::default(),
+            cage: hierarchy.evaluate().unwrap(),
+            parameters,
+            symmetry: None,
+            hierarchy: Some(hierarchy.clone()),
+            imported: None,
+            pipe: None,
+            profile: None,
+            matching: None,
+        };
+        let previous = fitted_source(&before, 0.05).unwrap();
+        assert!(previous.trimmed_roots, "the fixture must retain the old root chart");
+        let original = previous.fit.patches[10].eval(0.5, 0.5).unwrap();
+        assert!(original.z > 0.06, "the original fitted region must contain the fine sculpt");
+        let next = hierarchy.erase_and_cap(&selected).unwrap();
+        let face = next.quad_cap_face().unwrap();
+        let after = Definition { hierarchy: Some(next), ..before.clone() };
+        let (body, report, current) = convert_source(&after, 0.05).unwrap();
+        assert!(body.is_surface() && crate::kernel::validity(&body).ok());
+        assert!(current.trimmed_roots);
+        for (root, (old, new)) in previous.fit.patches.iter().zip(&current.fit.patches).enumerate() {
+            if root != 10 {
+                for [u, v] in [[0.0, 0.0], [0.25, 0.75], [0.5, 0.5], [1.0, 1.0]] {
+                    assert!(old.eval(u, v).unwrap().dist(new.eval(u, v).unwrap()) < 1e-9);
+                }
+            }
+        }
+        let native = report.patch_roots.iter().position(|&owner| owner == face).unwrap();
+        let [[u0, u1], [v0, v1]] = body.record().faces[native].domain;
+        let geometry = crate::kernel::face_geometry(&body, native).unwrap();
+        let (point, _, _) = geometry.surface.derivs((u0 + u1) / 2.0, (v0 + v1) / 2.0).unwrap();
+        assert!(point.dist(Vec3::new(original.x, original.y, point.z)) < 1e-9);
+        // The fine control also raises the exact rim. The cap follows that rim,
+        // with a lower center than the sculpted patch at the same XY station.
+        assert!(point.z > 0.0 && original.z - point.z > 0.05, "the new cap replaces the raised interior");
+        assert!(selected.iter().all(|id| !report.patch_roots.contains(id)));
+        let expected: std::collections::BTreeSet<_> =
+            previous.fit.patch_roots.into_iter().filter(|id| !selected.contains(id)).chain([face]).collect();
+        assert_eq!(report.patch_roots.iter().copied().collect::<std::collections::BTreeSet<_>>(), expected);
+        assert_eq!(after.cage, before.cage);
+        assert_eq!(after.hierarchy.as_ref().unwrap().details, hierarchy.details);
+    }
     #[test]
     fn a_basic_extruded_face_finishes_as_a_valid_cad_solid() {
         let parameters = Parameters::default();
@@ -2134,6 +3035,59 @@ mod tests {
         let reopened: crate::Document = serde_json::from_slice(&saved).unwrap();
         assert_eq!(reopened.feature(id), document.feature(id));
     }
+    #[test]
+    fn refined_plane_extrusion_compacts_only_preview_sheets_and_keeps_logical_routes() {
+        use std::collections::{BTreeMap, BTreeSet};
+
+        let parameters = Parameters { kind: "face".into(), dimensions: [64.0, 64.0, 1.0], segments: [8, 8, 1], ..Default::default() };
+        let hierarchy = solidcraft_geom::subdivision::hierarchy::Hierarchy::new(parameters.build().unwrap())
+            .unwrap()
+            .subdivide(&[27], [2, 2])
+            .unwrap()
+            .extrude_faces(&[67], solidcore_record::Vec3::new(0.0, 0.0, 4.0))
+            .unwrap();
+        let definition = Definition {
+            cage: hierarchy.evaluate().unwrap(),
+            hierarchy: Some(hierarchy),
+            parameters,
+            placement: Default::default(),
+            symmetry: None,
+            imported: None,
+            pipe: None,
+            profile: None,
+            matching: None,
+        };
+        let (saved, old, guides) = convert_with_guides(&definition, 0.05).unwrap();
+        let (preview, new, preview_guides, _) = convert_with_selection(&definition, 0.05).unwrap();
+        assert_eq!(saved.face_count(), 260);
+        assert!(preview.face_count() < saved.face_count());
+        assert!(preview.is_surface() && crate::kernel::validity(&preview).ok());
+        assert!(old.sampled_deviation_mm <= new.sampled_deviation_mm && new.sampled_deviation_mm <= 0.05);
+        assert_eq!(old.patch_roots.iter().copied().collect::<BTreeSet<_>>(), new.patch_roots.iter().copied().collect());
+
+        let owner_edges = |body: &crate::kernel::Body, report: &ConversionReport| {
+            let mut edges = BTreeMap::new();
+            for edge in &body.record().edges {
+                let mut owners: BTreeSet<_> = edge.uses.iter().map(|use_| report.patch_roots[use_.face as usize]).collect();
+                let first = owners.pop_first().unwrap();
+                let second = owners.pop_first();
+                if second.is_some() || edge.uses.len() == 1 {
+                    *edges.entry((first, second)).or_insert(0usize) += 1;
+                }
+            }
+            edges
+        };
+        assert_eq!(owner_edges(&saved, &old), owner_edges(&preview, &new));
+        let (SelectionGuides::Subdivision(old), SelectionGuides::Subdivision(new)) = (guides, preview_guides) else {
+            panic!("both bodies must retain exact subdivision guide routes");
+        };
+        assert_eq!(old.len(), new.len());
+        for (a, b) in old.iter().zip(&new) {
+            assert_eq!(a.edge, b.edge);
+            assert_eq!(a.rational_pieces().unwrap(), b.rational_pieces().unwrap());
+        }
+    }
+
     #[test]
     fn nested_sculpted_leaves_are_exact_root_trims_and_deleted_regions_stay_open() {
         use solidcraft_geom::subdivision::hierarchy::Hierarchy;
@@ -2244,6 +3198,29 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn sphere_converts_at_tight_tolerance_without_losing_source_faces() {
+        let parameters = Parameters { kind: "sphere".into(), dimensions: [10.0; 3], segments: [4, 4, 2], ..Default::default() };
+        let definition = Definition {
+            cage: parameters.build().unwrap(),
+            parameters,
+            imported: None,
+            pipe: None,
+            profile: None,
+            matching: None,
+            placement: Default::default(),
+            symmetry: None,
+            hierarchy: None,
+        };
+        let (body, report) = convert(&definition, 0.01).unwrap();
+        assert!(report.solid && !body.is_surface() && !body.is_mesh());
+        assert_eq!(body.shell_count(), 1);
+        assert_eq!(report.patches, body.face_count());
+        assert_eq!(report.patches, definition.cage.faces.len());
+        assert_eq!(report.patch_roots.iter().copied().collect::<std::collections::BTreeSet<_>>(), (0..definition.cage.faces.len()).collect());
+        assert!(report.sampled_deviation_mm <= 0.01);
     }
 
     #[test]

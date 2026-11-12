@@ -40,8 +40,8 @@ impl Form {
         self.placement.local_vector(v)
     }
     pub(super) fn install_surface(&mut self, surface: SurfacePreview) {
-        self.local_vertices = surface.vertices.clone();
-        self.surface = placed_surface(surface, &self.placement);
+        self.local_vertices = Arc::from(surface.vertices.as_slice());
+        self.surface = Arc::new(placed_surface(surface, &self.placement));
     }
     pub fn transform(&mut self, matrix: &Mat, checkpoint: bool) -> Result<()> {
         if self.profile.is_some() {
@@ -59,12 +59,12 @@ impl Form {
             return Ok(());
         }
         let delta = Placement::from_matrix(matrix)?;
-        let surface = placed_surface(self.surface.clone(), &delta);
+        let surface = placed_surface(self.surface.as_ref().clone(), &delta);
         if checkpoint {
             self.checkpoint();
         }
         self.placement = placement;
-        self.surface = surface;
+        self.surface = Arc::new(surface);
         self.match_report = None;
         self.extrusion = None;
         self.redo.clear();

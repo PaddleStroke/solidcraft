@@ -3639,7 +3639,7 @@ pub fn shortcuts(app: &mut SolveApp, ctx: &egui::Context) {
     }
     for (k, repeat, mods) in keys {
         use egui::Key;
-        if crate::forms_prototype::shortcut(app, k, mods) {
+        if crate::forms_prototype::shortcut(app, ctx, k, mods) {
             continue;
         }
         if mods.is_none() && crate::forms_prototype::owns_key(app, k) {

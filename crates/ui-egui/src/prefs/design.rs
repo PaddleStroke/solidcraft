@@ -172,7 +172,19 @@ pub(super) fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
         });
         origin_plane_names(app, ui, label_width);
         ui_kit::settings_section(ui, "forms", app.tr("prefs.forms"), |ui| {
+            let response = setting::forms_compact_editor(app, ui).on_hover_text(app.tr("prefs.forms_compact_editor_help"));
+            crate::scenario::publish_target("prefs:forms_compact_editor", response.rect);
+            let response = setting::forms_drag_feedback(app, ui).on_hover_text(app.tr("prefs.forms_drag_feedback_help"));
+            crate::scenario::publish_target("prefs:forms_drag_feedback", response.rect);
+            if cfg!(not(target_arch = "wasm32")) {
+                let response = setting::forms_exact_face_picking(app, ui).on_hover_text(app.tr("prefs.forms_exact_face_picking_help"));
+                crate::scenario::publish_target("prefs:forms_exact_face_picking", response.rect);
+            }
             setting::forms_greedy_selection(app, ui);
+            let response = setting::forms_preserve_selection(app, ui).on_hover_text(app.tr("prefs.forms_preserve_selection_help"));
+            crate::scenario::publish_target("prefs:forms_preserve_selection", response.rect);
+            let response = setting::forms_region_selection(app, ui).on_hover_text(app.tr("forms.prototype.region_help"));
+            crate::scenario::publish_target("prefs:forms_region_selection", response.rect);
             setting::forms_match_adjacent(app, ui);
             setting::forms_surface_partition(app, ui);
             let response = setting::forms_mesh_while_dragging(app, ui).on_hover_text(app.tr("prefs.forms_mesh_while_dragging_help"));

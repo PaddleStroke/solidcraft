@@ -503,3 +503,44 @@ fn a_square_g1_cap_leaves_incompatible_corner_conditions_out_and_stays_regular()
     assert_eq!(transition.order(), 1);
     assert!(transition.fade > 0.0 && transition.fade < 1.0 && transition.held);
 }
+
+#[test]
+fn exact_quad_cap_reproduces_a_rational_quarter_cylinder_with_split_directed_sides() {
+    use crate::bspline::CurveN;
+    let w = std::f64::consts::FRAC_1_SQRT_2;
+    let arc = [HPoint::weighted(Vec3::X, 1.0), HPoint::weighted(Vec3::new(1.0, 1.0, 0.0), w), HPoint::weighted(Vec3::Y, 1.0)];
+    let knots = [0.0, 0.0, 0.0, 1.0, 1.0, 1.0];
+    let cut = 0.375;
+    let curve = |[a, b]: [f64; 2], z: f64, reverse: bool| {
+        let (k, h) = segment(2, &knots, &arc, a, b).unwrap();
+        let values = |p: HPoint| [p.x, p.y, p.z + p.w * z, p.w];
+        let spline = if reverse {
+            CurveN { degree: 2, knots: k.iter().rev().map(|&t| (b - t) / (b - a)).collect(), ctrl: h.into_iter().rev().map(values).collect() }
+        } else {
+            CurveN { degree: 2, knots: k.iter().map(|&t| (t - a) / (b - a)).collect(), ctrl: h.into_iter().map(values).collect() }
+        };
+        (if reverse { [1.0 - b, 1.0 - a] } else { [a, b] }, spline)
+    };
+    let line = |a: Vec3, b: Vec3| {
+        ([0.0, 1.0], CurveN { degree: 1, knots: vec![0.0, 0.0, 1.0, 1.0], ctrl: vec![[a.x, a.y, a.z, 1.0], [b.x, b.y, b.z, 1.0]] })
+    };
+    let mut bottom = [curve([0.0, cut], 0.0, false), curve([cut, 1.0], 0.0, false)];
+    let right = [line(Vec3::Y, Vec3::Y + Vec3::Z * 2.0)];
+    let top = [curve([cut, 1.0], 2.0, true), curve([0.0, cut], 2.0, true)];
+    let left = [line(Vec3::X + Vec3::Z * 2.0, Vec3::X)];
+    let cap = quad_cap([&bottom, &right, &top, &left]).unwrap();
+    for i in 0..=100 {
+        let u = i as f64 / 100.0;
+        let h = arc[0] * (1.0 - u).powi(2) + arc[1] * (2.0 * u * (1.0 - u)) + arc[2] * u.powi(2);
+        let point = h.project().unwrap();
+        for v in [0.0, 0.2, 0.5, 0.8, 1.0] {
+            assert!(cap.eval(u, v).unwrap().dist(point + Vec3::Z * (2.0 * v)) < 1e-11, "u={u}, v={v}");
+        }
+    }
+    assert!(quad_cap([&bottom, &left, &top, &right]).is_err(), "crossed rim order is invalid");
+    bottom[1].0[0] += 1e-5;
+    assert!(quad_cap([&bottom, &right, &top, &left]).is_err(), "a missing rim interval must not be interpolated");
+    bottom[1].0[0] = cut;
+    bottom[1].1.ctrl[1][3] = f64::INFINITY;
+    assert!(quad_cap([&bottom, &right, &top, &left]).is_err(), "hostile homogeneous data is refused");
+}

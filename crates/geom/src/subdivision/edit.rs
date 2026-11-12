@@ -612,6 +612,28 @@ mod tests {
     }
 
     #[test]
+    fn logical_face_frame_centre_transports_u_through_rotated_evaluator_cells() {
+        use super::super::hierarchy::Hierarchy;
+
+        let parameters = Parameters { kind: "face".into(), dimensions: [10.0; 3], segments: [1; 3], ..Default::default() };
+        let h = Hierarchy::new(parameters.build().unwrap()).unwrap().subdivide(&[0], [2, 1]).unwrap();
+        let original = h.face_frame_sites(true).unwrap();
+        assert_eq!(
+            original.iter().map(|site| (site.owner, site.chart, site.uv, site.along_u)).collect::<Vec<_>>(),
+            [(1, 0, [0.25, 0.5], [1.0, 0.0]), (2, 0, [0.75, 0.5], [1.0, 0.0]),]
+        );
+        let evaluator = h.face_frame_sites(false).unwrap();
+        assert_eq!(
+            evaluator.iter().map(|site| (site.owner, site.chart, site.uv, site.along_u)).collect::<Vec<_>>(),
+            [(1, 3, [1.0, 0.5], [0.0, 0.125]), (2, 2, [0.5, 1.0], [-0.125, 0.0]),]
+        );
+        let edge = h.seam_endpoints(0, 0).unwrap();
+        let merged = h.dissolve_edges(&[edge]).unwrap();
+        assert!(merged.face_frame_sites(true).unwrap().is_empty());
+        assert!(merged.face_frame_sites(false).unwrap().is_empty());
+    }
+
+    #[test]
     fn trimmed_ribbon_uses_the_exact_active_boundary_and_leaves_the_stencil_intact() {
         use super::super::{hierarchy::Hierarchy, key};
         use crate::tess::EvalSurface;

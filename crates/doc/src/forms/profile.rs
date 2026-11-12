@@ -42,6 +42,16 @@ pub struct ProfileAnchor {
     pub coordinate: BoundaryCoordinate,
     pub uv: [f64; 2],
 }
+/// The display and its exact edited skin, produced together by one fit.
+pub struct ProfileDisplay {
+    pub mesh: solidcraft_geom::Mesh,
+    pub report: super::ConversionReport,
+    pub patch: kernel::Body,
+    /// Logical cell owners in patch-native face order. None does not authorize
+    /// inferring cell identities from display triangles or guide samples.
+    pub patch_roots: Option<Vec<usize>>,
+    pub guides: super::SelectionGuides,
+}
 pub struct ProfileFit {
     pub patch_roots: Option<Vec<usize>>,
     pub open: kernel::Body,
@@ -103,8 +113,20 @@ impl Profile {
         placement: &Placement,
         tolerance: f64,
     ) -> Result<(solidcraft_geom::Mesh, super::ConversionReport)> {
+        let display = self.display_with_body(state, cage, placement, tolerance)?;
+        Ok((display.mesh, display.report))
+    }
+    /// Display and the exact edited skin from one fit. The retained body is the
+    /// patch, not the source support or the solid with that patch installed.
+    /// Some(owners) maps its canonical native faces to logical grid cells;
+    /// None supplies no cell mapping. An unpartitioned profile is selected as
+    /// one whole Surface, never as the report's compatibility Face(0).
+    /// Native guide provenance is retained when available; display fallbacks
+    /// explicitly report unmapped exact guide coverage.
+    pub fn display_with_body(&self, state: &ModelState, cage: &Cage, placement: &Placement, tolerance: f64) -> Result<ProfileDisplay> {
         let fit = self.fit(state, cage, placement, tolerance)?;
         let roots = fit.patch_roots.clone();
+        let native_owners = roots.clone();
         let patch = fit.patch;
         let surface = kernel::face_geometry(&patch, 0)?;
         let mut mesh = patch.mesh(&kernel::MeshTolerance::chord(tolerance.min(0.05)))?;
@@ -112,24 +134,28 @@ impl Profile {
         mesh = display_mesh;
         let mut maximum = fit.report.gap.max(fit.report.point_gap);
         let edges = cage.edges().map_err(|e| invalid(e.to_string()))?;
+        let mut exact_guides = super::SelectionGuides::Unmapped("exact Form Surface fallback guide routing is unavailable".into());
         mesh.edges = if let Some(guides) = shared_guides {
             for &point in &cage.points {
                 let point = placement.point(point);
                 let uv = surface.parameters(point, None, tolerance)?;
                 maximum = maximum.max(surface.surface.eval(uv[0], uv[1]).0.dist(point));
             }
-            guides
+            exact_guides = super::SelectionGuides::Native(guides.exact);
+            guides.samples
         } else if roots.is_none() && patch.face_count() > 1 {
             let (source, face) = self.resolve(state)?;
             let rim = QuiltRim::new(self, cage, placement, &source.body, face)?;
             let original = quilt_guide_edges(&patch, cage, placement, &edges, &rim)?;
-            match quilt::display(&patch, &fit.open, &source.body, &edges, &rim, &original, tolerance) {
+            match quilt::display_routed(&patch, &fit.open, &source.body, &edges, &rim, &original, tolerance) {
                 Ok(sampled) => {
-                    mesh = sampled.mesh;
-                    sampled.guides
+                    mesh = sampled.sampled.mesh;
+                    exact_guides = super::SelectionGuides::Native(sampled.exact);
+                    sampled.sampled.guides
                 }
                 Err(reason) => {
                     log::warn!("Form Surface quilt retains independent display guides: {reason}");
+                    exact_guides = super::SelectionGuides::Unmapped(format!("exact Form Surface quilt guides are unavailable: {reason}"));
                     original
                 }
             }
@@ -188,9 +214,9 @@ impl Profile {
         } else {
             mesh.tri_face.fill(u32::MAX);
         }
-        Ok((
+        Ok(ProfileDisplay {
             mesh,
-            super::ConversionReport {
+            report: super::ConversionReport {
                 sampled_deviation_mm: maximum,
                 subdivision_level: 0,
                 patches: patch.face_count(),
@@ -199,7 +225,10 @@ impl Profile {
                 trimmed_roots: true,
                 solid: false,
             },
-        ))
+            patch,
+            patch_roots: native_owners,
+            guides: exact_guides,
+        })
     }
     pub fn validate(&self, cage: &Cage) -> Result<()> {
         self.source.validate()?;

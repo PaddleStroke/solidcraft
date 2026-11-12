@@ -63,7 +63,9 @@ struct State {
 impl Draft {
     pub(crate) fn capture(form: &Form, base_dirty: bool) -> Self {
         let form = accepted(form);
-        let history = |stack: &[Snapshot]| stack.iter().skip(stack.len().saturating_sub(MAX_HISTORY)).map(State::from_snapshot).collect();
+        let history = |stack: &[Arc<Snapshot>]| {
+            stack.iter().skip(stack.len().saturating_sub(MAX_HISTORY)).map(|snapshot| State::from_snapshot(snapshot)).collect()
+        };
         Self {
             version: VERSION,
             editing_feature: form.editing_feature,
@@ -132,7 +134,7 @@ impl Draft {
         Ok((form, draft.base_dirty))
     }
 
-    fn restore_history(states: Vec<State>, editing: Option<u64>) -> Result<Vec<Snapshot>> {
+    fn restore_history(states: Vec<State>, editing: Option<u64>) -> Result<Vec<Arc<Snapshot>>> {
         states
             .into_iter()
             .map(|state| {

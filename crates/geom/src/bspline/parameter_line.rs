@@ -31,6 +31,13 @@ impl NurbsSurface {
     /// share endpoints and form one clamped curve; unsupported degrees and
     /// discontinuities are refused instead of sampled or fitted.
     pub fn parameter_line(&self, a: [f64; 2], b: [f64; 2]) -> SplineResult<(Vec<f64>, Vec<HPoint>)> {
+        let mut remaining = usize::MAX;
+        self.parameter_line_bounded(a, b, &mut remaining)
+    }
+
+    /// Exact restriction with a shared work budget. Charge the knot scan,
+    /// actual parameter crossings, and tensor basis products used by this line.
+    pub fn parameter_line_bounded(&self, a: [f64; 2], b: [f64; 2], remaining: &mut usize) -> SplineResult<(Vec<f64>, Vec<HPoint>)> {
         let domain = self.domain();
         if a == b
             || (0..2).any(|d| {
@@ -45,6 +52,8 @@ impl NurbsSurface {
         if degree > MAX_SPLINE_DEGREE {
             return Err(SplineError::Unsupported("parameter-line degree exceeds the curve evaluator".into()));
         }
+        let knot_count = self.knots[0].len().saturating_add(self.knots[1].len());
+        charge(remaining, knot_count)?;
         let mut cuts = vec![0.0, 1.0];
         for d in 0..2 {
             if delta[d] == 0.0 {
@@ -55,6 +64,7 @@ impl NurbsSurface {
                 (t > 0.0 && t < 1.0).then_some(t)
             }));
         }
+        charge(remaining, cuts.len().saturating_mul(2 * (1 + cuts.len().ilog2() as usize)))?;
         cuts.sort_by(f64::total_cmp);
         // Distinct crossings can be almost coincident in the two directions.
         // Merging them would leave an interior knot inside a polynomial piece.
@@ -68,6 +78,10 @@ impl NurbsSurface {
         if cuts.len() > 257 || work > 2_000_000 {
             return Err(SplineError::TooLarge("parameter-line extraction budget exceeded".into()));
         }
+        // Both endpoints of each span search for nearby knots. Charge the
+        // complete input knot vector even though most searches stop early.
+        let snap_work = (cuts.len() - 1).saturating_mul(2).saturating_mul(knot_count);
+        charge(remaining, work.saturating_add(snap_work))?;
         let mut knots = vec![0.0; degree + 1];
         let mut ctrl = Vec::<HPoint>::new();
         for (piece, interval) in cuts.windows(2).enumerate() {
@@ -118,4 +132,10 @@ impl NurbsSurface {
         }
         Ok((knots, ctrl))
     }
+}
+
+fn charge(remaining: &mut usize, work: usize) -> SplineResult<()> {
+    *remaining =
+        remaining.checked_sub(work).ok_or_else(|| SplineError::TooLarge("parameter-line extraction exceeded its shared work budget".into()))?;
+    Ok(())
 }

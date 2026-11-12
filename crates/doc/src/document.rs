@@ -1618,6 +1618,9 @@ pub enum FeatureKind {
         #[serde(default = "zero_expr")]
         #[walk(length = "Tolerance")]
         tolerance: Expr,
+        /// Source-scoped refined Form seam. Ordinary Stitch has no seam record.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        form_seam: Option<Box<crate::forms::RefinedWeldSeam>>,
     },
     /// Surface bodies thickened into solids along their normals (by half each way when
     /// `symmetric`).
@@ -1627,6 +1630,14 @@ pub enum FeatureKind {
         thickness: Expr,
         #[serde(default)]
         symmetric: bool,
+        /// Construction chosen at authoring, in source body order. A true slot
+        /// builds two half walls. Older documents did not record that choice.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        form_half_walls: Option<Vec<bool>>,
+        /// A true slot retains the exact planar skin and sweeps its boundary
+        /// curves instead of offsetting the fitted surface in the kernel.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        form_planar_walls: Option<Vec<bool>>,
         operation: Operation,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         targets: Vec<BodyName>,

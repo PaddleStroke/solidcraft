@@ -14,11 +14,20 @@ pub struct ExtrusionPreview {
 pub struct ExtrusionResponse {
     template: ExtrusionPreview,
     reference: Vec3,
+    axis: Option<Vec3>,
     responses: Vec<[Vec3; 3]>,
     fixed: Vec<(usize, Vec3)>,
 }
 fn positions(preview: &ExtrusionPreview) -> Vec<Vec3> {
-    preview.mesh.positions.iter().chain(&preview.vertices).chain(preview.boundaries.iter().flat_map(|(_, path)| path)).copied().collect()
+    preview
+        .mesh
+        .positions
+        .iter()
+        .chain(&preview.vertices)
+        .chain(preview.boundaries.iter().flat_map(|(_, path)| path))
+        .chain(preview.mesh.edges.iter().flatten())
+        .copied()
+        .collect()
 }
 fn point_key(point: Vec3) -> [u64; 3] {
     [point.x, point.y, point.z].map(|value| if value == 0.0 { 0 } else { value.to_bits() })
@@ -30,16 +39,37 @@ impl ExtrusionResponse {
             return Err(error("extrusion feedback needs a finite displacement"));
         }
         let delta = displacement - self.reference;
+        let coefficients = if let Some(axis) = self.axis {
+            let along = delta.dot(axis);
+            if (delta - axis * along).len() > 1e-9 * delta.len().max(1.0) {
+                return Err(error("extrusion feedback moved outside its fixed axis"));
+            }
+            Vec3::new(along, 0.0, 0.0)
+        } else {
+            delta
+        };
         let mut preview = self.template.clone();
-        let targets = preview.mesh.positions.iter_mut().chain(&mut preview.vertices).chain(preview.boundaries.iter_mut().flat_map(|(_, path)| path));
+        let targets = preview
+            .mesh
+            .positions
+            .iter_mut()
+            .chain(&mut preview.vertices)
+            .chain(preview.boundaries.iter_mut().flat_map(|(_, path)| path))
+            .chain(preview.mesh.edges.iter_mut().flatten());
         for (point, response) in targets.zip(&self.responses) {
-            *point += response[0] * delta.x + response[1] * delta.y + response[2] * delta.z;
+            *point += response[0] * coefficients.x + response[1] * coefficients.y + response[2] * coefficients.z;
             if !point.is_finite() {
                 return Err(error("extrusion feedback exceeds finite display coordinates"));
             }
         }
         let mut fixed = self.fixed.iter().peekable();
-        let targets = preview.mesh.positions.iter_mut().chain(&mut preview.vertices).chain(preview.boundaries.iter_mut().flat_map(|(_, path)| path));
+        let targets = preview
+            .mesh
+            .positions
+            .iter_mut()
+            .chain(&mut preview.vertices)
+            .chain(preview.boundaries.iter_mut().flat_map(|(_, path)| path))
+            .chain(preview.mesh.edges.iter_mut().flatten());
         for (index, point) in targets.enumerate() {
             if let Some(&&(at, position)) = fixed.peek()
                 && index == at
@@ -65,6 +95,80 @@ impl ExtrusionResponse {
     }
 }
 impl Form {
+    /// Prepare evaluated-target feedback on a worker. Each sample uses the
+    /// actual inverse subdivision response; a raw-control ghost would lag the
+    /// requested surface displacement after topology changes its stencil.
+    pub fn prepare_surface_extrusion_preview(
+        &self,
+        faces: &[usize],
+        edges: &[[usize; 2]],
+        displacement: Vec3,
+        checkpoint: bool,
+    ) -> Result<ExtrusionResponse> {
+        self.prepare_surface_extrusion_response(faces, edges, displacement, checkpoint, None)
+    }
+
+    /// The same evaluated preview for an axis handle, with only the response
+    /// along that handle's fixed world direction prepared.
+    pub fn prepare_surface_extrusion_preview_on_axis(
+        &self,
+        faces: &[usize],
+        edges: &[[usize; 2]],
+        displacement: Vec3,
+        checkpoint: bool,
+        axis: Vec3,
+    ) -> Result<ExtrusionResponse> {
+        let axis = axis.normalized().ok_or_else(|| error("extrusion feedback axis must be finite and nonzero"))?;
+        self.prepare_surface_extrusion_response(faces, edges, displacement, checkpoint, Some(axis))
+    }
+
+    fn prepare_surface_extrusion_response(
+        &self,
+        faces: &[usize],
+        edges: &[[usize; 2]],
+        displacement: Vec3,
+        checkpoint: bool,
+        axis: Option<Vec3>,
+    ) -> Result<ExtrusionResponse> {
+        let evaluate = |delta| -> Result<(ExtrusionPreview, crate::doc::forms::Definition)> {
+            let candidate = self.surface_extrusion_candidate(None, faces, edges, delta, checkpoint, false)?;
+            let original = candidate
+                .extrusion
+                .as_ref()
+                .and_then(|gesture| gesture.surface_source.as_deref())
+                .ok_or_else(|| error("surface feedback lost its source"))?
+                .clone();
+            let surface = std::sync::Arc::unwrap_or_clone(candidate.surface);
+            Ok((ExtrusionPreview { mesh: surface.mesh, vertices: surface.vertices, boundaries: surface.boundaries }, original))
+        };
+        let (template, original) = evaluate(displacement)?;
+        let reference = positions(&template);
+        if reference.len() > 65_536 || template.mesh.triangles.len() > 131_072 {
+            return Err(error("extrusion feedback exceeds its interactive display budget"));
+        }
+        let step = 0.5;
+        let directions: &[Vec3] = match axis.as_ref() {
+            Some(direction) => std::slice::from_ref(direction),
+            None => &[Vec3::X, Vec3::Y, Vec3::Z],
+        };
+        let mut responses = vec![[Vec3::ZERO; 3]; reference.len()];
+        for (column, direction) in directions.iter().enumerate() {
+            let (preview, _) = evaluate(displacement + *direction * step)?;
+            if preview.mesh.triangles != template.mesh.triangles || preview.mesh.tri_face != template.mesh.tri_face {
+                return Err(error("surface extrusion feedback changed its topology"));
+            }
+            let values = positions(&preview);
+            if values.len() != reference.len() {
+                return Err(error("surface extrusion feedback changed its layout"));
+            }
+            for (response, (next, &old)) in responses.iter_mut().zip(values.into_iter().zip(&reference)) {
+                response[column] = (next - old) / step;
+            }
+        }
+        let fixed = if original.matching.is_some() { self.fixed_extrusion_opening(&template, &original)? } else { Vec::new() };
+        Ok(ExtrusionResponse { template, reference: displacement, axis, responses, fixed })
+    }
+
     /// Prepare on a worker. For fixed topology and crease weights, subdivision
     /// positions are affine in the extrusion displacement. The sampled response
     /// is only display data and has no document, history or recovery codec.
@@ -118,7 +222,11 @@ impl Form {
         for point in template.mesh.edges.iter_mut().flatten() {
             *point = self.placement.point(*point);
         }
-        let reference = positions(&template);
+        let fixed = self.fixed_extrusion_opening(&template, &original)?;
+        Ok(ExtrusionResponse { template, reference: displacement, axis: None, responses, fixed })
+    }
+    fn fixed_extrusion_opening(&self, template: &ExtrusionPreview, original: &crate::doc::forms::Definition) -> Result<Vec<(usize, Vec3)>> {
+        let reference = positions(template);
         let matching = original.matching.as_ref().ok_or_else(|| error("extrusion feedback requires a matched opening"))?;
         let ring = crate::doc::forms::match_openings(&original.cage, original.hierarchy.as_ref())?
             .into_iter()
@@ -162,6 +270,6 @@ impl Form {
         }
         let fixed =
             reference.iter().enumerate().filter_map(|(index, &point)| anchors.get(&point_key(point)).copied().map(|point| (index, point))).collect();
-        Ok(ExtrusionResponse { template, reference: displacement, responses, fixed })
+        Ok(fixed)
     }
 }

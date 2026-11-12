@@ -7,12 +7,15 @@ use solidcore_record::Vec3;
 use std::collections::{BTreeMap, BTreeSet};
 
 mod extrusion;
+mod fill;
 mod fitting;
 mod topology;
 mod trim_attachment;
 mod trim_wall;
 
-pub use fitting::Region;
+pub use fill::{FreeRimSide, QuadCapRim, QuadCapSide};
+pub use fitting::{FaceFrameSite, Region};
+pub use topology::{AlignedLoop, BoundaryCollapse, LeafCut, LoopPoint, ParameterEdge, ParameterLeaf, UnweldSplit};
 pub use trim_attachment::TrimAttachment;
 pub use trim_wall::TrimWall;
 
@@ -63,6 +66,19 @@ pub struct Hierarchy {
     extrusions: Vec<extrusion::LevelExtrusion>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     trim_wall: Option<TrimWall>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    quad_cap: Option<fill::QuadCap>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "fill::read_additional_quad_caps")]
+    additional_quad_caps: Vec<fill::QuadCap>,
+    /// Permanently empty face slots left by explicit cap removal.
+    #[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "fill::read_retired_quad_caps")]
+    retired_quad_caps: Vec<usize>,
+    /// Ownership retired by a split. Its original corners still delimit
+    /// surviving logical sides, and its evaluator stencils stay intact.
+    #[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "topology::read_detached_leaves")]
+    detached_leaves: Vec<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    boundary_collapse: Option<topology::RetainedBoundaryCollapse>,
 }
 
 // The design JSON has always stored control indices as object keys. Read
@@ -102,6 +118,13 @@ pub struct Layout {
     /// Deleted regions leave their evaluator cells intact but have no output owner.
     pub owners: Vec<Option<usize>>,
     pub paths: Vec<([usize; 2], Vec<usize>)>,
+    pub collapse: Option<BoundaryCollapse>,
+}
+
+impl Layout {
+    pub fn visible_edges(&self) -> impl Iterator<Item = [usize; 2]> + '_ {
+        self.paths.iter().map(|(edge, _)| *edge).chain(self.collapse.into_iter().flat_map(BoundaryCollapse::diagonal_edges))
+    }
 }
 
 impl Hierarchy {
@@ -122,16 +145,43 @@ impl Hierarchy {
             dissolved_edges: Vec::new(),
             extrusions: Vec::new(),
             trim_wall: None,
+            quad_cap: None,
+            additional_quad_caps: Vec::new(),
+            retired_quad_caps: Vec::new(),
+            detached_leaves: Vec::new(),
+            boundary_collapse: None,
         })
     }
     pub fn evaluate(&self) -> Result<Cage> {
+        self.evaluate_at_depth(self.depth)
+    }
+    /// Upper bound on evaluator faces at any step, before allocating or
+    /// replaying. Every subdivision replaces one quad with four, and each
+    /// extrusion only appends walls.
+    pub fn replay_face_bound(&self) -> Option<usize> {
+        self.validate_extrusion_levels().ok()?;
+        let mut faces = self.base.faces.len();
+        for level in 0..=self.depth {
+            if level != 0 {
+                faces = faces.checked_mul(4)?;
+            }
+            for operation in self.extrusions_at(level) {
+                faces = faces.checked_add(operation.wall_count_bound()?)?;
+            }
+        }
+        Some(faces)
+    }
+    /// Replay the authored coefficients and topology through one stored level.
+    pub fn evaluate_at_depth(&self, depth: usize) -> Result<Cage> {
         self.base.validate()?;
         if self.base.faces.iter().any(|f| f.len() != 4) {
             return Err(bad("hierarchical base patches must be quads"));
         }
-        if self.depth > MAX_DEPTH || self.details.len() != self.depth + 1 || self.leaves.len() > MAX_LEAVES {
+        if self.depth > MAX_DEPTH || depth > self.depth || self.details.len() != self.depth + 1 || self.leaves.len() > MAX_LEAVES {
             return Err(bad("hierarchical refinement budget exceeded"));
         }
+        self.validate_quad_cap_slots()?;
+        self.validate_detached_leaves()?;
         if self.sharpness.len() > self.depth + 1
             || self.sharpness.iter().any(|s| s.level > self.depth)
             || self.sharpness.windows(2).any(|s| s[0].level >= s[1].level)
@@ -140,7 +190,7 @@ impl Hierarchy {
         }
         self.validate_extrusion_levels()?;
         let mut cage = self.base.clone();
-        for (level, details) in self.details.iter().enumerate() {
+        for (level, details) in self.details.iter().enumerate().take(depth + 1) {
             Self::apply_details(details, &mut cage)?;
             Self::apply_sharpness(self.sharpness.iter().find(|s| s.level == level), &mut cage)?;
             for operation in self.extrusions_at(level) {
@@ -148,7 +198,7 @@ impl Hierarchy {
                 Self::apply_details(&operation.details, &mut cage)?;
                 Self::apply_sharpness(operation.sharpness.as_ref(), &mut cage)?;
             }
-            if level < self.depth {
+            if level < depth {
                 cage = cage.refined(1)?;
             }
         }
@@ -326,6 +376,9 @@ impl Hierarchy {
         if vertices.len() != deltas.len() || vertices.len() > 256 {
             return Err(bad("hierarchical edits require at most 256 matching controls"));
         }
+        if vertices.iter().any(|&id| self.is_retired_collapse_control(id)) {
+            return Err(bad("a collapsed endpoint no longer has a selectable control"));
+        }
         for (&vertex, &delta) in vertices.iter().zip(deltas) {
             let birth = *self.controls.get(&vertex).ok_or_else(|| bad("invalid hierarchical selection"))?;
             let details = if let Some(operation) = self.extrusions.iter_mut().rev().find(|op| op.level == birth && op.first_vertex <= vertex) {
@@ -406,11 +459,15 @@ impl Hierarchy {
         for &id in selected {
             let leaf = out.leaves.get_mut(id).filter(|l| l.active).ok_or_else(|| bad("select an active logical face"))?;
             let [u, v, x, y] = leaf.domain;
-            let du = (x - u) / counts[0];
-            let dv = (y - v) / counts[1];
-            if du == 0 || dv == 0 {
+            let extent = [x - u, y - v];
+            if extent[0] < counts[0] || extent[1] < counts[1] {
                 return Err(bad("local refinement depth budget exceeded"));
             }
+            if !extent[0].is_multiple_of(counts[0]) || !extent[1].is_multiple_of(counts[1]) {
+                return Err(bad("local subdivision does not divide the parameter extent exactly"));
+            }
+            let du = extent[0] / counts[0];
+            let dv = extent[1] / counts[1];
             let root = leaf.root;
             leaf.active = false;
             for j in 0..counts[1] {
@@ -419,17 +476,7 @@ impl Hierarchy {
                 }
             }
         }
-        let spacing = out
-            .leaves
-            .iter()
-            .filter(|l| l.active)
-            .flat_map(|l| [l.domain[2] - l.domain[0], l.domain[3] - l.domain[1]])
-            .min()
-            .ok_or_else(|| bad("empty hierarchy"))?;
-        out.depth = self.depth.max((GRID / spacing).ilog2() as usize);
-        if out.depth > MAX_DEPTH {
-            return Err(bad("local refinement depth budget exceeded"));
-        }
+        out.update_parameter_depth()?;
         out.details.resize_with(out.depth + 1, Vec::new);
         let (locations, _, levels) = out.locations()?;
         for leaf in out.leaves.iter().filter(|l| l.active) {
@@ -442,6 +489,22 @@ impl Hierarchy {
         }
         out.layout()?;
         Ok(out)
+    }
+    fn update_parameter_depth(&mut self) -> Result<()> {
+        for leaf in self.leaves.iter().filter(|leaf| leaf.active) {
+            let [u, v, x, y] = leaf.domain;
+            if u >= x || v >= y || x > GRID || y > GRID {
+                return Err(bad("invalid leaf parameter extent"));
+            }
+            for coordinate in leaf.domain {
+                let level = if coordinate == 0 { 0 } else { MAX_DEPTH.saturating_sub(coordinate.trailing_zeros() as usize) };
+                self.depth = self.depth.max(level);
+            }
+        }
+        if self.depth > MAX_DEPTH {
+            return Err(bad("local refinement depth budget exceeded"));
+        }
+        Ok(())
     }
     pub fn insert_target(&self, first: [usize; 2], second: [usize; 2]) -> Result<(usize, usize)> {
         let layout = self.layout()?;
@@ -500,12 +563,31 @@ impl Hierarchy {
         ])
     }
     pub fn layout(&self) -> Result<Layout> {
+        let mut layout = self.skin_layout()?;
+        for (face, rim) in self.replay_quad_caps(&layout)? {
+            let slot = layout.faces.get_mut(face).ok_or_else(|| bad("missing quad cap face slot"))?;
+            *slot = rim.sides.into_iter().map(|side| side.edge[0]).collect();
+        }
+        if let Some((site, retired)) = self.replay_boundary_collapse(&layout)? {
+            let slot = layout.faces.get_mut(site.face).ok_or_else(|| bad("missing collapsed face owner"))?;
+            *slot = site.boundary.to_vec();
+            layout.paths.retain(|(edge, _)| !edge.iter().any(|id| retired.contains(id)));
+            layout.collapse = Some(site);
+        }
+        Ok(layout)
+    }
+    fn skin_layout(&self) -> Result<Layout> {
         topology::dissolved_layout(self.raw_layout()?, &self.dissolved_edges)
+    }
+    fn exposes_leaf(&self, id: usize, leaf: &Leaf) -> bool {
+        leaf.active || self.detached_leaves.binary_search(&id).is_ok()
     }
     fn raw_layout(&self) -> Result<Layout> {
         if self.depth > MAX_DEPTH || self.leaves.is_empty() || self.leaves.len() > MAX_LEAVES || !self.leaves.iter().any(|l| l.active) {
             return Err(bad("invalid hierarchical topology budget"));
         }
+        self.validate_quad_cap_slots()?;
+        self.validate_detached_leaves()?;
         let (locations, tags, levels) = self.locations()?;
         if self.controls.len() > *levels.last().ok_or_else(|| bad("missing hierarchy level"))?
             || self.controls.iter().any(|(&v, &level)| levels.get(level).is_none_or(|&n| v >= n))
@@ -514,7 +596,7 @@ impl Hierarchy {
         }
         let charts = tags.iter().map(|(root, _)| root + 1).max().unwrap_or(0);
         let mut exposed = vec![BTreeSet::new(); charts];
-        for leaf in self.leaves.iter().filter(|l| l.active) {
+        for (_, leaf) in self.leaves.iter().enumerate().filter(|(id, leaf)| self.exposes_leaf(*id, leaf)) {
             let [u, v, x, y] = leaf.domain;
             if leaf.root >= charts || u >= x || v >= y || x > GRID || y > GRID {
                 return Err(bad("invalid leaf parameter domain"));
@@ -581,7 +663,7 @@ impl Hierarchy {
             faces.push(face);
         }
         let mut by_root = vec![Vec::new(); charts];
-        for (id, leaf) in self.leaves.iter().enumerate().filter(|(_, l)| l.active) {
+        for (id, leaf) in self.leaves.iter().enumerate().filter(|(id, leaf)| self.exposes_leaf(*id, leaf)) {
             by_root[leaf.root].push((id, leaf));
         }
         let mut owners = Vec::with_capacity(tags.len());
@@ -601,9 +683,9 @@ impl Hierarchy {
             if matches.len() > 1 {
                 return Err(bad("logical leaves overlap"));
             }
-            owners.push(matches.first().copied());
+            owners.push(matches.first().copied().filter(|&id| self.leaves.get(id).is_some_and(|leaf| leaf.active)));
         }
-        Ok(Layout { faces, owners, paths: paths.into_iter().map(|((a, b), p)| ([a, b], p)).collect() })
+        Ok(Layout { faces, owners, paths: paths.into_iter().map(|((a, b), p)| ([a, b], p)).collect(), collapse: None })
     }
     pub fn surface(&self, cage: &Cage, level: usize) -> Result<(SurfacePreview, Cage)> {
         self.layout_surface(cage, cage.surface(level)?)
@@ -613,7 +695,11 @@ impl Hierarchy {
         let mut triangles = Vec::with_capacity(surface.mesh.triangles.len());
         let mut faces = Vec::with_capacity(surface.mesh.tri_face.len());
         for (triangle, &id) in surface.mesh.triangles.iter().zip(&surface.mesh.tri_face) {
-            if let Some(owner) = *layout.owners.get(id as usize).ok_or_else(|| bad("missing leaf owner"))? {
+            if let Some(owner) = *layout.owners.get(id as usize).ok_or_else(|| bad("missing leaf owner"))?
+                && layout.collapse.is_none_or(|site| site.face != owner)
+            {
+                // The retained rectangular evaluator does not delimit the
+                // triangle. Only the fitted trim renders this face.
                 triangles.push(*triangle);
                 faces.push(owner as u32);
             }
@@ -634,6 +720,11 @@ impl Hierarchy {
                 Ok((edge, curve))
             })
             .collect::<Result<_>>()?;
+        if let Some(site) = layout.collapse {
+            // Keep logical IDs in the overlay. Exact chart guides fill these
+            // edges when the fitted preview is ready.
+            surface.boundaries.extend(site.diagonal_edges().map(|edge| (edge, Vec::new())));
+        }
         let mut logical = Cage { points: cage.points.clone(), faces: layout.faces, ..Default::default() };
         if let Some(wall) = self.validated_trim_wall()? {
             wall.append_preview(&mut surface, &mut logical)?;

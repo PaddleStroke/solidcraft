@@ -135,7 +135,7 @@ pub const SECTIONS: &[Section] = &[
         tab: "SURFACE",
         panel: "FORMS",
         promoted: 3,
-        ids: &["form.prototype.create", "form.pipe", "form.surface", "form.blend.import", "form.blend.export"],
+        ids: &["form.prototype.create", "form.pipe", "form.surface", "form.refined_weld", "form.blend.import", "form.blend.export"],
     },
     Section { tab: "SURFACE", panel: "CREATE", promoted: 4, ids: &["surface.extrude", "surface.revolve", "surface.sweep", "surface.loft"] },
     Section { tab: "SURFACE", panel: "EDIT", promoted: 4, ids: &["surface.trim", "surface.untrim", "surface.extend", "surface.stitch"] },

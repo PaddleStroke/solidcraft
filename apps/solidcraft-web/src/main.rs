@@ -18,6 +18,8 @@ mod easyprint;
 #[cfg(target_arch = "wasm32")]
 mod files;
 #[cfg(target_arch = "wasm32")]
+mod form_check_worker;
+#[cfg(target_arch = "wasm32")]
 mod install;
 #[cfg(any(target_arch = "wasm32", test))]
 mod keep;
@@ -349,6 +351,7 @@ mod web {
         linked: crate::linked::Download,
         full_url: Option<String>,
         api: Api,
+        form_check_worker: Rc<crate::form_check_worker::FormCheckWorker>,
         files: Rc<Files>,
         /// When the last autosave was (seconds), and the revision it holds (none stored: `None`).
         autosaved_at: f64,
@@ -1059,6 +1062,7 @@ mod web {
             self.load_other_tabs_prefs();
             self.tick_font(ctx);
             self.app.logic(ctx);
+            self.form_check_worker.poll(ctx);
             self.api.poll();
             self.space_mouse.logic(&mut self.app, ctx);
             self.files_tick(ctx);
@@ -1235,7 +1239,10 @@ mod web {
                         // Thumbnails of saves and start-page cards.
                         solidcraft_ui_egui::gpu::install_cpu_picture_renderer();
                         let (sender, receiver) = std::sync::mpsc::channel();
-                        let mut app = SolveApp::new(Session::default(), services).with_control(receiver);
+                        let form_check_worker = Rc::new(crate::form_check_worker::FormCheckWorker::default());
+                        let mut app = SolveApp::new(Session::default(), services)
+                            .with_control(receiver)
+                            .with_browser_form_check(form_check_worker.clone());
                         app.embedded = launch.embed;
                         app.embed_editor = launch.editor;
                         // Listening before reading: settings another tab writes from now on are
@@ -1275,6 +1282,7 @@ mod web {
                             linked,
                             full_url,
                             api,
+                            form_check_worker,
                             files,
                             autosaved_at: f64::NEG_INFINITY,
                             autosaved: None,

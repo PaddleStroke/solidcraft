@@ -223,7 +223,20 @@ async function launchOrKept(event) {
 async function asset(event) {
   const build = await startedBy(event.clientId).catch(() => CACHE);
   const kept = build === NETWORK ? null : await caches.match(event.request, { cacheName: build, ignoreSearch: true });
-  return kept || fetch(event.request);
+  if (kept) return kept;
+  // A dedicated worker is a different client from the page that created it.
+  // Its complete content-addressed bundle can be served from any retained
+  // whole build of this app copy without mixing generated glue and Wasm.
+  const prefix = url("workers/");
+  const workerFile = event.request.url.startsWith(prefix) && event.request.url.slice(prefix.length).split(/[?#]/)[0];
+  if (workerFile && /^[a-f0-9]{64}\/solidcraft-compute-worker(?:_loader\.js|\.js|_bg\.wasm)$/.test(workerFile)) {
+    for (const name of await caches.keys()) {
+      if (name === build || !name.startsWith(CACHE_PREFIX) || !(await has(name, COMPLETE))) continue;
+      const part = await caches.match(event.request, { cacheName: name, ignoreSearch: true });
+      if (part) return part;
+    }
+  }
+  return fetch(event.request);
 }
 
 self.addEventListener("fetch", (event) => {

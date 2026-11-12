@@ -14,6 +14,21 @@ struct Piece {
     chart: EdgeChart,
     active: [f64; 2],
 }
+
+impl Piece {
+    fn active_uv(&self) -> [[f64; 2]; 2] {
+        let domain = self.surface.domain();
+        self.active.map(|fraction| {
+            let t = (fraction - self.chart.range[0]) / (self.chart.range[1] - self.chart.range[0]);
+            std::array::from_fn(|axis| {
+                let [start, end] = self.chart.uv.map(|uv| uv[axis]);
+                let value = if start == end { start } else { start * (1.0 - t) + end * t };
+                let unit = ((value - self.domain[axis]) / (self.domain[axis + 2] - self.domain[axis])).clamp(0.0, 1.0);
+                domain[axis][0] * (1.0 - unit) + domain[axis][1] * unit
+            })
+        })
+    }
+}
 /// Derived curve pieces. No display samples, document references or saved state.
 #[derive(Clone, Debug)]
 pub struct EdgeCurve {
@@ -56,6 +71,115 @@ fn overlap(chart: &EdgeChart, patch: &PatchChart) -> Option<[f64; 2]> {
     Some(range.map(|t| a + (b - a) * t))
 }
 impl EdgeCurve {
+    /// Exact local differentials at one logical parameter. A join can have
+    /// multiple sided restrictions, which the caller must qualify together.
+    pub(super) fn frame_samples(&self, fraction: f64, remaining: &mut usize) -> Result<Vec<super::selection_frame::EdgeSample>> {
+        use super::selection_frame::{EdgeSample, normal, spend};
+        spend(remaining, self.pieces.len()).ok_or_else(|| invalid("Form edge frame work budget exhausted"))?;
+        self.pieces
+            .iter()
+            .filter(|piece| fraction >= piece.active[0] - 1e-12 && fraction <= piece.active[1] + 1e-12)
+            .map(|piece| {
+                let range = piece.chart.range[1] - piece.chart.range[0];
+                if range <= 0.0 {
+                    return Err(invalid("invalid Form edge frame parameter"));
+                }
+                let t = ((fraction - piece.chart.range[0]) / range).clamp(0.0, 1.0);
+                let domain = piece.surface.domain();
+                let mut uv = [0.0; 2];
+                let mut derivative = [0.0; 2];
+                for axis in 0..2 {
+                    let lo = piece.domain[axis];
+                    let hi = piece.domain[axis + 2];
+                    let [a, b] = piece.chart.uv.map(|p| p[axis]);
+                    let s = if a == b { a } else { a * (1.0 - t) + b * t };
+                    let q = ((s - lo) / (hi - lo)).clamp(0.0, 1.0);
+                    let [first, last] = domain[axis];
+                    uv[axis] = (first * (1.0 - q) + last * q).clamp(first, last);
+                    derivative[axis] = (b - a) / range * ((last - first) / (hi - lo));
+                }
+                let [a, b] = piece.surface.degree();
+                let work = piece.surface.knots().iter().map(Vec::len).sum::<usize>() + 4 * (a + 1) * (b + 1);
+                spend(remaining, work).ok_or_else(|| invalid("Form edge frame work budget exhausted"))?;
+                let (point, du, dv) = piece.surface.derivs(uv).ok_or_else(|| invalid("Form edge frame differential is unavailable"))?;
+                let normal = normal(du, dv).ok_or_else(|| invalid("Form edge frame chart is singular"))?;
+                Ok(EdgeSample { chart: piece.chart.face, point, tangent: du * derivative[0] + dv * derivative[1], normal })
+            })
+            .collect()
+    }
+
+    /// Exact oriented rational B-spline restrictions in world homogeneous
+    /// coordinates. Each range is in this logical edge's normalized parameter.
+    /// Overlapping incident-chart restrictions are retained, not averaged.
+    pub fn rational_pieces(&self) -> Result<Vec<([f64; 2], solidcraft_geom::bspline::CurveN<4>)>> {
+        let mut remaining = usize::MAX;
+        self.rational_pieces_bounded(&mut remaining)
+    }
+    /// Share the extractor's work budget across the actual restrictions of
+    /// this logical edge. Constant parameter coordinates stay constant.
+    pub fn rational_pieces_bounded(&self, remaining: &mut usize) -> Result<Vec<([f64; 2], solidcraft_geom::bspline::CurveN<4>)>> {
+        self.pieces
+            .iter()
+            .map(|piece| {
+                let uv = piece.active_uv();
+                let (knots, controls) = piece.surface.parameter_line_bounded(uv[0], uv[1], remaining).map_err(|error| invalid(error.to_string()))?;
+                let degree = knots.len().checked_sub(controls.len() + 1).ok_or_else(|| invalid("invalid exact guide degree"))?;
+                let ctrl = controls
+                    .into_iter()
+                    .map(|point| {
+                        let xyz = self.placement.vector(point.xyz()) + self.placement.origin * point.w;
+                        [xyz.x, xyz.y, xyz.z, point.w]
+                    })
+                    .collect();
+                Ok((piece.active, solidcraft_geom::bspline::CurveN { degree, knots, ctrl }))
+            })
+            .collect()
+    }
+    /// Prove the complete fitted rims agree under opposite boundary traversal.
+    /// The caller supplies each free boundary's authoritative directed logical
+    /// edge. The result only qualifies geometry; it never changes either rim.
+    pub fn opposite_rim_gap(
+        &self,
+        directed: [usize; 2],
+        other: &Self,
+        other_directed: [usize; 2],
+        tolerance: f64,
+        remaining: &mut usize,
+    ) -> Result<Option<f64>> {
+        let reversed = |curve: &Self, direction: [usize; 2]| {
+            let [a, b] = curve.edge;
+            if a == b {
+                return Err(invalid("degenerate rational weld rim"));
+            }
+            if direction == [a, b] {
+                Ok(false)
+            } else if direction == [b, a] {
+                Ok(true)
+            } else {
+                Err(invalid("directed weld rim does not name its fitted edge"))
+            }
+        };
+        let traversal = [reversed(self, directed)?, !reversed(other, other_directed)?];
+        let first = self.rational_pieces_bounded(remaining)?;
+        let second = other.rational_pieces_bounded(remaining)?;
+        solidcraft_geom::bspline::rational_rim_gap(&first, &second, traversal, tolerance, remaining).map_err(|error| invalid(error.to_string()))
+    }
+    pub fn with_placement(&self, placement: &Placement) -> Result<Self> {
+        placement.validate()?;
+        let mut placed = self.clone();
+        let mut corners = Vec::with_capacity(8);
+        for x in [self.bounds.min.x, self.bounds.max.x] {
+            for y in [self.bounds.min.y, self.bounds.max.y] {
+                for z in [self.bounds.min.z, self.bounds.max.z] {
+                    corners.push(placement.point(self.placement.local_point(Vec3::new(x, y, z))));
+                }
+            }
+        }
+        placed.bounds = corners.into_iter().collect();
+        placed.placement = placement.clone();
+        Ok(placed)
+    }
+
     pub fn bounds(&self) -> solidcraft_geom::Aabb3 {
         self.bounds
     }
@@ -119,27 +243,20 @@ pub(super) fn assemble(
         return Err(invalid("logical edge has no fitted source curve"));
     }
     let mut hull = Vec::new();
+    let mut remaining = 8_000_000;
     for piece in &pieces {
-        let uv = piece.active.map(|fraction| {
-            let t = (fraction - piece.chart.range[0]) / (piece.chart.range[1] - piece.chart.range[0]);
-            std::array::from_fn::<_, 2, _>(|axis| piece.chart.uv[0][axis] * (1.0 - t) + piece.chart.uv[1][axis] * t)
-        });
-        let varying = usize::from((uv[0][0] - uv[1][0]).abs() < 1e-14);
-        let fixed = 1 - varying;
-        if (uv[0][fixed] - uv[1][fixed]).abs() > 1e-12 {
-            return Err(invalid("logical source edge is not an isoparametric restriction"));
-        }
-        let domain = piece.surface.domain();
-        let parameter = |point: [f64; 2], axis: usize| {
-            let unit = ((point[axis] - piece.domain[axis]) / (piece.domain[axis + 2] - piece.domain[axis])).clamp(0.0, 1.0);
-            domain[axis][0] * (1.0 - unit) + domain[axis][1] * unit
+        let uv = piece.active_uv();
+        let restriction = if let Some(fixed) = (0..2).find(|&axis| piece.chart.uv[0][axis] == piece.chart.uv[1][axis]) {
+            let varying = 1 - fixed;
+            let direction = if varying == 0 { solidcraft_geom::bspline::Dir::S } else { solidcraft_geom::bspline::Dir::T };
+            let [a, b] = uv.map(|point| point[varying]);
+            piece.surface.iso_curve_segment(direction, uv[0][fixed], [a.min(b), a.max(b)])
+        } else {
+            // Retained trims may follow a diagonal on the source chart. Its
+            // rational control hull bounds the full route through each span.
+            piece.surface.parameter_line_bounded(uv[0], uv[1], &mut remaining)
         };
-        let ends = uv.map(|point| parameter(point, varying));
-        let direction = if varying == 0 { solidcraft_geom::bspline::Dir::S } else { solidcraft_geom::bspline::Dir::T };
-        let (_, controls) = piece
-            .surface
-            .iso_curve_segment(direction, parameter(uv[0], fixed), [ends[0].min(ends[1]), ends[0].max(ends[1])])
-            .map_err(|e| invalid(e.to_string()))?;
+        let (_, controls) = restriction.map_err(|e| invalid(e.to_string()))?;
         for control in controls {
             if control.w <= 0.0 {
                 return Err(invalid("source edge hull requires positive rational weights"));
@@ -179,15 +296,49 @@ pub fn edge_curves(definition: &Definition, tolerance: f64, edges: &[[usize; 2]]
         return Err(invalid("remove the derived trim wall before changing its source topology"));
     }
     let source = fitted_source(definition, tolerance)?;
+    from_source(definition, source, edges)
+}
+pub(super) fn from_source(definition: &Definition, source: FittedSource, edges: &[[usize; 2]]) -> Result<Vec<EdgeCurve>> {
     if source.fit.charts.len() != source.fit.patches.len() {
         return Err(invalid("fitted source lost its chart provenance"));
     }
-    let patches: Vec<_> = source.fit.charts.into_iter().zip(source.fit.patches.into_iter().map(Arc::new)).collect();
-    let charts = match &definition.hierarchy {
-        Some(h) => h.edge_charts_many(edges, source.trimmed_roots),
+    let charts = source_charts(definition, edges, source.trimmed_roots)?;
+    let patches = source.fit.charts.into_iter().zip(source.fit.patches.into_iter().map(Arc::new));
+    curves_in_patches(definition, edges, charts, patches)
+}
+
+/// Read the requested fitted edge restrictions while retaining the source
+/// sheets and their exact ownership for conversion.
+pub(super) fn fitted_edge_curves(definition: &Definition, source: &FittedSource, edges: &[[usize; 2]]) -> Result<Vec<EdgeCurve>> {
+    if source.fit.charts.len() != source.fit.patches.len() {
+        return Err(invalid("fitted source lost its chart provenance"));
+    }
+    let charts = source_charts(definition, edges, source.trimmed_roots)?;
+    let wanted: std::collections::BTreeSet<_> = charts.iter().flatten().map(|chart| chart.face).collect();
+    let patches = source
+        .fit
+        .charts
+        .iter()
+        .zip(&source.fit.patches)
+        .filter(|(chart, _)| wanted.contains(&chart.face))
+        .map(|(chart, patch)| (chart.clone(), Arc::new(patch.clone())));
+    curves_in_patches(definition, edges, charts, patches)
+}
+
+fn source_charts(definition: &Definition, edges: &[[usize; 2]], trimmed_roots: bool) -> Result<Vec<Vec<EdgeChart>>> {
+    match &definition.hierarchy {
+        Some(h) => h.skin_edge_charts_many(edges, trimmed_roots),
         None => definition.cage.edge_charts_many(edges),
     }
-    .map_err(|e| invalid(e.to_string()))?;
+    .map_err(|e| invalid(e.to_string()))
+}
+
+fn curves_in_patches(
+    definition: &Definition,
+    edges: &[[usize; 2]],
+    charts: Vec<Vec<EdgeChart>>,
+    patches: impl Iterator<Item = (PatchChart, Arc<NurbsSurface>)>,
+) -> Result<Vec<EdgeCurve>> {
     let mut index = std::collections::BTreeMap::<_, Vec<_>>::new();
     for (chart, surface) in patches {
         index.entry(chart.face).or_default().push((chart, surface));

@@ -4,16 +4,25 @@ use serde_json::{Value, json};
 use solidcore_record::Vec3;
 use solidcraft_geom::prelude::*;
 use solidcraft_geom::subdivision::{Cage, SurfacePreview, primitives::Parameters};
+use std::collections::BTreeSet;
+use std::sync::Arc;
 
 pub(crate) mod draft;
 mod extrusion_preview;
 mod objects;
 mod placement;
+mod surface_extrusion;
 mod symmetry;
 mod topology;
+mod transform_job;
+pub mod validation;
 
 pub use extrusion_preview::{ExtrusionPreview, ExtrusionResponse};
 pub use objects::Part;
+pub use transform_job::{FormTargetSpace, FormTransformJob, FormTransformStamp, PreparedFormTransform};
+pub(crate) use transform_job::{collapse_tolerance, qualify_collapse_edit};
+
+type InsertRecord = ([usize; 2], f64);
 
 #[derive(Clone)]
 struct Snapshot {
@@ -45,6 +54,7 @@ enum ExtrusionSource {
 struct ExtrusionGesture {
     source: ExtrusionSource,
     match_source: Option<Box<crate::doc::forms::Definition>>,
+    surface_source: Option<Box<crate::doc::forms::Definition>>,
     faces: Vec<usize>,
     edges: Vec<[usize; 2]>,
     front: Vec<[usize; 2]>,
@@ -74,7 +84,7 @@ pub struct Form {
     pub(crate) authoring_component: u64,
     pub(crate) authoring_path: Option<Vec<u64>>,
     pub placement: crate::doc::forms::Placement,
-    local_vertices: Vec<Vec3>,
+    local_vertices: Arc<[Vec3]>,
     pub(crate) tool_original: Option<std::sync::Arc<Form>>,
     pub cage: Cage,
     pub logical: Cage,
@@ -82,16 +92,36 @@ pub struct Form {
     pub parameters: Parameters,
     pub symmetry: Option<solidcraft_geom::subdivision::symmetry::Symmetry>,
     pub editing_feature: Option<u64>,
-    pub surface: SurfacePreview,
+    pub surface: Arc<SurfacePreview>,
     pub levels: usize,
     pub revision: u64,
     draft_identity: u64,
     pub finish_options: crate::schema::forms_prototype::FinishOptions,
     finish_revision: u64,
-    undo: Vec<Snapshot>,
-    redo: Vec<Snapshot>,
-    response: Option<(Vec<usize>, usize, Vec<Vec<f64>>)>,
+    undo: Vec<Arc<Snapshot>>,
+    redo: Vec<Arc<Snapshot>>,
+    response: Option<Arc<ResponseCache>>,
     extrusion: Option<ExtrusionGesture>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ResponseSpace {
+    BaseSurface,
+    HierarchicalControl,
+    HierarchicalSurface(usize),
+}
+
+struct ResponseCache {
+    vertices: Vec<usize>,
+    levels: usize,
+    space: ResponseSpace,
+    matrix: Vec<Vec<f64>>,
+}
+
+impl ResponseCache {
+    fn matches(&self, vertices: &[usize], levels: usize, space: ResponseSpace) -> bool {
+        self.vertices == vertices && self.levels == levels && self.space == space
+    }
 }
 
 /// Actual constrained source and its exact CAD extents in local authoring axes.
@@ -333,7 +363,7 @@ impl Form {
             return Err(error("Form hierarchy does not match its evaluator"));
         }
         let (surface, logical) = Self::preview(&cage, hierarchy.as_ref(), matching.as_deref(), profile.as_deref(), levels)?;
-        let local_vertices = surface.vertices.clone();
+        let local_vertices = Arc::from(surface.vertices.as_slice());
         let surface = placement::placed_surface(surface, &placement);
         Ok(Self {
             repair: None,
@@ -358,7 +388,7 @@ impl Form {
             parameters,
             symmetry,
             editing_feature,
-            surface,
+            surface: Arc::new(surface),
             levels,
             revision: 1,
             draft_identity: draft::new_identity(),
@@ -397,6 +427,12 @@ impl Form {
             None => Ok((cage.surface(levels).map_err(error)?, cage.clone())),
         }
     }
+    /// Cheap identity and revision of the live editor source, including tool
+    /// candidates. Reading this does not inspect document or recovery state.
+    pub fn source_revision(&self) -> (u64, u64) {
+        (self.draft_identity, self.revision)
+    }
+
     pub fn definition(&self) -> crate::doc::forms::Definition {
         crate::doc::forms::Definition {
             imported: self.imported.clone(),
@@ -512,6 +548,45 @@ impl Form {
         if self.symmetry.is_some() || !(2..=32).contains(&records.len()) {
             return Err(error("Insert Point needs 2..32 edge positions with symmetry off"));
         }
+        self.insert_source_points(records, state, tolerance, false)
+    }
+
+    // Independent mirror chains share one topology and Match transaction. The
+    // public point tool retains its separate 32-record, symmetry-off contract.
+    fn insert_source_points(
+        &mut self,
+        records: &[InsertRecord],
+        state: Option<&crate::doc::ModelState>,
+        tolerance: f64,
+        new_controls_only: bool,
+    ) -> Result<()> {
+        self.insert_source_chains(&[records], state, tolerance, new_controls_only)
+    }
+
+    fn insert_source_chains(
+        &mut self,
+        chains: &[&[InsertRecord]],
+        state: Option<&crate::doc::ModelState>,
+        tolerance: f64,
+        new_controls_only: bool,
+    ) -> Result<()> {
+        if chains.is_empty() || chains.len() > 2 || chains.iter().any(|chain| !(2..=257).contains(&chain.len())) {
+            return Err(error("Insert Loop needs one or two bounded source strips"));
+        }
+        let records: Vec<_> = chains.iter().flat_map(|chain| chain.iter().copied()).collect();
+        if new_controls_only {
+            let mut requests = std::collections::BTreeMap::new();
+            for &(edge, fraction) in &records {
+                let key = [edge[0].min(edge[1]), edge[0].max(edge[1])];
+                let fraction = if edge == key { fraction } else { 1.0 - fraction };
+                if requests.insert(key, fraction).is_some_and(|old: f64| (old - fraction).abs() > 4.0 * f64::EPSILON) {
+                    return Err(error("mirrored Insert Loop requests different stations on the same source edge"));
+                }
+            }
+            if !(2..=256).contains(&requests.len()) {
+                return Err(error("Insert Loop needs 2..256 unique source edge positions across both mirror strips"));
+            }
+        }
         if self.cage.faces.iter().any(|face| face.len() != 4) {
             return Err(error("Insert Point requires a quad source cage"));
         }
@@ -526,28 +601,38 @@ impl Form {
             candidate.refresh_match_preview(resolved.clone(), report)?;
             source = resolved;
         }
-        // Resolve the original matched CAD curves before removing Match for the
-        // topology operation. Neither targets nor response masks read a mesh.
+        // Resolve original matched CAD curves before removing Match. Mirror
+        // routes refer to that same source, not an already edited first strip.
         let edges: Vec<_> = records.iter().map(|(edge, _)| *edge).collect();
         let curves = crate::doc::forms::edge_curves(&source, tolerance, &edges)?;
-        let targets = curves.iter().zip(records).map(|(curve, (_, fraction))| curve.at(*fraction).map_err(Into::into)).collect::<Result<Vec<_>>>()?;
+        let targets =
+            curves.iter().zip(&records).map(|(curve, (_, fraction))| curve.at(*fraction).map_err(Into::into)).collect::<Result<Vec<_>>>()?;
         candidate.matching = None;
         candidate.match_report = None;
-        let (hierarchy, inserted) = candidate.insertion_topology(records)?;
-        candidate.adopt_hierarchy(hierarchy, false)?;
-        if let Some(matching) = &source.matching {
-            let state = state.ok_or_else(|| error("matched insertion requires its source document"))?;
-            let (definition, report) = matching.rebind_refinement(&source, candidate.definition(), state, tolerance)?;
-            candidate.refresh_match_preview(definition, report)?;
+        let (hierarchy, inserted) = candidate.insertion_topology_chains(chains)?;
+        if new_controls_only {
+            let previous = candidate.hierarchy.as_ref().ok_or_else(|| error("missing insertion hierarchy"))?;
+            if inserted.iter().any(|vertex| previous.controls.contains_key(vertex) || !hierarchy.controls.contains_key(vertex)) {
+                return Err(error("Insert Loop must expose new controls without moving an existing authored control"));
+            }
         }
-        // Rebind continuation before the inverse endpoint solve. Otherwise a
-        // later G2 transfer would move an endpoint that was already positioned.
         let mut positions = std::collections::BTreeMap::new();
         for (&vertex, &target) in inserted.iter().zip(&targets) {
             if positions.insert(vertex, target).is_some_and(|previous: Vec3| previous.dist(target) > 1e-8) {
                 return Err(error("Insert Point chain has incompatible shared endpoints"));
             }
         }
+        candidate.adopt_hierarchy(hierarchy, false)?;
+        candidate.verify_insertion_symmetry(&source, &records, &inserted, &targets, tolerance)?;
+        if let Some(matching) = &source.matching {
+            let state = state.ok_or_else(|| error("matched insertion requires its source document"))?;
+            let (definition, report) = matching.rebind_refinement_with_targets(&source, candidate.definition(), state, tolerance, &positions)?;
+            candidate.refresh_match_preview(definition, report)?;
+        }
+        // Rebind continuation before the inverse endpoint solve. Otherwise a
+        // later G2 transfer would move an endpoint that was already positioned.
+        // New matched rim stations already refer to these exact targets rather
+        // than the dyadic midpoint introduced by the topology-only refinement.
         let indices: Vec<_> = positions.keys().copied().collect();
         let points: Vec<_> = positions.values().map(|point| [point.x, point.y, point.z]).collect();
         candidate.set_surface(&indices, &points, false)?;
@@ -556,12 +641,13 @@ impl Form {
             let (definition, report) = matching.recompute(&candidate.definition(), state, tolerance)?;
             candidate.refresh_match_preview(definition, report)?;
         }
-        for (vertex, target) in inserted.into_iter().zip(&targets) {
+        for (&vertex, target) in inserted.iter().zip(&targets) {
             let position = candidate.local_vertices.get(vertex).copied().ok_or_else(|| error("inserted source endpoint is missing"))?;
             if candidate.world_point(position).dist(*target) > tolerance.max(1e-8) {
                 return Err(error("Match could not retain the inserted point within the CAD tolerance"));
             }
         }
+        candidate.verify_insertion_symmetry(&source, &records, &inserted, &targets, tolerance)?;
         self.checkpoint();
         candidate.undo = std::mem::take(&mut self.undo);
         candidate.redo.clear();
@@ -569,41 +655,57 @@ impl Form {
         Ok(())
     }
 
-    fn insertion_topology(&self, records: &[([usize; 2], f64)]) -> Result<(solidcraft_geom::subdivision::hierarchy::Hierarchy, Vec<usize>)> {
+    fn insertion_topology_chains(&self, chains: &[&[InsertRecord]]) -> Result<(solidcraft_geom::subdivision::hierarchy::Hierarchy, Vec<usize>)> {
         let hierarchy =
             self.hierarchy.clone().map_or_else(|| solidcraft_geom::subdivision::hierarchy::Hierarchy::new(self.cage.clone()), Ok).map_err(error)?;
-        let mut plan = Vec::new();
-        let mut faces = std::collections::BTreeSet::new();
-        for pair in records.windows(2) {
-            let target = hierarchy.insert_target(pair[0].0, pair[1].0).map_err(error)?;
-            if !faces.insert(target.0) {
-                return Err(error("an Insert Point chain cannot cross the same logical face twice"));
+        let mut plans = Vec::new();
+        let mut union = std::collections::BTreeMap::new();
+        for records in chains {
+            let mut plan = Vec::new();
+            let mut faces = std::collections::BTreeSet::new();
+            for pair in records.windows(2) {
+                let (face, axis) = hierarchy.insert_target(pair[0].0, pair[1].0).map_err(error)?;
+                if !faces.insert(face) {
+                    return Err(error("an Insert Point chain cannot cross the same logical face twice"));
+                }
+                let canonical = |edge: [usize; 2]| [edge[0].min(edge[1]), edge[0].max(edge[1])];
+                let mut edges = [canonical(pair[0].0), canonical(pair[1].0)];
+                edges.sort_unstable();
+                if union.insert(face, (axis, edges)).is_some_and(|previous| previous != (axis, edges)) {
+                    return Err(error("mirrored Insert Loop strips overlap with different parent seams"));
+                }
+                plan.push((face, axis));
             }
-            plan.push(target);
+            plans.push(plan);
         }
         let mut refined = hierarchy;
-        for &(face, axis) in &plan {
+        for (&face, &(axis, _)) in &union {
             refined = refined.subdivide(&[face], if axis == 0 { [2, 1] } else { [1, 2] }).map_err(error)?;
         }
         let layout = refined.layout().map_err(error)?;
-        let mut record_vertices = vec![None; records.len()];
-        for (i, &(face, axis)) in plan.iter().enumerate() {
-            let endpoints = refined.seam_endpoints(face, axis).map_err(error)?;
-            let original = records[i].0;
-            let adjacent = |vertex: usize| {
-                layout.paths.iter().any(|(edge, _)| edge.contains(&vertex) && (edge.contains(&original[0]) || edge.contains(&original[1])))
-            };
-            let endpoints = if adjacent(endpoints[0]) { endpoints } else { [endpoints[1], endpoints[0]] };
-            for (offset, vertex) in endpoints.into_iter().enumerate() {
-                if record_vertices[i + offset].replace(vertex).is_some_and(|previous| previous != vertex) {
-                    return Err(error("Insert Point chain has incompatible endpoint identities"));
+        let mut vertices = Vec::new();
+        for (records, plan) in chains.iter().zip(plans) {
+            let mut record_vertices = vec![None; records.len()];
+            for (i, (face, axis)) in plan.into_iter().enumerate() {
+                let endpoints = refined.seam_endpoints(face, axis).map_err(error)?;
+                let original = records[i].0;
+                let adjacent = |vertex: usize| {
+                    layout.paths.iter().any(|(edge, _)| edge.contains(&vertex) && (edge.contains(&original[0]) || edge.contains(&original[1])))
+                };
+                let endpoints = if adjacent(endpoints[0]) { endpoints } else { [endpoints[1], endpoints[0]] };
+                for (offset, vertex) in endpoints.into_iter().enumerate() {
+                    if record_vertices[i + offset].replace(vertex).is_some_and(|previous| previous != vertex) {
+                        return Err(error("Insert Point chain has incompatible endpoint identities"));
+                    }
                 }
             }
+            vertices.extend(
+                record_vertices
+                    .into_iter()
+                    .map(|vertex| vertex.ok_or_else(|| error("missing inserted endpoint identity")))
+                    .collect::<Result<Vec<_>>>()?,
+            );
         }
-        let vertices = record_vertices
-            .into_iter()
-            .map(|vertex| vertex.ok_or_else(|| error("missing inserted endpoint identity")))
-            .collect::<Result<Vec<_>>>()?;
         Ok((refined, vertices))
     }
 
@@ -690,6 +792,12 @@ impl Form {
         Ok(())
     }
     pub fn extrude_drag(&mut self, faces: &[usize], edges: &[[usize; 2]], displacement: Vec3, checkpoint: bool) -> Result<()> {
+        if self.hierarchy.as_ref().is_some_and(|h| h.has_quad_cap()) {
+            return Err(error("extrusion on a Form with a derived cap is not supported yet"));
+        }
+        if !checkpoint && self.extrusion.as_ref().is_some_and(|gesture| gesture.surface_source.is_some()) {
+            return Err(error("continue the extrusion with its original surface mode"));
+        }
         if self.profile.is_some() {
             return Err(error("Form Surface keeps its fixed source boundary"));
         }
@@ -764,8 +872,15 @@ impl Form {
                 front
             }
         };
-        self.extrusion =
-            Some(ExtrusionGesture { source, match_source: None, faces: faces.to_vec(), edges: edges.to_vec(), front, revision: self.revision });
+        self.extrusion = Some(ExtrusionGesture {
+            source,
+            match_source: None,
+            surface_source: None,
+            faces: faces.to_vec(),
+            edges: edges.to_vec(),
+            front,
+            revision: self.revision,
+        });
         Ok(())
     }
     /// A complete topology edit with no subsequent gesture updates.
@@ -779,15 +894,45 @@ impl Form {
         self.extrusion.as_ref().filter(|gesture| gesture.revision == self.revision).map_or(&[], |gesture| &gesture.front)
     }
     pub fn delete_logical_faces(&mut self, faces: &[usize]) -> Result<()> {
+        self.delete_logical_faces_at_tolerance(faces, 0.01)
+    }
+    pub(crate) fn delete_logical_faces_at_tolerance(&mut self, faces: &[usize], tolerance: f64) -> Result<()> {
         let h =
             self.hierarchy.clone().map_or_else(|| solidcraft_geom::subdivision::hierarchy::Hierarchy::new(self.cage.clone()), Ok).map_err(error)?;
-        self.adopt_hierarchy(h.delete_faces(faces).map_err(error)?, true)
+        let deleting_cap = faces.iter().any(|&id| h.is_quad_cap_face(id));
+        let next = h.delete_faces(faces).map_err(error)?;
+        if !deleting_cap {
+            return self.adopt_hierarchy(next, true);
+        }
+        let owners: BTreeSet<_> =
+            next.layout().map_err(error)?.faces.into_iter().enumerate().filter_map(|(id, face)| (!face.is_empty()).then_some(id)).collect();
+        let mut candidate = self.definition();
+        candidate.hierarchy = Some(next);
+        let (body, report) = crate::doc::forms::convert(&candidate, tolerance)?;
+        if report.solid || !body.is_surface() || report.patch_roots.iter().copied().collect::<BTreeSet<_>>() != owners {
+            return Err(error("removing the quad cap did not leave the expected open Form skin"));
+        }
+        let validity = crate::doc::kernel::validity(&body);
+        if !validity.ok() {
+            return Err(error(format!("the uncapped Form failed native validation: {validity:?}")));
+        }
+        let next = candidate.hierarchy.take().ok_or_else(|| error("missing uncapped Form source"))?;
+        self.adopt_hierarchy(next, true)
     }
     pub fn dissolve_logical_edges(&mut self, edges: &[[usize; 2]]) -> Result<()> {
         let h =
             self.hierarchy.clone().map_or_else(|| solidcraft_geom::subdivision::hierarchy::Hierarchy::new(self.cage.clone()), Ok).map_err(error)?;
         self.adopt_hierarchy(h.dissolve_edges(edges).map_err(error)?, true)
     }
+    pub(crate) fn collapse_boundary(&mut self, vertices: [usize; 2], tolerance: f64) -> Result<()> {
+        if !self.parts.is_empty() || self.consumed_features().next().is_some() {
+            return Err(error("finish the staged Form bodies before Collapse"));
+        }
+        let candidate = crate::doc::forms::author_boundary_collapse(&self.definition(), vertices, tolerance)?;
+        let hierarchy = candidate.hierarchy.ok_or_else(|| error("missing qualified Collapse hierarchy"))?;
+        self.adopt_hierarchy(hierarchy, true)
+    }
+
     fn adopt_hierarchy(&mut self, h: solidcraft_geom::subdivision::hierarchy::Hierarchy, checkpoint: bool) -> Result<()> {
         if self.profile.is_some() {
             return Err(error("Form Surface keeps its original regular guide grid"));
@@ -821,8 +966,8 @@ impl Form {
         self.revision = self.revision.wrapping_add(1);
         Ok(())
     }
-    fn snapshot(&self) -> Snapshot {
-        Snapshot {
+    fn snapshot(&self) -> Arc<Snapshot> {
+        Arc::new(Snapshot {
             repair: self.repair.clone(),
             imported: self.imported.clone(),
             pipe_segments: self.pipe_segments.clone(),
@@ -839,7 +984,7 @@ impl Form {
             parameters: self.parameters.clone(),
             symmetry: self.symmetry.clone(),
             hierarchy: self.hierarchy.clone(),
-        }
+        })
     }
     fn set_local(&mut self, indices: &[usize], positions: &[[f64; 3]], checkpoint: bool) -> Result<()> {
         if self.hierarchy.is_some() {
@@ -961,7 +1106,7 @@ impl Form {
         if unique.len() != indices.len() || indices.iter().any(|&i| i >= self.cage.points.len()) {
             return Err(error("surface selection contains duplicate or invalid vertices"));
         }
-        let cached = self.response.as_ref().is_some_and(|(ids, levels, _)| ids == indices && *levels == self.levels);
+        let cached = self.response.as_ref().is_some_and(|response| response.matches(indices, self.levels, ResponseSpace::BaseSurface));
         if !cached {
             let mut matrix = vec![vec![0.0; indices.len()]; indices.len()];
             for (column, &control) in indices.iter().enumerate() {
@@ -979,9 +1124,10 @@ impl Form {
                     *matrix.get_mut(row).and_then(|r| r.get_mut(column)).ok_or_else(|| error("invalid response matrix"))? = coefficient;
                 }
             }
-            self.response = Some((indices.to_vec(), self.levels, matrix));
+            self.response =
+                Some(Arc::new(ResponseCache { vertices: indices.to_vec(), levels: self.levels, space: ResponseSpace::BaseSurface, matrix }));
         }
-        let matrix = &self.response.as_ref().ok_or_else(|| error("missing surface response"))?.2;
+        let matrix = &self.response.as_ref().ok_or_else(|| error("missing surface response"))?.matrix;
         let mut rhs = Vec::with_capacity(indices.len());
         for (&i, p) in indices.iter().zip(positions) {
             let target = Vec3::new(p[0], p[1], p[2]);
@@ -1028,19 +1174,7 @@ impl Form {
         }
         let mut h = self.hierarchy.clone().ok_or_else(|| error("missing hierarchy"))?;
         let order = self.matching.as_ref().map_or(Ok(0), |m| m.evaluation_order(&self.cage, Some(&h)))?;
-        let mut matrix = vec![vec![0.0; indices.len()]; indices.len()];
-        for (column, &vertex) in indices.iter().enumerate() {
-            let basis = h.basis(vertex).map_err(error)?;
-            let evaluated = if surface {
-                solidcraft_geom::subdivision::matching::evaluated_vertices(&basis, order, self.levels).map_err(error)?
-            } else {
-                basis.points
-            };
-            for (row, &id) in indices.iter().enumerate() {
-                matrix[row][column] = evaluated.get(id).ok_or_else(|| error("invalid hierarchical target"))?.x;
-            }
-        }
-        let source = if surface { &self.local_vertices } else { &self.cage.points };
+        let source: &[Vec3] = if surface { &self.local_vertices } else { &self.cage.points };
         let mut rhs = Vec::with_capacity(indices.len());
         for (&vertex, p) in indices.iter().zip(&positions) {
             let target = Vec3::new(p[0], p[1], p[2]);
@@ -1052,9 +1186,32 @@ impl Form {
         if rhs.iter().all(|v| v.len() < 1e-12) {
             return Ok(());
         }
-        let deltas = solve_response(&matrix, rhs)?;
+        let space = if surface { ResponseSpace::HierarchicalSurface(order) } else { ResponseSpace::HierarchicalControl };
+        let response = match &self.response {
+            Some(response) if response.matches(indices, self.levels, space) => response.clone(),
+            _ => {
+                let mut matrix = vec![vec![0.0; indices.len()]; indices.len()];
+                for (column, &vertex) in indices.iter().enumerate() {
+                    let basis = h.basis(vertex).map_err(error)?;
+                    let evaluated = if surface {
+                        solidcraft_geom::subdivision::matching::evaluated_vertices(&basis, order, self.levels).map_err(error)?
+                    } else {
+                        basis.points
+                    };
+                    for (row, &id) in indices.iter().enumerate() {
+                        matrix[row][column] = evaluated.get(id).ok_or_else(|| error("invalid hierarchical target"))?.x;
+                    }
+                }
+                Arc::new(ResponseCache { vertices: indices.to_vec(), levels: self.levels, space, matrix })
+            }
+        };
+        let deltas = solve_response(&response.matrix, rhs)?;
         h.add_deltas(indices, &deltas).map_err(error)?;
-        self.adopt_hierarchy(h, checkpoint)
+        self.adopt_hierarchy(h, checkpoint)?;
+        // Only detail coefficients changed. Structural edits and history restores
+        // clear this cache through their ordinary adoption paths.
+        self.response = Some(response);
+        Ok(())
     }
     fn set_trim_rim(&mut self, indices: &[usize], positions: &[[f64; 3]], checkpoint: bool, surface: bool) -> Result<()> {
         let h = self.hierarchy.as_ref().filter(|h| h.has_trim_wall()).ok_or_else(|| error("missing derived trim wall"))?;
@@ -1062,7 +1219,7 @@ impl Form {
         if indices.len() > 2 || indices.iter().any(|&i| i < first || i > first + 1) || (indices.len() == 2 && indices[0] == indices[1]) {
             return Err(error("select only distinct trim wall rim controls to translate the wall"));
         }
-        let source = if surface { &self.local_vertices } else { &self.logical.points };
+        let source: &[Vec3] = if surface { &self.local_vertices } else { &self.logical.points };
         let mut deltas = indices.iter().zip(positions).map(|(&i, p)| {
             let old = source.get(i).ok_or_else(|| error("missing trim rim control"))?;
             let delta = Vec3::new(p[0], p[1], p[2]) - *old;
@@ -1080,9 +1237,10 @@ impl Form {
         self.adopt_hierarchy(h.move_trim_rim(delta).map_err(error)?, checkpoint)
     }
     pub fn selectable_control(&self, id: usize) -> bool {
-        self.hierarchy
-            .as_ref()
-            .is_none_or(|h| h.controls.contains_key(&id) || (h.has_trim_wall() && id >= self.cage.points.len() && id < self.logical.points.len()))
+        self.hierarchy.as_ref().is_none_or(|h| {
+            !h.is_retired_collapse_control(id)
+                && (h.controls.contains_key(&id) || (h.has_trim_wall() && id >= self.cage.points.len() && id < self.logical.points.len()))
+        })
     }
     pub fn history(&mut self, redo: bool) -> Result<()> {
         let snap = if redo { self.redo.last() } else { self.undo.last() }
@@ -1097,6 +1255,7 @@ impl Form {
             self.undo.pop();
             self.redo.push(current);
         }
+        let snap = Arc::unwrap_or_clone(snap);
         self.repair = snap.repair;
         self.repair_context = None;
         self.cage = snap.cage;
@@ -1120,6 +1279,11 @@ impl Form {
         self.revision = self.revision.wrapping_add(1);
         Ok(())
     }
+    /// Constant-time source-stack availability as (Undo, Redo).
+    /// Active tool restrictions are enforced separately by the commands.
+    pub fn history_available(&self) -> (bool, bool) {
+        (!self.undo.is_empty(), !self.redo.is_empty())
+    }
     pub fn inspect(&self) -> Value {
         json!({"active":true,"repair":self.repair,"placement":self.placement,"tool_preview":self.tool_original.is_some(),"points":self.control_positions().iter().map(|p| [p.x,p.y,p.z]).collect::<Vec<_>>(),"faces":self.logical.faces,"parameters":self.parameters,"editing_feature":self.editing_feature,
             "finish_options":self.finish_options,
@@ -1131,6 +1295,9 @@ impl Form {
             "levels":self.levels,"triangles":self.surface.mesh.triangles.len(),"undo":self.undo.len(),"redo":self.redo.len(),"revision":self.revision})
     }
     pub fn set_symmetry(&mut self, axis: Option<usize>) -> Result<()> {
+        if axis.is_some() && self.hierarchy.as_ref().is_some_and(|h| h.has_quad_cap()) {
+            return Err(error("symmetry on a Form with a derived cap is not supported yet"));
+        }
         if axis.is_some() && self.hierarchy.as_ref().is_some_and(|h| h.has_trim_wall()) {
             return Err(error("remove the derived trim wall before enabling symmetry"));
         }

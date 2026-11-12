@@ -1,0 +1,17 @@
+{
+  "de": {
+    "forms.diagnostics.browser_source_required": "Im Browser lassen sich kleine, unabhängige Formen prüfen. Prüfen Sie diese Form in der Desktop-App."
+  },
+  "en": {
+    "forms.diagnostics.browser_source_required": "Browser checks support small independent Forms. Check this Form in the desktop app."
+  },
+  "ja": {
+    "forms.diagnostics.browser_source_required": "ブラウザーでは小規模な独立フォームをチェックできます。このフォームはデスクトップアプリでチェックしてください。"
+  },
+  "ko": {
+    "forms.diagnostics.browser_source_required": "브라우저에서는 작은 독립 Form을 검사할 수 있습니다. 이 Form은 데스크톱 앱에서 검사하세요."
+  },
+  "zh": {
+    "forms.diagnostics.browser_source_required": "浏览器支持检查小型独立 Form。请在桌面应用中检查此 Form。"
+  }
+}

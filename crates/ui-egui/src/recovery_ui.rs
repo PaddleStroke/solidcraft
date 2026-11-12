@@ -387,13 +387,13 @@ mod tests {
         app.run("form.prototype.create", json!({"size":12,"segments":[1,1,1],"levels":1})).unwrap();
         app.run("form.prototype.set_vertices", json!({"vertices":[0],"positions":[[-6,-6,-8]]})).unwrap();
         let before = app.session.execute("form.prototype.inspect", &json!({})).unwrap()["points"].clone();
-        app.forms_prototype.projected = vec![(0, egui::pos2(40.0, 40.0))];
+        app.forms_prototype.projected = vec![(0, solidcore_record::Vec3::ZERO, egui::pos2(40.0, 40.0))];
         documents::new_tab(&mut app);
         assert!(app.forms_prototype.projected.is_empty());
         assert!(app.session.forms_prototype.is_none());
         tick_and_wait(&mut app);
         documents::switch(&mut app, 0);
-        assert_eq!(app.forms_prototype.projected, vec![(0, egui::pos2(40.0, 40.0))]);
+        assert_eq!(app.forms_prototype.projected, vec![(0, solidcore_record::Vec3::ZERO, egui::pos2(40.0, 40.0))]);
         drop(app);
 
         let mut recovered = restart(&dir);

@@ -10,6 +10,10 @@ pub(super) struct Partition {
     pub body: kernel::Body,
     pub roots: Vec<usize>,
 }
+pub(super) struct DisplayGuides {
+    pub samples: Vec<Vec<Vec3>>,
+    pub exact: super::super::NativeGuides,
+}
 /// The displayed skin and its editable guides share the native edge nodes.
 /// Legacy single-face sources keep their authored CAD topology: cells used here
 /// only constrain their display tessellation. Unsupported trims retain the
@@ -22,9 +26,9 @@ pub(super) fn display_mesh(
     placement: &Placement,
     tolerance: f64,
     mesh: solidcraft_geom::Mesh,
-) -> Result<(solidcraft_geom::Mesh, Option<Vec<Vec<Vec3>>>)> {
-    let (mut mesh, roots) = if let Some(roots) = roots {
-        (mesh, roots.to_vec())
+) -> Result<(solidcraft_geom::Mesh, Option<DisplayGuides>)> {
+    let (mut mesh, roots, native) = if let Some(roots) = roots {
+        (mesh, roots.to_vec(), patch.clone())
     } else {
         if patch.face_count() != 1 {
             return Ok((mesh, None));
@@ -34,19 +38,24 @@ pub(super) fn display_mesh(
         let Ok(Some(cells)) = build(patch, &display, cage, placement, tolerance) else {
             return Ok((mesh, None));
         };
-        (cells.body.mesh(&kernel::MeshTolerance::chord(tolerance.min(0.05)))?, cells.roots)
+        (cells.body.mesh(&kernel::MeshTolerance::chord(tolerance.min(0.05)))?, cells.roots, cells.body)
     };
     let edges = cage.edges().map_err(|e| invalid(e.to_string()))?;
     if mesh.edges.len() != edges.len() || mesh.edge_faces.len() != mesh.edges.len() {
         return Err(invalid("Surface display cells lost their logical guide edges"));
     }
-    let native_owners = mesh
-        .edge_faces
+    if mesh.edges.len() != native.edge_count() {
+        return Err(invalid("Surface display lost its canonical native edge order"));
+    }
+    let native_curves = kernel::edge_geometry(&native, &(0..native.edge_count()).collect::<Vec<_>>())?;
+    let native_owners = native
+        .record()
+        .edges
         .iter()
-        .map(|faces| {
-            faces
+        .map(|edge| {
+            edge.uses
                 .iter()
-                .map(|&face| roots.get(face as usize).copied().ok_or_else(|| invalid("Surface display edge lost its cell owner")))
+                .map(|use_| roots.get(use_.face as usize).copied().ok_or_else(|| invalid("Surface display edge lost its cell owner")))
                 .collect::<Result<BTreeSet<_>>>()
         })
         .collect::<Result<Vec<_>>>()?;
@@ -67,6 +76,7 @@ pub(super) fn display_mesh(
         })
         .collect::<Result<Vec<_>>>()?;
     let mut guides = Vec::with_capacity(edges.len());
+    let mut routes = Vec::with_capacity(edges.len());
     let mut smooth = Vec::with_capacity(edges.len());
     let mut sharp = Vec::with_capacity(edges.len());
     let mut used = BTreeSet::new();
@@ -81,16 +91,15 @@ pub(super) fn display_mesh(
         let &(start, start_roundoff) = endpoints.get(a).ok_or_else(|| invalid("Surface display lost a guide endpoint"))?;
         let &(end, end_roundoff) = endpoints.get(b).ok_or_else(|| invalid("Surface display lost a guide endpoint"))?;
         let roundoff = start_roundoff.max(end_roundoff);
-        let candidates: Vec<_> = mesh
-            .edges
+        let candidates: Vec<_> = native_curves
             .iter()
             .enumerate()
             .filter(|(id, _)| native_owners.get(*id).is_some_and(|native| *native == owners))
             .filter_map(|(id, curve)| {
-                let (first, last) = (*curve.first()?, *curve.last()?);
+                let (first, last) = (curve.at(0.0)?.0, curve.at(1.0)?.0);
                 let forward = first.dist(start) <= roundoff && last.dist(end) <= roundoff;
                 let reverse = first.dist(end) <= roundoff && last.dist(start) <= roundoff;
-                (curve.len() >= 2 && forward != reverse).then_some((id, reverse))
+                (forward != reverse).then_some((id, reverse))
             })
             .collect();
         let [(id, reverse)] = candidates.as_slice() else {
@@ -103,13 +112,27 @@ pub(super) fn display_mesh(
         if *reverse {
             curve.reverse();
         }
+        let record = native.record().edges.get(*id).ok_or_else(|| invalid("missing native guide interval"))?;
+        let face = record.uses.first().ok_or_else(|| invalid("missing native guide face"))?.face;
+        let native_edge = u32::try_from(*id).map_err(|_| invalid("native guide index overflow"))?;
+        let [a_parameter, b_parameter] = if *reverse { [record.interval[1], record.interval[0]] } else { record.interval };
+        routes.push(super::super::NativeGuide {
+            edge: [a, b],
+            pieces: vec![kernel::DisplayGuide {
+                face,
+                points: vec![
+                    kernel::DisplayGuidePoint::Edge { edge: native_edge, parameter: a_parameter },
+                    kernel::DisplayGuidePoint::Edge { edge: native_edge, parameter: b_parameter },
+                ],
+            }],
+        });
         guides.push(curve);
         smooth.push(mesh.smooth_edges.get(*id).copied().unwrap_or(false));
         sharp.push(mesh.sharp_edges.get(*id).copied().unwrap_or(false));
     }
     mesh.smooth_edges = smooth;
     mesh.sharp_edges = sharp;
-    Ok((mesh, Some(guides)))
+    Ok((mesh, Some(DisplayGuides { samples: guides, exact: super::super::NativeGuides { body: native, edges: routes } })))
 }
 pub(super) fn build(patch: &kernel::Body, profile: &Profile, cage: &Cage, placement: &Placement, tolerance: f64) -> Result<Option<Partition>> {
     if !profile.partition || cage.faces.len() < 2 {

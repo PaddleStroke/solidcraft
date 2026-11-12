@@ -1,0 +1,72 @@
+{
+  "de": {
+    "forms.soft.empty": "Wählen Sie einen beweglichen Punkt, eine Kante oder Fläche für die weiche Auswahl.",
+    "forms.soft.enabled": "Weiche Auswahl",
+    "forms.soft.falloff": "Abfall",
+    "forms.soft.help": "Nahe logische Punkte folgen der Transformation mit abnehmendem Einfluss. Der Radius folgt logischen Kanten; getrennte Inseln bleiben getrennt. Profilränder bleiben fest. Extrusion verwendet die harte Auswahl.",
+    "forms.soft.invalid_radius": "Geben Sie einen endlichen Auswahlradius zwischen 0,000001 mm und 100000 mm ein.",
+    "forms.soft.invalid_source": "Die Form enthält ungültige logische Punkte oder Verbindungen für die weiche Auswahl.",
+    "forms.soft.limit": "Die weiche Auswahl überschreitet das Bearbeitungsbudget. Verkleinern Sie den Radius oder verfeinern Sie weniger Elemente.",
+    "forms.soft.linear": "Linear",
+    "forms.soft.radius": "Einflussradius",
+    "forms.soft.sharp": "Scharf",
+    "forms.soft.smooth": "Glatt",
+    "forms.soft.trim_wall": "Weiche Auswahl ist für Formen mit abgeleiteten Schnittwänden nicht verfügbar. Deaktivieren Sie sie zum Bearbeiten der Form."
+  },
+  "en": {
+    "forms.soft.empty": "Select a movable point, edge or face to use soft selection.",
+    "forms.soft.enabled": "Soft selection",
+    "forms.soft.falloff": "Falloff",
+    "forms.soft.help": "Nearby logical points follow the transform with fading influence. Radius is measured along logical edges, so disconnected islands stay separate. Profile rims remain fixed. Extrusion uses the sharp selection.",
+    "forms.soft.invalid_radius": "Enter a finite soft-selection radius between 0.000001 mm and 100000 mm.",
+    "forms.soft.invalid_source": "The Form has invalid logical points or connectivity for soft selection.",
+    "forms.soft.limit": "Soft selection exceeds the bounded edit budget. Reduce the radius or refine fewer elements.",
+    "forms.soft.linear": "Linear",
+    "forms.soft.radius": "Influence radius",
+    "forms.soft.sharp": "Sharp",
+    "forms.soft.smooth": "Smooth",
+    "forms.soft.trim_wall": "Soft selection is not available for Forms with derived trim walls. Turn it off to edit the Form."
+  },
+  "ja": {
+    "forms.soft.empty": "ソフト選択には移動可能な点、辺、面を選択してください。",
+    "forms.soft.enabled": "ソフト選択",
+    "forms.soft.falloff": "減衰",
+    "forms.soft.help": "近くの論理点が減衰する影響で変形に追従します。半径は論理辺に沿って測るため、離れた島は影響しません。プロファイルの縁は固定されます。押し出しは通常の選択を使います。",
+    "forms.soft.invalid_radius": "ソフト選択の半径には0.000001 mmから100000 mmまでの有限値を入力してください。",
+    "forms.soft.invalid_source": "フォームの論理点または接続がソフト選択に対して無効です。",
+    "forms.soft.limit": "ソフト選択が編集量の上限を超えています。半径または細分化する要素数を減らしてください。",
+    "forms.soft.linear": "線形",
+    "forms.soft.radius": "影響半径",
+    "forms.soft.sharp": "鋭い",
+    "forms.soft.smooth": "滑らか",
+    "forms.soft.trim_wall": "派生した切断壁を含むフォームではソフト選択を使用できません。フォームを編集するにはオフにしてください。"
+  },
+  "ko": {
+    "forms.soft.empty": "소프트 선택을 사용하려면 이동 가능한 점, 모서리 또는 면을 선택하세요.",
+    "forms.soft.enabled": "소프트 선택",
+    "forms.soft.falloff": "감쇠",
+    "forms.soft.help": "가까운 논리 점이 점차 줄어드는 영향으로 변환을 따릅니다. 반경은 논리 모서리를 따라 측정되므로 분리된 섬은 영향을 받지 않습니다. 프로파일 테두리는 고정됩니다. 돌출은 일반 선택을 사용합니다.",
+    "forms.soft.invalid_radius": "소프트 선택 반경에 0.000001 mm에서 100000 mm 사이의 유한한 값을 입력하세요.",
+    "forms.soft.invalid_source": "폼에 소프트 선택에 유효하지 않은 논리 점 또는 연결이 있습니다.",
+    "forms.soft.limit": "소프트 선택이 편집 한도를 초과합니다. 반경이나 세분화할 요소 수를 줄이세요.",
+    "forms.soft.linear": "선형",
+    "forms.soft.radius": "영향 반경",
+    "forms.soft.sharp": "날카롭게",
+    "forms.soft.smooth": "부드럽게",
+    "forms.soft.trim_wall": "파생된 절단 벽이 있는 폼에서는 소프트 선택을 사용할 수 없습니다. 폼을 편집하려면 끄세요."
+  },
+  "zh": {
+    "forms.soft.empty": "请选择可移动的点、边或面以使用软选择。",
+    "forms.soft.enabled": "软选择",
+    "forms.soft.falloff": "衰减",
+    "forms.soft.help": "附近的逻辑点以逐渐减弱的影响跟随变换。半径沿逻辑边测量，因此分离的岛不会相互影响。轮廓边缘保持固定。拉伸使用普通选择。",
+    "forms.soft.invalid_radius": "请输入 0.000001 mm 到 100000 mm 之间的有限软选择半径。",
+    "forms.soft.invalid_source": "形状包含无法用于软选择的逻辑点或连接。",
+    "forms.soft.limit": "软选择超出了编辑预算。请减小半径或减少细化的元素。",
+    "forms.soft.linear": "线性",
+    "forms.soft.radius": "影响半径",
+    "forms.soft.sharp": "锐利",
+    "forms.soft.smooth": "平滑",
+    "forms.soft.trim_wall": "包含派生修剪壁的形状不支持软选择。请关闭软选择以编辑形状。"
+  }
+}

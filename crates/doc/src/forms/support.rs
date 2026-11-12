@@ -414,6 +414,7 @@ impl BoundarySupport {
         new_ring: &[usize],
         definition: &Definition,
         config: &Config,
+        targets: &std::collections::BTreeMap<usize, Vec3>,
     ) -> Result<Vec<BoundaryCoordinate>> {
         let first = old.first().ok_or_else(|| invalid("missing Match curve coordinates"))?;
         if old.len() != old_ring.len() || new_ring.len() < old_ring.len() || new_ring.len() > 64 {
@@ -436,7 +437,10 @@ impl BoundarySupport {
             for step in 1..(end + new_ring.len() - start) % new_ring.len() {
                 let index = (start + step) % new_ring.len();
                 let id = *new_ring.get(index).ok_or_else(|| invalid("invalid refined Match control"))?;
-                let point = definition.placement.point(*limits.get(id).ok_or_else(|| invalid("missing Match limit point"))?);
+                let point = match targets.get(&id) {
+                    Some(point) => *point,
+                    None => definition.placement.point(*limits.get(id).ok_or_else(|| invalid("missing Match limit point"))?),
+                };
                 *out.get_mut(index).ok_or_else(|| invalid("invalid refined Match station"))? =
                     self.coordinate(self.nearest_in_span(low, span, point)?)?;
             }
@@ -563,6 +567,20 @@ impl BoundarySupport {
             normal: placement.local_vector(normal),
             support: local,
         })
+    }
+    pub(super) fn measure_fitted(
+        &self,
+        definition: &Definition,
+        config: &Config,
+        fit: &solidcraft_geom::subdivision::fitting::Fit,
+    ) -> Result<matching::Report> {
+        let layout = domain_layout(definition.hierarchy.as_ref())?;
+        let owners = layout.as_ref().map(|layout| layout.owners.as_slice());
+        let domain = Domain::new(&definition.cage, owners).map_err(|e| invalid(e.to_string()))?;
+        matching::measure_fitted_match(domain, config, &fit.patches, |f| {
+            self.target(f, &definition.placement, config.order).map_err(|e| solidcraft_geom::subdivision::SubdivisionError(e.to_string()))
+        })
+        .map_err(|e| invalid(e.to_string()))
     }
     pub fn solve(&self, definition: &Definition, config: &Config, tolerance: f64) -> Result<Solution> {
         definition.placement.validate()?;

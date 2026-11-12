@@ -46,6 +46,23 @@ struct OtherForm {
     target: solidcraft_engine::schema::forms_prototype::FormObject,
     openings: Vec<Vec<usize>>,
 }
+#[derive(Clone, Copy)]
+enum FillChoices {
+    Base,
+    Refined { new_cap: bool },
+}
+impl FillChoices {
+    fn options(self) -> &'static [(&'static str, &'static str)] {
+        const AUTO: (&str, &str) = ("automatic", "forms.prototype.fill_automatic");
+        const SINGLE: (&str, &str) = ("single", "forms.prototype.fill_single");
+        match self {
+            Self::Base => &[AUTO, SINGLE, ("minimal", "forms.prototype.fill_minimal"), ("reduced_star", "forms.prototype.fill_star")],
+            Self::Refined { new_cap: true } => &[AUTO, SINGLE, ("new_cap", "forms.fill.new_cap")],
+            Self::Refined { new_cap: false } => &[AUTO, SINGLE],
+        }
+    }
+}
+
 pub(super) struct State {
     repair: bool,
     surface_mapping: usize,
@@ -73,12 +90,13 @@ pub(super) struct State {
     faces: Vec<usize>,
     elements: BTreeSet<Element>,
     pivot: Option<Vec3>,
-    normal: Vec3,
+    normal: Option<Vec3>,
     distance: String,
     sharp: bool,
     direction: usize,
     controls: bool,
     fill: usize,
+    fill_choices: FillChoices,
     local_bridge: bool,
     desired: Option<serde_json::Value>,
     applied: Option<serde_json::Value>,
@@ -99,44 +117,205 @@ pub(super) fn inspect(app: &SolveApp) -> serde_json::Value {
     json!({"mode":state.mode.title(),"pending":state.pending.is_some(),"error":state.error,"desired":state.desired,"applied":state.applied,
         "picking_support":state.picking_support,"support_edges":state.support_edges})
 }
-pub(super) fn start(app: &mut SolveApp, mode: Mode) {
-    if active(app) {
-        return;
+// Entry checks explain known state restrictions; command validation still qualifies the actual geometry.
+pub(super) fn topology_mode(tool: &str) -> Option<Mode> {
+    match tool {
+        "thicken" => Some(Mode::Thicken),
+        "match" => Some(Mode::Match),
+        "fill_hole" => Some(Mode::Fill),
+        "bridge" => Some(Mode::Bridge),
+        "weld" => Some(Mode::Weld),
+        "unweld" => Some(Mode::Unweld),
+        "collapse" => Some(Mode::Collapse),
+        "erase_and_fill" => Some(Mode::EraseFill),
+        _ => None,
     }
-    let Some(form) = &app.session.forms_prototype else { return };
-    if form.repair.is_some() && !((form.profile.is_some() && mode == Mode::Surface) || (form.matching.is_some() && mode == Mode::Match)) {
-        return;
+}
+fn form_state_unavailable(form: &solidcraft_engine::forms_prototype::Form, mode: Option<Mode>) -> Option<&'static str> {
+    let reattachment = (form.profile.is_some() && mode == Some(Mode::Surface)) || (form.matching.is_some() && mode == Some(Mode::Match));
+    if form.repair.is_some() && !reattachment {
+        return Some("forms.prototype.reattach_before_tool");
     }
-    if form.profile.is_some() && !matches!(mode, Mode::Surface | Mode::Flatten | Mode::Straighten) {
-        app.set_status(app.tr("forms.prototype.surface_fixed_grid").to_owned(), true);
-        return;
+    if form.profile.is_some() && !matches!(mode, Some(Mode::Surface | Mode::Flatten | Mode::Straighten)) {
+        return Some("forms.prototype.surface_fixed_grid");
     }
-    if matches!(mode, Mode::Thicken | Mode::Fill | Mode::EraseFill | Mode::Weld | Mode::Unweld | Mode::Collapse) && form.hierarchy.is_some() {
-        app.set_status(app.tr("forms.prototype.base_tool_required").to_owned(), true);
-        return;
+    if form.hierarchy.as_ref().is_some_and(|h| h.has_quad_cap()) && matches!(mode, Some(Mode::Bridge | Mode::Match)) {
+        return Some("forms.fill.cap_topology_unavailable");
     }
-    if mode == Mode::Thicken && form.cage.boundary_loops().is_ok_and(|l| l.is_empty()) {
-        app.set_status(app.tr("forms.prototype.open_surface_required").to_owned(), true);
-        return;
+    if mode == Some(Mode::Bridge) && form.hierarchy.as_ref().is_some_and(|h| h.has_quad_cap_history()) {
+        return Some("forms.fill.retired_cap_bridge");
     }
-    let bounds: solidcraft_engine::geom::Aabb3 = form.cage.points.iter().copied().collect();
-    let size = bounds.size();
-    let distance = (size.x.max(size.y).max(size.z) * 0.1).max(0.1).to_string();
-    let local_bridge = mode == Mode::Bridge && form.hierarchy.is_some();
-    let (direction, controls) = controls::projection_settings(app);
-    let mut edges: Vec<_> = app.forms_prototype.elements.iter().filter_map(|e| if let Element::Edge(e) = e { Some(*e) } else { None }).collect();
+    if form.hierarchy.as_ref().is_some_and(|h| h.has_boundary_collapse())
+        && matches!(mode, Some(Mode::Bridge | Mode::Thicken | Mode::Unweld | Mode::Fill | Mode::EraseFill | Mode::Match))
+    {
+        return Some("forms.collapse.topology_unavailable");
+    }
+    if mode == Some(Mode::Collapse)
+        && let Some(hierarchy) = &form.hierarchy
+    {
+        if cfg!(target_arch = "wasm32") {
+            return Some("forms.collapse.desktop_required");
+        }
+        if !hierarchy.supports_boundary_collapse()
+            || form.symmetry.is_some()
+            || form.matching.is_some()
+            || form.pipe.is_some()
+            || !form.parts.is_empty()
+            || form.consumed_features().next().is_some()
+        {
+            return Some("forms.collapse.source_unavailable");
+        }
+    }
+    if form.hierarchy.is_some() && matches!(mode, Some(Mode::Thicken | Mode::Weld)) {
+        return Some("forms.prototype.base_tool_required");
+    }
+    if mode == Some(Mode::Unweld)
+        && let Some(hierarchy) = &form.hierarchy
+    {
+        if cfg!(target_arch = "wasm32") {
+            return Some("forms.unweld.refined_desktop_required");
+        }
+        if !hierarchy.supports_refined_unweld()
+            || form.matching.is_some()
+            || form.symmetry.is_some()
+            || form.pipe.is_some()
+            || !form.parts.is_empty()
+            || form.consumed_features().next().is_some()
+        {
+            return Some("forms.unweld.refined_unavailable");
+        }
+    }
+    if mode == Some(Mode::Bridge) && form.hierarchy.as_ref().is_some_and(|h| h.has_detached_material()) {
+        return Some("forms.unweld.bridge_unavailable");
+    }
+    if mode == Some(Mode::EraseFill)
+        && let Some(hierarchy) = &form.hierarchy
+    {
+        if cfg!(target_arch = "wasm32") {
+            return Some("forms.fill.erase_desktop_required");
+        }
+        if !hierarchy.supports_hole_restoration() || form.matching.is_some() || form.symmetry.is_some() {
+            return Some("forms.fill.erase_refined_unavailable");
+        }
+    }
+    if mode == Some(Mode::Fill)
+        && let Some(hierarchy) = &form.hierarchy
+    {
+        if cfg!(target_arch = "wasm32") {
+            return Some("forms.fill.desktop_required");
+        }
+        if !hierarchy.supports_hole_restoration() || form.matching.is_some() {
+            return Some("forms.fill.refined_unavailable");
+        }
+    }
+    None
+}
+pub(super) fn unavailable(app: &SolveApp, mode: Mode) -> Option<&'static str> {
+    let Some(form) = &app.session.forms_prototype else { return Some("forms.prototype.active_form_required") };
+    if let Some(reason) = form_state_unavailable(form, Some(mode)) {
+        return Some(reason);
+    }
+    if matches!(mode, Mode::Flatten | Mode::Straighten) && surface::cap_selected(app) {
+        return Some("forms.fill.cap_rim_editing");
+    }
+    if mode == Mode::Fill
+        && form.hierarchy.is_some()
+        && !app.forms_prototype.elements.iter().any(|element| matches!(element, Element::Edge(_) | Element::Vertex(_)))
+    {
+        return Some("forms.fill.select_rim");
+    }
+    if mode == Mode::Thicken && controls::source_closed(app) == Some(true) {
+        return Some("forms.prototype.open_surface_required");
+    }
+    if mode == Mode::Collapse
+        && (app.forms_prototype.selected.len() != 2
+            || (form.hierarchy.is_some() && app.forms_prototype.elements.iter().any(|e| !matches!(e, Element::Vertex(_)))))
+    {
+        return Some("forms.prototype.two_points_required");
+    }
+    if mode == Mode::EraseFill {
+        if surface::selected_faces(app).is_empty() {
+            return Some("forms.prototype.select_faces_for_tool");
+        }
+        if form.hierarchy.is_some() && app.forms_prototype.elements.iter().any(|element| !matches!(element, Element::Face(_))) {
+            return Some("forms.fill.erase_faces_only");
+        }
+    }
+    if mode == Mode::Unweld && (controls::source_closed(app) == Some(false) || tool_selection(app, mode).0.is_empty()) {
+        return Some("forms.prototype.unweld_seam_required");
+    }
+    None
+}
+pub(super) fn topology_unavailable(app: &SolveApp, tool: &str) -> Option<&'static str> {
+    if let Some(mode) = topology_mode(tool) {
+        return unavailable(app, mode);
+    }
+    let Some(form) = &app.session.forms_prototype else { return Some("forms.prototype.active_form_required") };
+    if let Some(reason) = form_state_unavailable(form, None) {
+        return Some(reason);
+    }
+    let cap_selected = surface::cap_selected(app);
+    if tool == "delete_faces" && cap_selected {
+        if app.forms_prototype.elements.len() != 1 {
+            return Some("forms.fill.select_cap_only");
+        }
+        if cfg!(target_arch = "wasm32") {
+            return Some("forms.fill.cap_delete_desktop");
+        }
+    }
+    if form.hierarchy.as_ref().is_some_and(|h| h.has_quad_cap())
+        && (matches!(tool, "extrude_faces" | "extrude_edges") || (matches!(tool, "subdivide" | "dissolve" | "crease" | "uncrease") && cap_selected))
+    {
+        return Some("forms.fill.cap_topology_unavailable");
+    }
+    if matches!(tool, "extrude_faces" | "delete_faces" | "subdivide") && surface::selected_faces(app).is_empty() {
+        return Some("forms.prototype.select_faces_for_tool");
+    }
+    if tool == "extrude_edges" && !app.forms_prototype.elements.iter().any(|element| matches!(element, Element::Edge(_))) {
+        return Some("forms.prototype.select_boundary_edges_for_tool");
+    }
+    None
+}
+fn tool_selection(app: &SolveApp, mode: Mode) -> (Vec<[usize; 2]>, Vec<usize>) {
+    let mut edges: Vec<_> =
+        app.forms_prototype.elements.iter().filter_map(|element| if let Element::Edge(edge) = element { Some(*edge) } else { None }).collect();
     let faces: Vec<_> = surface::selected_faces(app).into_iter().collect();
-    if mode == Mode::Unweld && edges.is_empty() {
+    if mode == Mode::Unweld
+        && edges.is_empty()
+        && let Some(form) = &app.session.forms_prototype
+    {
         let mut counts = std::collections::BTreeMap::new();
         for id in &faces {
-            if let Some(face) = form.cage.faces.get(*id) {
+            if let Some(face) = form.logical.faces.get(*id) {
                 for (&a, &b) in face.iter().zip(face.iter().cycle().skip(1)).take(face.len()) {
                     *counts.entry([a.min(b), a.max(b)]).or_insert(0usize) += 1;
                 }
             }
         }
-        edges = counts.into_iter().filter_map(|(edge, n)| (n == 1).then_some(edge)).collect();
+        edges = counts.into_iter().filter_map(|(edge, count)| (count == 1).then_some(edge)).collect();
     }
+    (edges, faces)
+}
+pub(super) fn start(app: &mut SolveApp, mode: Mode) {
+    if active(app) {
+        return;
+    }
+    if let Some(reason) = unavailable(app, mode) {
+        app.set_status(app.tr(reason).to_owned(), true);
+        return;
+    }
+    let Some(form) = &app.session.forms_prototype else { return };
+    let bounds: solidcraft_engine::geom::Aabb3 = form.cage.points.iter().copied().collect();
+    let size = bounds.size();
+    let distance = (size.x.max(size.y).max(size.z) * 0.1).max(0.1).to_string();
+    let local_bridge = mode == Mode::Bridge && form.hierarchy.is_some();
+    let vertices = if mode == Mode::Fill && form.hierarchy.is_some() {
+        app.forms_prototype.elements.iter().filter_map(|element| if let Element::Vertex(id) = element { Some(*id) } else { None }).collect()
+    } else {
+        app.forms_prototype.selected.iter().copied().collect()
+    };
+    let (direction, controls) = controls::projection_settings(app);
+    let (edges, faces) = tool_selection(app, mode);
     let first_openings = if mode == Mode::Match {
         solidcraft_engine::doc::forms::match_openings(&form.cage, form.hierarchy.as_ref()).unwrap_or_default()
     } else {
@@ -231,14 +410,6 @@ pub(super) fn start(app: &mut SolveApp, mode: Mode) {
             return;
         }
     }
-    if mode == Mode::Unweld && (!first_openings.is_empty() || edges.is_empty()) {
-        app.set_status(app.tr("forms.prototype.unweld_seam_required").to_owned(), true);
-        return;
-    }
-    if mode == Mode::Collapse && app.forms_prototype.selected.len() != 2 {
-        app.set_status(app.tr("forms.prototype.two_points_required").to_owned(), true);
-        return;
-    }
     let mut state = State {
         repair: form.repair.is_some(),
         surface_mapping: 0,
@@ -265,17 +436,23 @@ pub(super) fn start(app: &mut SolveApp, mode: Mode) {
         second_opening: 0,
         separate: true,
         mode,
-        vertices: app.forms_prototype.selected.iter().copied().collect(),
+        vertices,
         edges,
         faces,
         elements: app.forms_prototype.elements.clone(),
         pivot: app.forms_prototype.pivot,
-        normal: basis(app)[2],
+        normal: basis(app).ok().map(|dirs| dirs[2]),
         distance,
         sharp: true,
         direction,
         controls,
         fill: 0,
+        // Preview installs candidates in the live editor. Keep the choices
+        // qualified against the original Form for the entire Apply/Cancel tool.
+        fill_choices: form
+            .hierarchy
+            .as_ref()
+            .map_or(FillChoices::Base, |hierarchy| FillChoices::Refined { new_cap: form.symmetry.is_none() && hierarchy.can_reserve_quad_cap() }),
         local_bridge,
         desired: None,
         applied: None,
@@ -376,7 +553,7 @@ fn params(app: &SolveApp, state: &State) -> Result<serde_json::Value, String> {
             1 => Some(Vec3::X),
             2 => Some(Vec3::Y),
             3 => Some(Vec3::Z),
-            4 => Some(state.normal),
+            4 => Some(state.normal.ok_or_else(|| app.tr("forms.selection_frame.unavailable").to_owned())?),
             _ => None,
         };
         return Ok(json!({"project":{
@@ -384,6 +561,10 @@ fn params(app: &SolveApp, state: &State) -> Result<serde_json::Value, String> {
             "points":if state.controls{"control"}else{"surface"},"direction":direction.map(|d|[d.x,d.y,d.z]),
             "origin":state.pivot.map(|p|[p.x,p.y,p.z]),
         }}));
+    }
+    if state.mode == Mode::EraseFill && matches!(state.fill_choices, FillChoices::Refined { .. }) {
+        let tolerance = controls::tolerance(app).ok_or_else(|| app.tr("forms.prototype.invalid_tolerance").to_owned())?;
+        return Ok(json!({"topology":{"tool":"erase_and_fill","faces":state.faces,"tolerance":tolerance}}));
     }
     let tool = match state.mode {
         Mode::Bridge => "bridge",
@@ -403,9 +584,15 @@ fn params(app: &SolveApp, state: &State) -> Result<serde_json::Value, String> {
     } else {
         0.0
     };
-    let fill = ["automatic", "single", "minimal", "reduced_star"].get(state.fill).copied().unwrap_or("automatic");
-    Ok(json!({"topology":{"tool":tool,"distance":distance,"sharp":state.sharp,"fill_mode":fill,
-        "vertices":state.vertices,"faces":state.faces,"edges":state.edges}}))
+    let &(fill, _) = state.fill_choices.options().get(state.fill).ok_or_else(|| app.tr("forms.prototype.invalid_number").to_owned())?;
+    let mut topology = json!({"tool":tool,"distance":distance,"sharp":state.sharp,"fill_mode":fill,
+        "vertices":state.vertices,"faces":state.faces,"edges":state.edges});
+    let refined = app.session.forms_prototype.as_ref().is_some_and(|form| form.hierarchy.is_some());
+    if (state.mode == Mode::Fill && matches!(state.fill_choices, FillChoices::Refined { .. })) || (state.mode == Mode::Collapse && refined) {
+        let tolerance = controls::tolerance(app).ok_or_else(|| app.tr("forms.prototype.invalid_tolerance").to_owned())?;
+        topology["tolerance"] = json!(tolerance);
+    }
+    Ok(json!({"topology":topology}))
 }
 pub(super) fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
     let Some(mut state) = app.forms_prototype.tool_panel.take() else {
@@ -419,6 +606,9 @@ pub(super) fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
         return;
     };
     ui.heading(app.tr(state.mode.title()));
+    if state.mode == Mode::Collapse && app.session.forms_prototype.as_ref().is_some_and(|form| form.hierarchy.is_some()) {
+        ui.add(egui::Label::new(app.tr("forms.collapse.help")).wrap());
+    }
     if state.mode == Mode::Pipe {
         pipe_panel::show(app, ui, &mut state);
     }
@@ -567,9 +757,13 @@ pub(super) fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
         }
     }
     if state.mode == Mode::Unweld {
-        let r = crate::ui_kit::checkbox(ui, app.tr("forms.prototype.separate_forms"), &mut state.separate);
-        crate::scenario::publish_handle("forms_unweld_separate", r.rect.center());
-        ui.add(egui::Label::new(app.tr("forms.prototype.unweld_help")).wrap());
+        if app.session.forms_prototype.as_ref().is_some_and(|form| form.hierarchy.is_some()) {
+            ui.add(egui::Label::new(app.tr("forms.unweld.refined_help")).wrap());
+        } else {
+            let r = crate::ui_kit::checkbox(ui, app.tr("forms.prototype.separate_forms"), &mut state.separate);
+            crate::scenario::publish_handle("forms_unweld_separate", r.rect.center());
+            ui.add(egui::Label::new(app.tr("forms.prototype.unweld_help")).wrap());
+        }
     }
     if state.mode == Mode::Weld {
         let labels: Vec<_> = state.other_forms.iter().map(|f| f.label.clone()).collect();
@@ -632,17 +826,27 @@ pub(super) fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
         crate::scenario::publish_handle("forms_tool_controls", r.rect.center());
     }
     if state.mode == Mode::Fill {
-        let options: [String; 4] =
-            ["forms.prototype.fill_automatic", "forms.prototype.fill_single", "forms.prototype.fill_minimal", "forms.prototype.fill_star"]
-                .map(|key| app.tr(key).to_owned());
+        let options = state.fill_choices.options();
+        let labels: Vec<_> = options.iter().map(|(_, key)| app.tr(key).to_owned()).collect();
         let r = crate::ui_kit::choice_row(
             ui,
             app.tr("forms.prototype.fill_mode"),
             "forms_tool_fill",
             &mut state.fill,
-            &options.iter().map(String::as_str).collect::<Vec<_>>(),
+            &labels.iter().map(String::as_str).collect::<Vec<_>>(),
         );
         crate::scenario::publish_handle("forms_tool_fill", r.rect.center());
+        if matches!(state.fill_choices, FillChoices::Refined { .. }) {
+            let help = if options.get(state.fill).is_some_and(|(mode, _)| *mode == "new_cap") {
+                "forms.fill.new_cap_help"
+            } else {
+                "forms.fill.restore_material"
+            };
+            ui.add(egui::Label::new(app.tr(help)).wrap());
+        }
+    }
+    if state.mode == Mode::EraseFill && matches!(state.fill_choices, FillChoices::Refined { .. }) {
+        ui.add(egui::Label::new(app.tr("forms.fill.erase_refined_help")).wrap());
     }
     if state.local_bridge {
         ui.add(egui::Label::new(app.tr("forms.prototype.bridge_bakes_local")).wrap());
@@ -830,24 +1034,59 @@ fn entry_faces(mesh: &Mesh, edge: usize, face: usize) -> bool {
 }
 fn compute(app: &mut SolveApp, ctx: &egui::Context, state: &mut State, given: serde_json::Value) {
     let Some(form) = &app.session.forms_prototype else { return };
+    let refined_erase = state.mode == Mode::EraseFill && matches!(state.fill_choices, FillChoices::Refined { .. });
+    let refined_unweld = state.mode == Mode::Unweld && form.hierarchy.is_some();
+    let refined_collapse = state.mode == Mode::Collapse && form.hierarchy.is_some();
+    let needs_native = refined_erase || refined_unweld || refined_collapse || given["topology"]["fill_mode"] == "new_cap";
     #[cfg(not(target_arch = "wasm32"))]
     {
+        let permit = if needs_native {
+            let Some(permit) = finish::permit(app) else {
+                state.error = Some(app.tr("forms.prototype.command_worker_busy").to_owned());
+                let wait = std::time::Duration::from_millis(125);
+                state.deadline = ctx.input(|input| input.time) + wait.as_secs_f64();
+                ctx.request_repaint_after(wait);
+                return;
+            };
+            Some(permit)
+        } else {
+            None
+        };
         let revision = form.revision;
         let copy = app.session.scratch();
         let wake = ctx.clone();
         let params = given.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         match std::thread::Builder::new().name("form-tool-preview".into()).spawn(move || {
+            let _permit = permit;
             let result = copy.compute_commands(&[("form.prototype.tool.preview".into(), params)], None).map_err(|e| e.to_string());
             let _ = tx.send(result);
             wake.request_repaint();
         }) {
             Ok(_) => {
+                state.error = None;
                 state.pending = Some(Pending { revision, params: given, done: rx });
                 return;
             }
             Err(error) => state.error = Some(error.to_string()),
         }
+    }
+    if needs_native {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let message = if refined_collapse {
+                "forms.collapse.desktop_required"
+            } else if refined_unweld {
+                "forms.unweld.refined_desktop_required"
+            } else if refined_erase {
+                "forms.fill.erase_desktop_required"
+            } else {
+                "forms.fill.desktop_required"
+            };
+            state.error = Some(app.tr(message).to_owned());
+        }
+        state.applied = Some(given);
+        return;
     }
     let _ = (ctx, form);
     match app.session.execute("form.prototype.tool.preview", &given) {
@@ -915,12 +1154,321 @@ pub(super) fn cancel(app: &mut SolveApp) {
 mod tests {
     use super::*;
     #[test]
+    fn tool_entry_rechecks_refinement_and_undo_without_mutating_a_refused_edit() {
+        let mut app = SolveApp::new(Default::default(), Default::default());
+        app.session.execute("form.prototype.create", &json!({"primitive":"face","dimensions":[4,6,1],"segments":[1,1,1],"levels":1})).unwrap();
+        assert!(unavailable(&app, Mode::Thicken).is_none());
+        app.session.execute("form.prototype.refine", &json!({"faces":[0],"counts":[2,2]})).unwrap();
+        let before = app.session.forms_prototype.as_ref().unwrap().definition();
+        let undo = app.session.forms_prototype.as_ref().unwrap().inspect()["undo"].clone();
+        let selection = app.forms_prototype.elements.clone();
+        for mode in [Mode::Thicken, Mode::Weld] {
+            assert_eq!(unavailable(&app, mode), Some("forms.prototype.base_tool_required"));
+            start(&mut app, mode);
+            assert!(!active(&app));
+            assert_eq!(app.session.forms_prototype.as_ref().unwrap().definition(), before);
+            assert_eq!(app.session.forms_prototype.as_ref().unwrap().inspect()["undo"], undo);
+            assert_eq!(app.forms_prototype.elements, selection);
+        }
+        let erase_reason = if cfg!(target_arch = "wasm32") { "forms.fill.erase_desktop_required" } else { "forms.prototype.select_faces_for_tool" };
+        assert_eq!(unavailable(&app, Mode::EraseFill), Some(erase_reason));
+        start(&mut app, Mode::EraseFill);
+        assert!(!active(&app));
+        assert_eq!(app.session.forms_prototype.as_ref().unwrap().definition(), before);
+        assert_eq!(app.session.forms_prototype.as_ref().unwrap().inspect()["undo"], undo);
+        assert_eq!(app.forms_prototype.elements, selection);
+        let fill_reason = if cfg!(target_arch = "wasm32") { "forms.fill.desktop_required" } else { "forms.fill.select_rim" };
+        assert_eq!(unavailable(&app, Mode::Fill), Some(fill_reason));
+        start(&mut app, Mode::Fill);
+        assert!(!active(&app));
+        assert_eq!(app.session.forms_prototype.as_ref().unwrap().definition(), before);
+        assert_eq!(app.session.forms_prototype.as_ref().unwrap().inspect()["undo"], undo);
+        assert_eq!(app.forms_prototype.elements, selection);
+        for mode in [Mode::Bridge, Mode::Match] {
+            assert!(unavailable(&app, mode).is_none(), "supported hierarchy entry keeps its detailed geometry checks");
+        }
+        app.session.execute("form.prototype.undo", &json!({})).unwrap();
+        assert!(unavailable(&app, Mode::Thicken).is_none());
+        let source = app.session.forms_prototype.as_ref().unwrap().definition();
+        start(&mut app, Mode::Thicken);
+        assert!(active(&app));
+        cancel(&mut app);
+        assert_eq!(app.session.forms_prototype.as_ref().unwrap().definition(), source);
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn refined_fill_preview_uses_a_deleted_rim_and_cancel_restores_selection() {
+        let mut app = SolveApp::new(Default::default(), Default::default());
+        app.run("form.prototype.create", json!({"primitive":"face","dimensions":[9,9,1],"segments":[3,3,1],"levels":0})).unwrap();
+        app.run("form.prototype.refine", json!({"faces":[4],"counts":[2,2]})).unwrap();
+        let f = app.session.forms_prototype.as_ref().unwrap();
+        let intact = f.definition();
+        let h = f.hierarchy.as_ref().unwrap();
+        let leaf = h.leaves.iter().position(|leaf| leaf.active && leaf.root == 4).unwrap();
+        app.run("form.prototype.topology", json!({"tool":"delete_faces","faces":[leaf]})).unwrap();
+        let f = app.session.forms_prototype.as_ref().unwrap();
+        let hole = f.definition();
+        let undo = f.inspect()["undo"].clone();
+        let rims = solidcraft_engine::doc::forms::match_openings(&hole.cage, hole.hierarchy.as_ref()).unwrap();
+        let rim = rims.iter().find(|rim| rim.len() == 4).unwrap();
+        let edge = [rim[0].min(rim[1]), rim[0].max(rim[1])];
+        let picked = BTreeSet::from([Element::Edge(edge)]);
+        app.forms_prototype.elements = picked.clone();
+        selection::sync(&mut app);
+        let pivot = Vec3::new(1.0, 2.0, 0.0);
+        app.forms_prototype.pivot = Some(pivot);
+        assert!(unavailable(&app, Mode::Fill).is_none());
+        start(&mut app, Mode::Fill);
+        let state = app.forms_prototype.tool_panel.as_ref().unwrap();
+        let request = params(&app, state).unwrap();
+        assert_eq!(request["topology"]["edges"], json!([edge]));
+        assert_eq!(request["topology"]["fill_mode"], "automatic");
+        assert_eq!(request["topology"]["tolerance"], 0.05);
+        app.run("form.prototype.tool.preview", request).unwrap();
+        assert_eq!(app.session.forms_prototype.as_ref().unwrap().definition(), intact);
+        cancel(&mut app);
+        assert!(!active(&app));
+        assert_eq!(app.session.forms_prototype.as_ref().unwrap().definition(), hole);
+        assert_eq!(app.session.forms_prototype.as_ref().unwrap().inspect()["undo"], undo);
+        assert_eq!(app.forms_prototype.elements, picked);
+        assert_eq!(app.forms_prototype.pivot, Some(pivot));
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn refined_erase_and_fill_worker_cancel_restores_selected_material_and_pivot() {
+        let mut app = SolveApp::new(Default::default(), Default::default());
+        app.run("form.prototype.create", json!({"primitive":"face","dimensions":[8,8,1],"segments":[4,4,1],"levels":0})).unwrap();
+        app.run("form.prototype.refine", json!({"faces":[10],"counts":[2,2]})).unwrap();
+        let form = app.session.forms_prototype.as_ref().unwrap();
+        let before = form.definition();
+        let hierarchy = before.hierarchy.as_ref().unwrap();
+        let faces: Vec<_> = hierarchy.leaves.iter().enumerate().filter_map(|(id, leaf)| (leaf.active && leaf.root == 10).then_some(id)).collect();
+        let cap = hierarchy.leaves.len();
+        let undo = form.inspect()["undo"].as_u64().unwrap();
+        let picked: BTreeSet<_> = faces.iter().copied().map(Element::Face).collect();
+        app.forms_prototype.elements = picked.clone();
+        let vertex = form.logical.faces[faces[0]][0];
+        app.forms_prototype.elements.insert(Element::Vertex(vertex));
+        assert_eq!(unavailable(&app, Mode::EraseFill), Some("forms.fill.erase_faces_only"));
+        app.forms_prototype.elements.remove(&Element::Vertex(vertex));
+        selection::sync(&mut app);
+        let pivot = Vec3::new(1.0, 2.0, 0.0);
+        app.forms_prototype.pivot = Some(pivot);
+        assert_eq!(unavailable(&app, Mode::EraseFill), None);
+        start(&mut app, Mode::EraseFill);
+        let mut state = app.forms_prototype.tool_panel.take().unwrap();
+        let request = params(&app, &state).unwrap();
+        assert_eq!(request, json!({"topology":{"tool":"erase_and_fill","faces":faces,"tolerance":0.05}}));
+        state.desired = Some(request.clone());
+        let ctx = egui::Context::default();
+        let permit = finish::permit(&app).unwrap();
+        compute(&mut app, &ctx, &mut state, request.clone());
+        assert!(state.pending.is_none());
+        assert_eq!(state.error.as_deref(), Some(app.tr("forms.prototype.command_worker_busy")));
+        assert_eq!(app.session.forms_prototype.as_ref().unwrap().definition(), before);
+        drop(permit);
+        compute(&mut app, &ctx, &mut state, request);
+        let work = state.pending.take().unwrap();
+        let result = work.done.recv().unwrap();
+        let (tx, done) = std::sync::mpsc::channel();
+        tx.send(result).unwrap();
+        state.pending = Some(Pending { done, ..work });
+        app.forms_prototype.tool_panel = Some(state);
+        tick(&mut app);
+        let state = app.forms_prototype.tool_panel.as_ref().unwrap();
+        assert!(state.error.is_none(), "{:?}", state.error);
+        let form = app.session.forms_prototype.as_ref().unwrap();
+        assert_eq!(form.hierarchy.as_ref().unwrap().quad_cap_face(), Some(cap));
+        assert_eq!(form.inspect()["undo"], undo + 1);
+        assert!(faces.iter().all(|&id| form.logical.faces[id].is_empty()));
+        cancel(&mut app);
+        assert_eq!(app.session.forms_prototype.as_ref().unwrap().definition(), before);
+        assert_eq!(app.session.forms_prototype.as_ref().unwrap().inspect()["undo"], undo);
+        assert_eq!(app.forms_prototype.elements, picked);
+        assert_eq!(app.forms_prototype.pivot, Some(pivot));
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn new_cap_preview_uses_native_worker_and_keeps_rim_selection_on_cancel() {
+        let mut app = SolveApp::new(Default::default(), Default::default());
+        app.run("form.prototype.create", json!({"primitive":"face","dimensions":[8,8,1],"segments":[4,4,1],"levels":0})).unwrap();
+        let edge: [usize; 2] = app.session.forms_prototype.as_ref().unwrap().logical.faces[10][..2].try_into().unwrap();
+        let edge = [edge[0].min(edge[1]), edge[0].max(edge[1])];
+        app.run("form.prototype.topology", json!({"tool":"delete_faces","faces":[10]})).unwrap();
+        app.run("form.prototype.refine", json!({"faces":[0],"counts":[2,2]})).unwrap();
+        let form = app.session.forms_prototype.as_ref().unwrap();
+        let before = form.definition();
+        let undo = form.inspect()["undo"].as_u64().unwrap();
+        let cap_face = before.hierarchy.as_ref().unwrap().leaves.len();
+        let picked = BTreeSet::from([Element::Edge(edge)]);
+        app.forms_prototype.elements = picked.clone();
+        selection::sync(&mut app);
+        let pivot = Vec3::new(1.0, 2.0, 0.0);
+        app.forms_prototype.pivot = Some(pivot);
+        start(&mut app, Mode::Fill);
+        let mut state = app.forms_prototype.tool_panel.take().unwrap();
+        assert_eq!(params(&app, &state).unwrap()["topology"]["fill_mode"], "automatic");
+        state.fill = 2;
+        let request = params(&app, &state).unwrap();
+        assert_eq!(request["topology"]["fill_mode"], "new_cap");
+        assert_eq!(request["topology"]["edges"], json!([edge]));
+        state.desired = Some(request.clone());
+        let ctx = egui::Context::default();
+        let permit = finish::permit(&app).unwrap();
+        compute(&mut app, &ctx, &mut state, request.clone());
+        assert!(state.pending.is_none() && state.applied.is_none());
+        assert_eq!(state.error.as_deref(), Some(app.tr("forms.prototype.command_worker_busy")));
+        assert_eq!(app.session.forms_prototype.as_ref().unwrap().definition(), before);
+        drop(permit);
+
+        compute(&mut app, &ctx, &mut state, request.clone());
+        let work = state.pending.take().unwrap();
+        let result = work.done.recv().unwrap();
+        let (tx, done) = std::sync::mpsc::channel();
+        tx.send(result).unwrap();
+        state.pending = Some(Pending { done, ..work });
+        app.forms_prototype.tool_panel = Some(state);
+        tick(&mut app);
+        let state = app.forms_prototype.tool_panel.as_ref().unwrap();
+        assert!(state.error.is_none(), "{:?}", state.error);
+        assert_eq!(state.applied.as_ref(), Some(&request));
+        assert_eq!(params(&app, state).unwrap(), request, "a live cap candidate must not remove the selected mode");
+        let form = app.session.forms_prototype.as_ref().unwrap();
+        assert_eq!(form.hierarchy.as_ref().unwrap().quad_cap_face(), Some(cap_face));
+        assert_eq!(form.inspect()["undo"], undo + 1);
+        // Apply a copy to exercise current exact region ownership. The live
+        // preview remains open so Cancel is tested on the original editor.
+        let mut accepted = SolveApp::new(Default::default(), Default::default());
+        accepted.session = app.session.scratch();
+        accepted.forms_prototype.controls.tolerance.clone_from(&app.forms_prototype.controls.tolerance);
+        accepted.run("form.prototype.tool.apply", json!({})).unwrap();
+        fit(&mut accepted);
+        accepted.cam.pitch = std::f64::consts::FRAC_PI_2;
+        accepted.cam.fov = 0.0;
+        accepted.forms_prototype.pick = Pick::Face;
+        let proj = crate::viewport::projection(&accepted, egui::Rect::from_min_size(Pos2::ZERO, egui::vec2(900.0, 700.0)));
+        let form = accepted.session.forms_prototype.as_ref().unwrap();
+        let [a, b, c] = form.surface.mesh.tri(&form.surface.mesh.triangles[0]).unwrap();
+        let skin = proj.to_screen((a + b + c) / 3.0).unwrap();
+        let (o, d) = proj.ray(skin);
+        assert!(form.surface.index.raycast(&form.surface.mesh, o, d).is_some());
+        assert!(
+            surface::nearest_with(&accepted, &proj, skin, Pick::Face).is_none(),
+            "the incomplete skin fallback cannot resolve a face on a capped Form"
+        );
+        live_cad::install_for_test(&mut accepted);
+        let exact = live_cad::selection_geometry(&accepted).unwrap();
+        let native_face = exact.faces.iter().position(|owner| *owner == live_cad::ExactFaceOwner::Face(cap_face)).unwrap();
+        assert!(exact.logical.as_ref().unwrap().accepts(&BTreeSet::from([Element::Face(cap_face)]), Pick::Face));
+        let geometry = solidcraft_engine::doc::kernel::face_geometry(&exact.body, native_face).unwrap();
+        let [[u0, u1], [v0, v1]] = exact.body.record().faces[native_face].domain;
+        let (center, _, _) = geometry.surface.derivs((u0 + u1) / 2.0, (v0 + v1) / 2.0).unwrap();
+        let pixel = proj.to_screen(center).unwrap();
+        assert!(surface::nearest_with(&accepted, &proj, pixel, Pick::Face).is_none(), "a displayed cap cannot acquire a face owner through a click");
+        let offset = egui::vec2(3.0, 3.0);
+        let region = crate::selection::BoxSel::from_drag(pixel + offset, pixel - offset);
+        let selected = region_geometry::Query::capture(&accepted, &proj, &region).unwrap().run().unwrap();
+        assert_eq!(selected, BTreeSet::from([Element::Face(cap_face)]));
+        accepted.forms_prototype.elements = selected;
+        selection::sync(&mut accepted);
+        assert!(surface::cap_selected(&accepted));
+        assert!(triad(&accepted).is_none());
+        let before_delete = accepted.session.forms_prototype.as_ref().unwrap().definition();
+        accepted.forms_prototype.elements.insert(Element::Edge(edge));
+        assert_eq!(topology_unavailable(&accepted, "delete_faces"), Some("forms.fill.select_cap_only"));
+        assert!(shortcut(&mut accepted, &ctx, egui::Key::Delete, egui::Modifiers::NONE));
+        assert!(accepted.forms_prototype.pending.is_none());
+        assert_eq!(accepted.session.forms_prototype.as_ref().unwrap().definition(), before_delete);
+        accepted.forms_prototype.elements.remove(&Element::Edge(edge));
+        assert_eq!(topology_unavailable(&accepted, "delete_faces"), None);
+        accepted.forms_prototype.pivot = Some(pivot);
+        assert!(shortcut(&mut accepted, &ctx, egui::Key::Delete, egui::Modifiers::NONE));
+        assert!(accepted.forms_prototype.pending.is_some());
+        assert_eq!(accepted.session.forms_prototype.as_ref().unwrap().definition(), before_delete);
+        assert_eq!(accepted.forms_prototype.elements, BTreeSet::from([Element::Face(cap_face)]));
+        assert_eq!(accepted.forms_prototype.pivot, Some(pivot));
+        finish::flush_for_test(&mut accepted).unwrap();
+        let form = accepted.session.forms_prototype.as_ref().unwrap();
+        assert_eq!(form.inspect()["undo"], undo + 2);
+        assert!(form.logical.faces[cap_face].is_empty());
+        assert!(accepted.forms_prototype.elements.is_empty());
+        assert_eq!(accepted.forms_prototype.pivot, None);
+        cancel(&mut app);
+        assert!(!active(&app));
+        assert_eq!(app.session.forms_prototype.as_ref().unwrap().definition(), before);
+        assert_eq!(app.session.forms_prototype.as_ref().unwrap().inspect()["undo"], undo);
+        assert_eq!(app.forms_prototype.elements, picked);
+        assert_eq!(app.forms_prototype.pivot, Some(pivot));
+    }
+    #[test]
+    fn closed_form_and_selection_reasons_match_tool_entry() {
+        let mut app = SolveApp::new(Default::default(), Default::default());
+        app.session.execute("form.prototype.create", &json!({"size":4,"segments":[1,1,1],"levels":1})).unwrap();
+        let source = app.session.forms_prototype.as_ref().unwrap().definition();
+        assert_eq!(unavailable(&app, Mode::Thicken), Some("forms.prototype.open_surface_required"));
+        assert_eq!(unavailable(&app, Mode::Collapse), Some("forms.prototype.two_points_required"));
+        assert_eq!(unavailable(&app, Mode::Unweld), Some("forms.prototype.unweld_seam_required"));
+        start(&mut app, Mode::Thicken);
+        assert!(!active(&app));
+        assert_eq!(app.session.forms_prototype.as_ref().unwrap().definition(), source);
+        app.forms_prototype.elements.insert(Element::Edge([source.cage.faces[0][0], source.cage.faces[0][1]]));
+        selection::sync(&mut app);
+        assert!(unavailable(&app, Mode::Collapse).is_none());
+        app.forms_prototype.elements.clear();
+        app.forms_prototype.elements.insert(Element::Face(0));
+        selection::sync(&mut app);
+        assert!(unavailable(&app, Mode::Unweld).is_none(), "a face region supplies its separating seam");
+    }
+    #[test]
+    fn retained_match_keeps_reattachment_available_and_blocks_unrelated_tools() {
+        let mut app = SolveApp::new(Default::default(), Default::default());
+        app.session
+            .execute("solid.box", &json!({"corner":[-2,-3,-1],"length":4,"width":6,"height":1,"body_name":"Support","operation":"new"}))
+            .unwrap();
+        let body = app.session.model.state().body("Support").unwrap().body.clone();
+        let top = (0..body.face_count()).find(|&i| body.planar_face(i).is_some_and(|plane| plane.normal().z > 0.99)).unwrap();
+        app.session.execute("form.prototype.create", &json!({"primitive":"face","dimensions":[4,6,1],"segments":[2,2,1],"levels":1})).unwrap();
+        let center =
+            app.session.forms_prototype.as_ref().unwrap().cage.points.iter().position(|point| point.x.abs() < 1e-8 && point.y.abs() < 1e-8).unwrap();
+        app.session.execute("form.prototype.set_vertices", &json!({"vertices":[center],"positions":[[0,0,2]]})).unwrap();
+        let ring = app.session.forms_prototype.as_ref().unwrap().cage.boundary_loops().unwrap().remove(0);
+        app.session
+            .execute("form.prototype.match", &json!({"body":"Support","face":top,"edge":[ring[0],ring[1]],"order":0,"tolerance":0.01}))
+            .unwrap();
+        let feature = app.session.execute("form.prototype.commit", &json!({"tolerance":0.01})).unwrap()["feature"].as_u64().unwrap();
+        let solidcraft_engine::doc::FeatureKind::Form { definition, .. } = &mut app.session.doc_mut().feature_mut(feature).unwrap().kind else {
+            panic!("Form")
+        };
+        let solidcraft_engine::doc::forms::SupportRef::Face { body, .. } = &mut definition.matching.as_mut().unwrap().source else { panic!("face") };
+        *body = "Missing support".into();
+        app.session.refresh();
+        app.session.execute("form.repair", &json!({"feature":feature})).unwrap();
+        opened(&mut app);
+        let source = app.session.forms_prototype.as_ref().unwrap().definition();
+        assert!(unavailable(&app, Mode::Match).is_none());
+        assert_eq!(unavailable(&app, Mode::Surface), Some("forms.prototype.reattach_before_tool"));
+        assert_eq!(topology_unavailable(&app, "extrude_faces"), Some("forms.prototype.reattach_before_tool"));
+        start(&mut app, Mode::Thicken);
+        assert!(!active(&app));
+        assert_eq!(app.session.forms_prototype.as_ref().unwrap().definition(), source);
+        start(&mut app, Mode::Match);
+        assert!(active(&app));
+        cancel(&mut app);
+        assert!(app.session.forms_prototype.as_ref().unwrap().repair.is_some());
+        assert_eq!(app.session.forms_prototype.as_ref().unwrap().definition(), source);
+    }
+    #[test]
     fn retained_surface_mapping_is_explicit_and_qualification_uses_the_existing_preview_worker() {
         let mut app = SolveApp::new(Default::default(), Default::default());
         app.session.execute("solid.box", &json!({"length":4,"width":6,"height":1,"body_name":"Support","operation":"new"})).unwrap();
         let body = app.session.model.state().body("Support").unwrap().body.clone();
         let top = (0..body.face_count()).find(|&i| body.planar_face(i).is_some_and(|p| p.normal().z > 0.99)).unwrap();
         app.session.execute("form.surface", &json!({"body":"Support","face":top,"segments":[3,2],"continuity":0,"partition":false})).unwrap();
+        assert!(unavailable(&app, Mode::Surface).is_none());
+        assert!(unavailable(&app, Mode::Flatten).is_none());
+        assert!(unavailable(&app, Mode::Straighten).is_none());
+        assert_eq!(unavailable(&app, Mode::Match), Some("forms.prototype.surface_fixed_grid"));
+        assert_eq!(topology_unavailable(&app, "extrude_faces"), Some("forms.prototype.surface_fixed_grid"));
         let feature = app.session.execute("form.prototype.commit", &json!({"tolerance":0.01})).unwrap()["feature"].as_u64().unwrap();
         let solidcraft_engine::doc::FeatureKind::Form { definition, .. } = &mut app.session.doc_mut().feature_mut(feature).unwrap().kind else {
             panic!("Form")
@@ -931,6 +1479,12 @@ mod tests {
         app.session.execute("form.repair", &json!({"feature":feature})).unwrap();
         opened(&mut app);
         let source = app.session.forms_prototype.as_ref().unwrap().definition();
+        assert!(unavailable(&app, Mode::Surface).is_none());
+        assert_eq!(unavailable(&app, Mode::Flatten), Some("forms.prototype.reattach_before_tool"));
+        assert_eq!(topology_unavailable(&app, "thicken"), Some("forms.prototype.reattach_before_tool"));
+        start(&mut app, Mode::Thicken);
+        assert!(!active(&app));
+        assert_eq!(app.session.forms_prototype.as_ref().unwrap().definition(), source);
         start(&mut app, Mode::Surface);
         let mut state = app.forms_prototype.tool_panel.take().unwrap();
         assert!(params(&app, &state).is_err());

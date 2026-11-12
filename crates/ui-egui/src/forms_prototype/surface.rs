@@ -49,6 +49,7 @@ pub(super) fn nearest(app: &SolveApp, proj: &Proj, pos: Pos2) -> Option<Element>
 }
 pub(super) fn nearest_with(app: &SolveApp, proj: &Proj, pos: Pos2, mode: Pick) -> Option<Element> {
     let form = app.session.forms_prototype.as_ref()?;
+    let retained_collapse = form.hierarchy.as_ref().is_some_and(|h| h.has_boundary_collapse());
     if matches!(mode, Pick::Vertex | Pick::All) {
         let mut candidates: Vec<_> = form
             .surface
@@ -59,6 +60,7 @@ pub(super) fn nearest_with(app: &SolveApp, proj: &Proj, pos: Pos2, mode: Pick) -
                 if !form.selectable_control(i) || !live_cad::handle_available(app, i) {
                     return None;
                 }
+                let p = control_position(app, i, p)?;
                 let q = proj.to_screen(p)?;
                 let distance = q.distance(pos);
                 (distance < 10.0 && visible(app, proj, p)).then_some((distance, (p - proj.cam.eye()).len2(), i))
@@ -74,7 +76,7 @@ pub(super) fn nearest_with(app: &SolveApp, proj: &Proj, pos: Pos2, mode: Pick) -
             if let Some((edge, _, _)) = curves::nearest(app, proj, pos) {
                 return Some(Element::Edge(edge));
             }
-        } else {
+        } else if !retained_collapse {
             let mut best: Option<(f32, [usize; 2])> = None;
             for (i, (edge, initial)) in form.surface.boundaries.iter().enumerate() {
                 let curve = boundary_curve(app, i, initial);
@@ -95,6 +97,11 @@ pub(super) fn nearest_with(app: &SolveApp, proj: &Proj, pos: Pos2, mode: Pick) -
         }
     }
     if matches!(mode, Pick::Face | Pick::All) {
+        // The evaluator omits derived material. Picking from it could
+        // select a face behind an exact native cap or Collapse trim.
+        if retained_collapse || form.hierarchy.as_ref().is_some_and(|h| h.has_quad_cap()) {
+            return None;
+        }
         let (o, d) = proj.ray(pos);
         let (mesh, index) = if form.profile.is_some() {
             live_cad::occlusion(app).unwrap_or((&form.surface.mesh, &form.surface.index))
@@ -111,6 +118,16 @@ pub(super) fn nearest_with(app: &SolveApp, proj: &Proj, pos: Pos2, mode: Pick) -
             .map(|&face| if form.profile.is_some() && face == u32::MAX { Element::Surface } else { Element::Face(face as usize) });
     }
     None
+}
+pub(super) fn selected_cap(app: &SolveApp) -> Option<usize> {
+    let hierarchy = app.session.forms_prototype.as_ref()?.hierarchy.as_ref()?;
+    app.forms_prototype.elements.iter().find_map(|element| match *element {
+        Element::Face(face) if hierarchy.is_quad_cap_face(face) => Some(face),
+        _ => None,
+    })
+}
+pub(super) fn cap_selected(app: &SolveApp) -> bool {
+    selected_cap(app).is_some()
 }
 pub(super) fn selected_faces(app: &SolveApp) -> BTreeSet<usize> {
     let mut faces: BTreeSet<_> = app
@@ -144,6 +161,14 @@ pub(super) fn highlight_curve(app: &SolveApp, edge: [usize; 2]) -> Option<Vec<Ve
     let curve = curves::get(app, edge)?;
     (0..=64).map(|i| curve.at(i as f64 / 64.0)).collect::<Result<_, _>>().ok()
 }
+fn control_position(app: &SolveApp, id: usize, evaluated: Vec3) -> Option<Vec3> {
+    let form = app.session.forms_prototype.as_ref()?;
+    if form.hierarchy.as_ref().is_some_and(|h| h.has_boundary_collapse()) {
+        return live_cad::selection_geometry(app)?.points.as_ref().ok()?.get(&id).copied();
+    }
+    Some(evaluated)
+}
+
 pub(super) fn overlay(app: &mut SolveApp, ui: &egui::Ui, proj: &Proj) {
     let Some(form) = &app.session.forms_prototype else { return };
     let tokens = Tokens::get();
@@ -158,7 +183,10 @@ pub(super) fn overlay(app: &mut SolveApp, ui: &egui::Ui, proj: &Proj) {
         .iter()
         .enumerate()
         .filter(|(i, _)| form.selectable_control(*i) && live_cad::handle_available(app, *i))
-        .filter_map(|(i, &p)| visible(app, proj, p).then(|| proj.to_screen(p).map(|p| (i, p))).flatten())
+        .filter_map(|(i, &p)| {
+            let p = control_position(app, i, p)?;
+            visible(app, proj, p).then(|| proj.to_screen(p).map(|screen| (i, p, screen))).flatten()
+        })
         .collect();
     if app.forms_prototype.cage {
         for ([a, b], _) in &form.surface.boundaries {
@@ -187,7 +215,7 @@ pub(super) fn overlay(app: &mut SolveApp, ui: &egui::Ui, proj: &Proj) {
             }
         }
     }
-    for &(i, p) in &app.forms_prototype.projected {
+    for &(i, _, p) in &app.forms_prototype.projected {
         let selected = app.forms_prototype.selected.contains(&i);
         let hover = app.forms_prototype.hover == Some(Element::Vertex(i));
         if !(form.pipe.is_some() && tool_panel::active(app))

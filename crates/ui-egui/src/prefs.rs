@@ -1049,8 +1049,18 @@ macro_rules! preference_settings {
 preference_settings! {
     /// Units of new designs.
     default_units: String = "mm".into(), PAGE_DESIGN;
+    /// Focus the Form editor on sculpting controls and the active insertion tool.
+    forms_compact_editor: bool = true, PAGE_DESIGN => check_tr("prefs.forms_compact_editor");
+    /// Show submitted Form transforms and their request status beside the viewport.
+    forms_drag_feedback: bool = true, PAGE_DESIGN => check_tr("prefs.forms_drag_feedback");
+    /// Use qualified native CAD faces for Form clicks on desktop.
+    forms_exact_face_picking: bool = false, PAGE_DESIGN => check_tr("prefs.forms_exact_face_picking");
     /// Toggle Form elements without holding a selection modifier.
     forms_greedy_selection: bool = false, PAGE_DESIGN => check_tr("prefs.forms_greedy_selection");
+    /// Keep selected Form entities and the custom pivot when changing pick filters.
+    forms_preserve_selection: bool = true, PAGE_DESIGN => check_tr("prefs.forms_preserve_selection");
+    /// Drag empty viewport space to select logical Form elements. False keeps click-only selection.
+    forms_region_selection: bool = true, PAGE_DESIGN => check_tr("prefs.forms_region_selection");
     forms_match_adjacent:bool = false, PAGE_DESIGN => check_tr("prefs.forms_match_adjacent");
     /// Keep subdivision feedback during a drag; false requests fitted CAD while interacting.
     forms_mesh_while_dragging: bool = true, PAGE_DESIGN => check_tr("prefs.forms_mesh_while_dragging");
@@ -4262,6 +4272,42 @@ pub(crate) fn reveal_preference(h: &mut crate::scenario::Harness, handle: &str) 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn compact_form_editor_defaults_on_preserves_legacy_and_resets_with_design() {
+        assert!(super::Prefs::default().forms_compact_editor);
+        let mut prefs = serde_json::from_value::<super::Prefs>(serde_json::json!({"forms_compact_editor":false})).unwrap();
+        assert!(!prefs.forms_compact_editor);
+        assert_eq!(serde_json::to_value(&prefs).unwrap()["forms_compact_editor"], false);
+        super::reset_preferences(&mut prefs, super::PAGE_DESIGN);
+        assert!(prefs.forms_compact_editor);
+    }
+    #[test]
+    fn form_drag_feedback_defaults_on_preserves_legacy_and_resets_with_design() {
+        assert!(super::Prefs::default().forms_drag_feedback);
+        let mut prefs = serde_json::from_value::<super::Prefs>(serde_json::json!({"forms_drag_feedback":false})).unwrap();
+        assert!(!prefs.forms_drag_feedback);
+        assert_eq!(serde_json::to_value(&prefs).unwrap()["forms_drag_feedback"], false);
+        super::reset_preferences(&mut prefs, super::PAGE_DESIGN);
+        assert!(prefs.forms_drag_feedback);
+    }
+    #[test]
+    fn form_filter_selection_preference_defaults_on_round_trips_and_resets_with_design() {
+        assert!(super::Prefs::default().forms_preserve_selection);
+        let mut prefs = serde_json::from_value::<super::Prefs>(serde_json::json!({"forms_preserve_selection":false})).unwrap();
+        assert!(!prefs.forms_preserve_selection);
+        assert_eq!(serde_json::to_value(&prefs).unwrap()["forms_preserve_selection"], false);
+        super::reset_preferences(&mut prefs, super::PAGE_DESIGN);
+        assert!(prefs.forms_preserve_selection);
+    }
+    #[test]
+    fn form_region_selection_defaults_on_preserves_legacy_and_resets_on_design_page() {
+        assert!(super::Prefs::default().forms_region_selection);
+        let mut p = serde_json::from_value::<super::Prefs>(serde_json::json!({"forms_region_selection":false})).unwrap();
+        assert!(!p.forms_region_selection);
+        assert_eq!(serde_json::to_value(&p).unwrap()["forms_region_selection"], false);
+        super::reset_preferences(&mut p, super::PAGE_DESIGN);
+        assert!(p.forms_region_selection);
+    }
     /// Profile operations switches the profiler when it changes, and only then: an agent's
     /// diagnostics.profile in between is not undone next frame.
     #[test]

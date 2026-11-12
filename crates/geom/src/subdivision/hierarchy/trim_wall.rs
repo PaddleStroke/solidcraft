@@ -10,6 +10,11 @@ pub struct TrimWall {
 }
 
 impl TrimWall {
+    /// Saved directed source trim, revalidated by Hierarchy::validated_trim_wall.
+    pub fn attachment(&self) -> &TrimAttachment {
+        &self.attachment
+    }
+
     pub fn root(&self) -> usize {
         self.attachment.root
     }
@@ -98,6 +103,9 @@ impl Hierarchy {
     /// Extend ordinary evaluator edges or a single trimmed edge.
     /// Both routes return the translated logical rim for the gesture selection.
     pub fn extend_edges(&self, edges: &[[usize; 2]], delta: Vec3) -> Result<(Self, Vec<[usize; 2]>)> {
+        if self.has_quad_cap() {
+            return Err(bad("edge extrusion on a capped hierarchy is not supported yet"));
+        }
         self.check_trim_wall_topology()?;
         let ordinary = match self.extrude_edges(edges, delta) {
             Ok(extruded) => return Ok(extruded),

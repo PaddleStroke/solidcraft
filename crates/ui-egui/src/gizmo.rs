@@ -315,8 +315,13 @@ pub(crate) fn show_mode(
         }
     }
     let state: Option<State> = ui.data(|d| d.get_temp(id));
-    let pointer = ui.input(|i| i.pointer.hover_pos());
-    let hovered = if state.is_none() { pointer.filter(|_| ui.rect_contains_pointer(proj.rect)).and_then(|p| hit(&sh, p)) } else { None };
+    let (pointer, press) = ui.input(|i| {
+        let press = i.pointer.primary_down().then(|| i.pointer.press_origin()).flatten();
+        (i.pointer.hover_pos(), press)
+    });
+    // egui starts a drag after the pointer has moved. Pick the handle under the
+    // original press so that a fast first move cannot switch the constraint.
+    let hovered = if state.is_none() { press.or(pointer).filter(|_| ui.rect_contains_pointer(proj.rect)).and_then(|p| hit(&sh, p)) } else { None };
     let active = state.map(|s| s.handle).or(hovered);
     let hot = |h: Handle| active == Some(h);
     let col = |h: Handle, i: usize| if hot(h) { tk.accent } else { tk.axes()[i.min(2)] };
