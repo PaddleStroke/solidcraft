@@ -13,8 +13,7 @@ pub(super) struct Entry {
 impl Entry {
     pub(super) fn display_color(&self, tokens: &Tokens) -> egui::Color32 {
         if self.detached_companion {
-            let [r, g, b, _] = tokens.body_selected.to_srgba_unmultiplied();
-            return egui::Color32::from_rgb(r, g, b);
+            return tokens.body_selected.to_opaque();
         }
         self.color.map_or(tokens.body, crate::theme::srgb)
     }

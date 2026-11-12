@@ -28,5 +28,23 @@
     "forms.unweld.refined_desktop_required": "分离细分造型需要桌面应用。",
     "forms.unweld.refined_help": "选择闭合造型上能将其分成两部分的完整接缝。两部分都会保留细分并保存为独立造型。",
     "forms.unweld.refined_unavailable": "请选择无对称、无封盖且没有其他待处理对象的闭合独立细分造型。"
+  },
+  "ar": {
+    "forms.unweld.bridge_unavailable": "لا تتوفر أداة التجسير لمصدر محفوظ لعملية الفصل.",
+    "forms.unweld.refined_desktop_required": "يتطلب فصل شكل مُنقَّح تطبيق سطح المكتب.",
+    "forms.unweld.refined_help": "حدّد درزًا فاصلًا كاملًا في شكل مغلق. يحتفظ الجزءان بتنقيحهما ويُحفظان كشكلين مستقلين.",
+    "forms.unweld.refined_unavailable": "حدّد شكلًا مستقلًا مغلقًا ومُنقَّحًا بلا تناظر أو رقع إغلاق أو عناصر أخرى قيد الإعداد."
+  },
+  "he": {
+    "forms.unweld.bridge_unavailable": "גישור אינו זמין במקור שנשמר לצורך הפרדה.",
+    "forms.unweld.refined_desktop_required": "הפרדת צורה חופשית שעברה עידון דורשת את יישום שולחן העבודה.",
+    "forms.unweld.refined_help": "יש לבחור תפר מפריד שלם על צורה חופשית סגורה. שני החלקים שומרים על העידון ונשמרים כצורות חופשיות נפרדות.",
+    "forms.unweld.refined_unavailable": "יש לבחור צורה חופשית סגורה ועצמאית שעברה עידון, ללא סימטריה, מכסים או אובייקטים נוספים הממתינים לסיום."
+  },
+  "vi": {
+    "forms.unweld.bridge_unavailable": "Không thể nối cầu trên hình nguồn được giữ lại sau khi tách.",
+    "forms.unweld.refined_desktop_required": "Tách hình đã chia nhỏ cần ứng dụng máy tính.",
+    "forms.unweld.refined_help": "Chọn một đường nối hoàn chỉnh có thể chia đôi hình kín. Cả hai phần giữ nguyên mức chia nhỏ và được lưu thành hai hình riêng.",
+    "forms.unweld.refined_unavailable": "Chọn một hình kín đã chia nhỏ, độc lập, không có đối xứng, mặt bịt hoặc đối tượng khác đang chờ hoàn tất."
   }
 }

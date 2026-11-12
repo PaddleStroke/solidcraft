@@ -28,5 +28,23 @@
     "forms.prototype.insert_points_help": "单击希望切线穿过的边。",
     "prefs.forms_compact_editor": "紧凑的形体编辑器",
     "prefs.forms_compact_editor_help": "优先显示塑形控件，并在面板中突出当前工具。关闭此选项可恢复原来的布局。"
+  },
+  "ar": {
+    "forms.prototype.insert_edge_help": "انقر على وجه لإدراج حافة. اضغط M لتبديل الاتجاه.",
+    "forms.prototype.insert_points_help": "انقر على الحواف التي تريد أن يمرّ القطع عبرها.",
+    "prefs.forms_compact_editor": "محرّر الأشكال المدمج",
+    "prefs.forms_compact_editor_help": "يعرض أدوات النحت أولًا ويركّز اللوحة على الأداة النشطة. أوقف هذا الخيار لاستعادة التخطيط الأصلي."
+  },
+  "he": {
+    "forms.prototype.insert_edge_help": "יש ללחוץ על פאה כדי להוסיף קצה. מקש M מחליף את הכיוון.",
+    "forms.prototype.insert_points_help": "יש ללחוץ על הקצוות שבהם החיתוך אמור לעבור.",
+    "prefs.forms_compact_editor": "עורך קומפקטי לצורות חופשיות",
+    "prefs.forms_compact_editor_help": "הצגת כלי העיצוב בראש הלוח ומיקודו בכלי הפעיל. כיבוי ההגדרה מחזיר את הפריסה המקורית."
+  },
+  "vi": {
+    "forms.prototype.insert_edge_help": "Bấm vào một mặt để chèn cạnh. Nhấn M để đổi hướng.",
+    "forms.prototype.insert_points_help": "Bấm vào các cạnh mà bạn muốn đường cắt đi qua.",
+    "prefs.forms_compact_editor": "Trình chỉnh sửa hình thu gọn",
+    "prefs.forms_compact_editor_help": "Hiển thị các điều khiển tạo dáng trước và ưu tiên công cụ đang dùng trong bảng. Tắt để khôi phục bố cục ban đầu."
   }
 }

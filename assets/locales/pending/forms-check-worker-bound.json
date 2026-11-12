@@ -13,5 +13,14 @@
   },
   "zh": {
     "forms.diagnostics.worker_busy": "另一个 Form CAD 检查仍在运行。请在其完成后重试。"
+  },
+  "ar": {
+    "forms.diagnostics.worker_busy": "لا يزال فحص CAD لشكل آخر قيد التشغيل. أعد المحاولة بعد انتهائه."
+  },
+  "he": {
+    "forms.diagnostics.worker_busy": "בדיקת CAD אחרת של צורה חופשית עדיין מתבצעת. יש לנסות שוב כשהיא תסתיים."
+  },
+  "vi": {
+    "forms.diagnostics.worker_busy": "Một lượt kiểm tra CAD cho hình khác đang chạy. Hãy thử lại khi lượt đó hoàn tất."
   }
 }

@@ -23,5 +23,20 @@
     "forms.selection_frame.current_cad": "选择轴需要当前的 CAD 预览。",
     "forms.selection_frame.single_element": "请选择作为选择轴基准的面、边或点。",
     "forms.selection_frame.unavailable": "此元素没有可唯一确定的选择轴。"
+  },
+  "ar": {
+    "forms.selection_frame.current_cad": "تتطلب محاور التحديد معاينة CAD الحالية.",
+    "forms.selection_frame.single_element": "اختر وجهًا أو حافة أو نقطة لضبط محاور التحديد.",
+    "forms.selection_frame.unavailable": "لا يمكن تعيين محاور تحديد واضحة لهذا العنصر."
+  },
+  "he": {
+    "forms.selection_frame.current_cad": "צירי הבחירה דורשים את תצוגת ה־CAD המקדימה העדכנית.",
+    "forms.selection_frame.single_element": "יש לבחור פאה, קצה או נקודה כדי לקבוע את צירי הבחירה.",
+    "forms.selection_frame.unavailable": "לא ניתן לקבוע צירי בחירה חד־משמעיים לרכיב זה."
+  },
+  "vi": {
+    "forms.selection_frame.current_cad": "Để xác định các trục vùng chọn, cần bản xem trước CAD hiện tại.",
+    "forms.selection_frame.single_element": "Chọn một mặt, cạnh hoặc điểm để xác định các trục vùng chọn.",
+    "forms.selection_frame.unavailable": "Không thể xác định duy nhất các trục vùng chọn cho phần tử này."
   }
 }

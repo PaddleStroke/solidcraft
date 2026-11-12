@@ -28,5 +28,23 @@
     "forms.translation_snap.help": "沿当前轴或平面，从拖动起点按增量的整数倍移动。在软选择之前应用，也适用于 Shift 拉伸。Ctrl/Cmd 暂时关闭吸附；若现有操纵器设置允许，Alt 也可关闭。旋转、缩放和数值变换保留各自设置。",
     "forms.translation_snap.increment": "移动增量",
     "forms.translation_snap.invalid": "请输入 0.000001 mm 到 100000 mm 之间的有限移动增量。移动量和约束坐标系也必须为有限值。"
+  },
+  "ar": {
+    "forms.translation_snap.enabled": "التقاط الإزاحة",
+    "forms.translation_snap.help": "حرّك بمضاعفات خطوة الالتقاط بدءًا من موضع بدء السحب وعلى طول المحور أو المستوى النشط. يُطبَّق الالتقاط قبل التحديد الناعم ويشمل البثق باستخدام Shift. اضغط Ctrl/Cmd لتجاوز الالتقاط. ويمكن تجاوزه باستخدام Alt أيضًا إذا كان مفعّلًا في إعداد أداة التحكّم الحالي. يحتفظ التدوير وتغيير المقياس والتحويلات الرقمية بإعداداتها الخاصة.",
+    "forms.translation_snap.increment": "خطوة الالتقاط",
+    "forms.translation_snap.invalid": "أدخل خطوة إزاحة محدودة بين 0.000001 مم و100000 مم. يجب أن تكون قيم الحركة والإطار المرجعي للقيود محدودة أيضًا."
+  },
+  "he": {
+    "forms.translation_snap.enabled": "הצמדת הזזות",
+    "forms.translation_snap.help": "ההזזה מתבצעת בכפולות של המרווח מנקודת תחילת הגרירה, לאורך הציר הפעיל או על המישור הפעיל. ההצמדה חלה לפני בחירה רכה וגם בשליפה עם Shift. Ctrl או Cmd עוקפים את ההצמדה. Alt עוקף אותה כשהאפשרות המתאימה מופעלת בהגדרות כלי המניפולציה. לסיבוב, לקנה מידה ולשינויים מספריים נשארות הגדרות נפרדות.",
+    "forms.translation_snap.increment": "מרווח הצמדה",
+    "forms.translation_snap.invalid": "יש להזין מרווח הצמדה סופי בין 0.000001 מ״מ ל־100000 מ״מ. גם התנועה ומסגרת האילוצים חייבות להיות סופיות."
+  },
+  "vi": {
+    "forms.translation_snap.enabled": "Bắt bước tịnh tiến",
+    "forms.translation_snap.help": "Di chuyển theo bội số của bước dịch chuyển tính từ điểm bắt đầu kéo, dọc theo trục hoặc mặt phẳng đang dùng. Áp dụng trước chế độ chọn mềm và cả khi giữ Shift để đùn. Giữ Ctrl/Cmd để tạm bỏ bắt bước. Alt cũng có tác dụng nếu đã bật tùy chọn tương ứng của bộ điều khiển. Xoay, đổi tỷ lệ và biến đổi bằng số vẫn dùng thiết lập riêng.",
+    "forms.translation_snap.increment": "Bước dịch chuyển",
+    "forms.translation_snap.invalid": "Nhập bước dịch chuyển hữu hạn trong khoảng từ 0,000001 mm đến 100000 mm. Độ dịch chuyển và hệ trục ràng buộc cũng phải hữu hạn."
   }
 }

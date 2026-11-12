@@ -28,5 +28,23 @@
     "forms.fill.refined_unavailable": "在局部细分形状上填补孔洞时，形状不得含有匹配、拉伸或修剪壁。",
     "forms.fill.restore_material": "恢复删除面时移除的曲面及其雕塑形状。",
     "forms.fill.select_rim": "选择开口边界上的边或点。"
+  },
+  "ar": {
+    "forms.fill.desktop_required": "يتطلب ملء الفتحات في الأشكال المُنقَّحة تطبيق سطح المكتب.",
+    "forms.fill.refined_unavailable": "يتطلب «ملء الفتحة» في شكل مُنقَّح شكلًا بلا مطابقة حدود أو بثق أو جدار قصّ.",
+    "forms.fill.restore_material": "يستعيد السطح الذي أُزيل بحذف الأوجه، بما في ذلك شكله المنحوت.",
+    "forms.fill.select_rim": "حدّد حافة أو نقطة على محيط فتحة."
+  },
+  "he": {
+    "forms.fill.desktop_required": "מילוי חורים בצורות חופשיות שעברו עידון דורש את יישום שולחן העבודה.",
+    "forms.fill.refined_unavailable": "מילוי חור בצורה שעברה עידון דורש צורה חופשית ללא התאמת גבול, שליפה או דופן גזומה.",
+    "forms.fill.restore_material": "שחזור המשטח שהוסר במחיקת הפאות, כולל צורתו לאחר העיצוב.",
+    "forms.fill.select_rim": "יש לבחור קצה או נקודה בשפת פתח."
+  },
+  "vi": {
+    "forms.fill.desktop_required": "Lấp lỗ trên hình đã chia nhỏ cần ứng dụng máy tính.",
+    "forms.fill.refined_unavailable": "Để lấp lỗ, hình đã chia nhỏ không được có khớp biên, phần đùn hoặc thành cắt xén.",
+    "forms.fill.restore_material": "Khôi phục bề mặt đã bị loại bỏ khi xóa mặt, kể cả các chi tiết tạo dáng.",
+    "forms.fill.select_rim": "Chọn một cạnh hoặc điểm trên vành của lỗ hở."
   }
 }

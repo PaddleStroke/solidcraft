@@ -18,5 +18,17 @@
   "zh": {
     "cmd.form.refined_weld": "焊接细分造型",
     "cmd.form.refined_weld.remove": "移除细分造型焊接"
+  },
+  "ar": {
+    "cmd.form.refined_weld": "دمج الأشكال المُنقَّحة",
+    "cmd.form.refined_weld.remove": "إزالة دمج الأشكال المُنقَّحة"
+  },
+  "he": {
+    "cmd.form.refined_weld": "איחוי צורות חופשיות שעברו עידון",
+    "cmd.form.refined_weld.remove": "הסרת איחוי של צורות חופשיות שעברו עידון"
+  },
+  "vi": {
+    "cmd.form.refined_weld": "Hàn các hình đã chia nhỏ",
+    "cmd.form.refined_weld.remove": "Xóa mối hàn giữa các hình đã chia nhỏ"
   }
 }

@@ -28,5 +28,23 @@
     "forms.prototype.reattach_before_tool": "使用此工具前，请先重新关联形状的参照。",
     "forms.prototype.select_boundary_edges_for_tool": "请选择一条或多条自由边界边。",
     "forms.prototype.select_faces_for_tool": "请选择一个或多个形状面以使用此工具。"
+  },
+  "ar": {
+    "forms.prototype.active_form_required": "ابدأ إنشاء شكل قبل استخدام هذه الأداة.",
+    "forms.prototype.reattach_before_tool": "أعد ربط دعامة الشكل قبل استخدام هذه الأداة.",
+    "forms.prototype.select_boundary_edges_for_tool": "حدّد حافة حدودية حرة واحدة أو أكثر.",
+    "forms.prototype.select_faces_for_tool": "حدّد وجهًا واحدًا أو أكثر من الشكل لاستخدام هذه الأداة."
+  },
+  "he": {
+    "forms.prototype.active_form_required": "יש לפתוח צורה חופשית לפני השימוש בכלי זה.",
+    "forms.prototype.reattach_before_tool": "יש לחבר מחדש את תמיכת הצורה החופשית לפני השימוש בכלי זה.",
+    "forms.prototype.select_boundary_edges_for_tool": "יש לבחור קצה גבול חופשי אחד או יותר.",
+    "forms.prototype.select_faces_for_tool": "יש לבחור פאה אחת או יותר של הצורה החופשית כדי להשתמש בכלי זה."
+  },
+  "vi": {
+    "forms.prototype.active_form_required": "Bắt đầu tạo hoặc chỉnh sửa một hình trước khi dùng công cụ này.",
+    "forms.prototype.reattach_before_tool": "Gắn lại hình học đỡ của hình trước khi dùng công cụ này.",
+    "forms.prototype.select_boundary_edges_for_tool": "Chọn một hoặc nhiều cạnh biên tự do.",
+    "forms.prototype.select_faces_for_tool": "Chọn một hoặc nhiều mặt của hình để dùng công cụ này."
   }
 }

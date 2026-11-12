@@ -48,5 +48,35 @@
     "forms.face_pick.worker_stopped": "CAD 选面已停止。请重试。",
     "prefs.forms_exact_face_picking": "使用精确 CAD 选面",
     "prefs.forms_exact_face_picking_help": "在桌面应用中，可在拟合的 CAD 曲面上选择形态面并插入边。遇到修剪边界或重叠面时，可能需要改点其他位置。"
+  },
+  "ar": {
+    "forms.face_pick.context_missing_cad": "يتطلب اختيار الوجه بدقة هندسة CAD في المشهد المحيط. أخفِ الأجسام الشبكية وأعد المحاولة.",
+    "forms.face_pick.insert_face_required": "اختر وجهًا في الشكل يحتوي على خلايا قابلة للتحرير.",
+    "forms.face_pick.limit": "تجاوز اختيار وجه CAD حدّ المعالجة.",
+    "forms.face_pick.not_ready": "انتظر ظهور معاينة CAD الحالية قبل اختيار وجه.",
+    "forms.face_pick.unresolved": "تعذّر تحديد وجه CAD الأقرب في اتجاه الرؤية. جرّب نقطة أخرى.",
+    "forms.face_pick.worker_stopped": "توقّف اختيار وجه CAD. أعد المحاولة.",
+    "prefs.forms_exact_face_picking": "استخدام الاختيار الدقيق لأوجه CAD",
+    "prefs.forms_exact_face_picking_help": "في تطبيق سطح المكتب، اختر أوجه الشكل وأدرج الحواف على سطح CAD الملائَم. قد تحتاج إلى النقر في نقطة أخرى عند الحدود المقصوصة أو الأوجه المتداخلة."
+  },
+  "he": {
+    "forms.face_pick.context_missing_cad": "בחירה מדויקת של פאות דורשת סביבת CAD. יש להסתיר גופי רשת ולנסות שוב.",
+    "forms.face_pick.insert_face_required": "יש לבחור פאה של צורה חופשית שיש בה תאים הניתנים לעריכה.",
+    "forms.face_pick.limit": "בחירת פאת ה־CAD חרגה ממגבלת החישוב.",
+    "forms.face_pick.not_ready": "יש להמתין לתצוגה המקדימה העדכנית של ה־CAD לפני בחירת פאה.",
+    "forms.face_pick.unresolved": "לא ניתן היה לזהות את פאת ה־CAD הקדמית ביותר. יש לנסות נקודה אחרת.",
+    "forms.face_pick.worker_stopped": "בחירת פאת ה־CAD הופסקה. יש לנסות שוב.",
+    "prefs.forms_exact_face_picking": "בחירה מדויקת של פאות CAD",
+    "prefs.forms_exact_face_picking_help": "ביישום שולחן העבודה אפשר לבחור פאות של צורה חופשית ולהוסיף קצוות על משטח ה־CAD המותאם. ליד גבולות גזומים או פאות חופפות ייתכן שיהיה צורך ללחוץ בנקודה אחרת."
+  },
+  "vi": {
+    "forms.face_pick.context_missing_cad": "Chọn mặt chính xác cần hình học CAD xung quanh. Hãy ẩn các khối lưới rồi thử lại.",
+    "forms.face_pick.insert_face_required": "Chọn một mặt của hình có các ô chỉnh sửa được.",
+    "forms.face_pick.limit": "Thao tác chọn mặt CAD đã vượt quá giới hạn tính toán.",
+    "forms.face_pick.not_ready": "Chờ bản xem trước CAD hiện tại sẵn sàng rồi chọn mặt.",
+    "forms.face_pick.unresolved": "Không xác định được mặt CAD ngoài cùng theo hướng nhìn. Hãy thử bấm ở vị trí khác.",
+    "forms.face_pick.worker_stopped": "Thao tác chọn mặt CAD đã dừng. Hãy thử lại.",
+    "prefs.forms_exact_face_picking": "Chọn mặt CAD chính xác",
+    "prefs.forms_exact_face_picking_help": "Trong ứng dụng máy tính, chọn mặt của hình và chèn cạnh trên bề mặt CAD đã khớp. Với một số đường cắt xén hoặc mặt chồng nhau, có thể cần bấm ở vị trí khác."
   }
 }

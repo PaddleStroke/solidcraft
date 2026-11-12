@@ -53,5 +53,38 @@
     "forms.prototype.region_waiting": "正在等待上一次选择完成…",
     "forms.prototype.region_worker_lost": "形状选择任务在返回结果前已停止。",
     "prefs.forms_region_selection": "使用框选或套索选择形状元素"
+  },
+  "ar": {
+    "forms.prototype.region_browser_unavailable": "تحديد المناطق غير متاح في المتصفح بعد. استخدم تطبيق سطح المكتب.",
+    "forms.prototype.region_busy": "جارٍ تحديد عناصر الشكل…",
+    "forms.prototype.region_failed": "تعذّر تحديد منطقة من الشكل: {error}",
+    "forms.prototype.region_help": "اسحب في مساحة فارغة للتحديد. استخدم Shift للإضافة وCtrl+Shift لتبديل حالة التحديد. يحدّد السحب من اليسار إلى اليمين العناصر الواقعة بالكامل داخل المنطقة، ومن اليمين إلى اليسار العناصر التي تلامسها. اختر التحديد الحر في خيارات التحديد لرسم منطقة حرّة. تعمل اختصارات التنقّل كالمعتاد. يجري التحديد في الخلفية، ويمكن إلغاؤه بالضغط على Esc.",
+    "forms.prototype.region_invalid": "لم تعد نتيجة تحديد الشكل صالحة. أعد المحاولة.",
+    "forms.prototype.region_limit": "محيط التحديد طويل جدًا. ارسم محيطًا حرًا أقصر.",
+    "forms.prototype.region_waiting": "بانتظار انتهاء التحديد السابق…",
+    "forms.prototype.region_worker_lost": "توقّفت مهمة تحديد الشكل قبل إرجاع نتيجة.",
+    "prefs.forms_region_selection": "تحديد عناصر الشكل بمستطيل أو برسم حر"
+  },
+  "he": {
+    "forms.prototype.region_browser_unavailable": "בחירת אזור עדיין אינה זמינה בדפדפן. יש להשתמש ביישום שולחן העבודה.",
+    "forms.prototype.region_busy": "מתבצעת בחירה של רכיבי הצורה החופשית…",
+    "forms.prototype.region_failed": "לא ניתן לבחור אזור בצורה החופשית: {error}",
+    "forms.prototype.region_help": "לבחירה יש לגרור בשטח ריק. Shift מוסיף לבחירה, ו־Ctrl+Shift מחליף את מצב הבחירה. גרירה משמאל לימין בוחרת רכיבים שנמצאים במלואם באזור, וגרירה מימין לשמאל בוחרת גם רכיבים שנוגעים בו. אפשרות לאסו מציירת אזור בחירה חופשי. קיצורי הניווט נשארים כרגיל. הבחירה מתבצעת ברקע וניתן לבטלה באמצעות Escape.",
+    "forms.prototype.region_invalid": "תוצאת בחירת הרכיבים כבר אינה תקפה. יש לנסות שוב.",
+    "forms.prototype.region_limit": "מתאר הבחירה ארוך מדי. יש לצייר מתאר לאסו קצר יותר.",
+    "forms.prototype.region_waiting": "ממתין לסיום הבחירה הקודמת…",
+    "forms.prototype.region_worker_lost": "תהליך הבחירה של רכיבי הצורה החופשית הופסק לפני שהתקבלה תוצאה.",
+    "prefs.forms_region_selection": "בחירת רכיבי צורה חופשית באמצעות מלבן או לאסו"
+  },
+  "vi": {
+    "forms.prototype.region_browser_unavailable": "Trình duyệt chưa hỗ trợ chọn theo vùng. Hãy dùng ứng dụng máy tính.",
+    "forms.prototype.region_busy": "Đang chọn phần tử của hình…",
+    "forms.prototype.region_failed": "Không thể chọn vùng trên hình: {error}",
+    "forms.prototype.region_help": "Kéo trên vùng trống để chọn. Giữ Shift để thêm vào vùng chọn, hoặc Ctrl+Shift để chọn hay bỏ chọn từng phần tử. Kéo từ trái sang phải để chọn các phần tử nằm hoàn toàn bên trong. Kéo từ phải sang trái để chọn cả các phần tử chạm vùng chọn. Dùng dây chọn trong tùy chọn chọn để vẽ vùng tự do. Các phím tắt điều hướng vẫn hoạt động như thường lệ. Quá trình chọn chạy trong nền. Nhấn Escape để hủy.",
+    "forms.prototype.region_invalid": "Kết quả chọn trên hình không còn hợp lệ. Hãy thử lại.",
+    "forms.prototype.region_limit": "Đường bao vùng chọn quá dài. Hãy vẽ vùng chọn ngắn hơn bằng dây chọn.",
+    "forms.prototype.region_waiting": "Đang chờ lần chọn trước hoàn tất…",
+    "forms.prototype.region_worker_lost": "Tác vụ chọn trên hình đã dừng trước khi trả về kết quả.",
+    "prefs.forms_region_selection": "Chọn phần tử của hình bằng khung chữ nhật hoặc dây chọn"
   }
 }

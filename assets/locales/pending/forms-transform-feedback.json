@@ -53,5 +53,38 @@
     "forms.feedback.soft": "{value} · 软选择",
     "prefs.forms_drag_feedback": "拖动时显示形状变换请求",
     "prefs.forms_drag_feedback_help": "按手势坐标轴显示提交的吸附移动距离、角度或缩放比例。约束和软选择可能改变各点的运动。已接受的请求不表示测量到的形状位移。关闭后恢复原来的显示。"
+  },
+  "ar": {
+    "forms.feedback.accepted": "قُبل الطلب · {value}",
+    "forms.feedback.fitting": "قُبل الطلب · {value} · معاينة CAD قيد الانتظار",
+    "forms.feedback.move": "تحريك {distance} · X ‏{x}، Y ‏{y}، Z ‏{z}",
+    "forms.feedback.requested": "الطلب · {value}",
+    "forms.feedback.rotate": "تدوير حول {axis}: ‏{angle}",
+    "forms.feedback.scale": "تغيير المقياس · X ‏{x}×، Y ‏{y}×، Z ‏{z}×",
+    "forms.feedback.soft": "{value} · تحديد ناعم",
+    "prefs.forms_drag_feedback": "عرض طلبات تحويل الشكل أثناء السحب",
+    "prefs.forms_drag_feedback_help": "يعرض الإزاحة أو الزاوية أو المقياس بعد الالتقاط كما أُرسل ضمن محاور السحب. قد تغيّر القيود والتحديد الناعم حركة كل نقطة. القيم المقبولة تمثّل الطلبات، وقد تختلف عن الحركة المقاسة للشكل. أوقف الخيار لاستعادة العرض السابق."
+  },
+  "he": {
+    "forms.feedback.accepted": "הבקשה התקבלה · {value}",
+    "forms.feedback.fitting": "הבקשה התקבלה · {value} · בהמתנה לתצוגת CAD מקדימה",
+    "forms.feedback.move": "הזזה {distance} · X {x}, Y {y}, Z {z}",
+    "forms.feedback.requested": "בקשה · {value}",
+    "forms.feedback.rotate": "סיבוב סביב {axis}: {angle}",
+    "forms.feedback.scale": "שינוי קנה מידה · X {x}×, Y {y}×, Z {z}×",
+    "forms.feedback.soft": "{value} · בחירה רכה",
+    "prefs.forms_drag_feedback": "הצגת בקשות לשינוי צורה חופשית במהלך גרירה",
+    "prefs.forms_drag_feedback_help": "הצגת ההזזה, הזווית או קנה המידה שנשלחו לאחר הצמדה, ביחס לצירי הגרירה. אילוצים ובחירה רכה עשויים לשנות את תנועתה של כל נקודה. בקשות שהתקבלו אינן מדידה של תנועת הצורה בפועל. כיבוי ההגדרה מחזיר את התצוגה הקודמת."
+  },
+  "vi": {
+    "forms.feedback.accepted": "Đã chấp nhận yêu cầu · {value}",
+    "forms.feedback.fitting": "Đã chấp nhận yêu cầu · {value} · Đang chờ bản xem trước CAD",
+    "forms.feedback.move": "Di chuyển {distance} · X {x}, Y {y}, Z {z}",
+    "forms.feedback.requested": "Yêu cầu · {value}",
+    "forms.feedback.rotate": "Xoay quanh {axis}: {angle}",
+    "forms.feedback.scale": "Đổi tỷ lệ · X {x}×, Y {y}×, Z {z}×",
+    "forms.feedback.soft": "{value} · Chọn mềm",
+    "prefs.forms_drag_feedback": "Hiện yêu cầu biến đổi hình khi kéo",
+    "prefs.forms_drag_feedback_help": "Hiện lượng dịch chuyển đã bắt bước, góc xoay hoặc tỷ lệ gửi đi theo các trục thao tác. Ràng buộc và chế độ chọn mềm có thể thay đổi chuyển động của từng điểm. Giá trị của yêu cầu đã được chấp nhận không phải là chuyển động đo được của hình. Tắt để khôi phục cách hiển thị trước đó."
   }
 }

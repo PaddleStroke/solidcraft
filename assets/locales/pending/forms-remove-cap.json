@@ -23,5 +23,20 @@
     "forms.fill.cap_delete_desktop": "移除封盖需要使用桌面应用。",
     "forms.fill.retired_cap_bridge": "桥接会替换已移除封盖所保留的面 ID。",
     "forms.fill.select_cap_only": "若要删除封盖，请只选择封盖面。"
+  },
+  "ar": {
+    "forms.fill.cap_delete_desktop": "تتطلب إزالة رقعة إغلاق تطبيق سطح المكتب.",
+    "forms.fill.retired_cap_bridge": "قد تستبدل أداة التجسير معرّفات الأوجه المحفوظة لرقع الإغلاق المُزالة.",
+    "forms.fill.select_cap_only": "حدّد وجه رقعة الإغلاق وحده لحذفه."
+  },
+  "he": {
+    "forms.fill.cap_delete_desktop": "הסרת מכסה דורשת את יישום שולחן העבודה.",
+    "forms.fill.retired_cap_bridge": "גישור יחליף את מזהי הפאות השמורים של מכסים שהוסרו.",
+    "forms.fill.select_cap_only": "יש לבחור רק את פאת המכסה כדי למחוק אותו."
+  },
+  "vi": {
+    "forms.fill.cap_delete_desktop": "Xóa mặt bịt cần ứng dụng máy tính.",
+    "forms.fill.retired_cap_bridge": "Nối cầu sẽ thay thế các ID mặt đã lưu của những mặt bịt đã xóa.",
+    "forms.fill.select_cap_only": "Chỉ chọn mặt bịt cần xóa."
   }
 }
