@@ -148,6 +148,7 @@ use crate::geom::tol::{
 };
 use crate::geom::vector3d::{Point3, Vec3};
 use crate::kernel::Kernel;
+use crate::math::det;
 use crate::math::{
     max2, min2, rad_to_deg, BIG_DOUBLE, EFF_ZERO, EFF_ZERO_DEG, EFF_ZERO_SQ, EFF_ZERO_SQRT, PI,
     TWO_PI,
@@ -155,6 +156,33 @@ use crate::math::{
 use crate::nurbs::b_spline_curve::{BSplineCurve, BSplineCurveForm};
 use crate::nurbs::b_spline_surface::p1::SurfParamType;
 use crate::nurbs::math::NOW;
+
+/// Only a private query Kernel has an owner; source-frame observers do not.
+pub(super) fn charge_query(k: &Kernel, amount: Option<u64>, operation: &'static str) -> Result<()> {
+    crate::nurbs::crv_basic::charge_conic_work(k.context.proof_work(), amount, operation)
+}
+
+fn charge_compact_source(
+    k: &Kernel,
+    source: Option<&crate::nurbs::crv_basic::Curve>,
+    operation: &'static str,
+) -> Result<()> {
+    if let Some(work) = k.context.proof_work() {
+        // EXACT native-copy half: compact32N+8K, wrapper120 and N+K events.
+        let cost = match source {
+            Some(source) => u64::try_from(source.cpts().len())
+                .ok()
+                .and_then(|n| n.checked_mul(33))
+                .and_then(|n| {
+                    n.checked_add(u64::try_from(source.knots().len()).ok()?.checked_mul(9)?)
+                })
+                .and_then(|n| n.checked_add(120)),
+            None => Some(0),
+        };
+        crate::nurbs::crv_basic::charge_conic_work(Some(work), cost, operation)?;
+    }
+    Ok(())
+}
 
 const OP_SET_UP: &str = "curve::ellipse::p2::Ellipse::set_up_polar_conversion";
 
@@ -613,9 +641,9 @@ impl PolarConversion {
         let angle_rad = (angle_deg - start_angle_deg) * PI / 180.0;
 
         // get coefficients of quadratic equation
-        let cos_angle = angle_rad.cos();
-        let cos_theta = theta.cos();
-        let a = 2.0 * cos_angle * (1.0 - cos_theta) - 1.0 + 2.0 * cos_theta - (2.0 * theta).cos();
+        let cos_angle = det::cos(angle_rad);
+        let cos_theta = det::cos(theta);
+        let a = 2.0 * cos_angle * (1.0 - cos_theta) - 1.0 + 2.0 * cos_theta - det::cos(2.0 * theta);
         let b = 2.0 * cos_angle * (-1.0 + cos_theta) + 2.0 - 2.0 * cos_theta;
         let c = cos_angle - 1.0;
 
@@ -691,13 +719,10 @@ impl PolarConversion {
         zone_tol: f64,
     ) -> Result<Option<f64>> {
         let mut written = None;
-        match self.convert_to_nurbs_parameter_into(
-            k,
-            curve,
-            polar_param_deg,
-            zone_tol,
-            &mut written,
-        ) {
+        let result =
+            self.convert_to_nurbs_parameter_into(k, curve, polar_param_deg, zone_tol, &mut written);
+        charge_query(k, Some(0), OP_TO_NURBS)?;
+        match result {
             Ok((t, _)) => Ok(Some(t)),
             Err(e) if e.is_unported_or_cancelled() => Err(e),
             Err(_) => Ok(written),
@@ -714,6 +739,7 @@ impl PolarConversion {
         _zone_tol: f64,
         written: &mut Option<f64>,
     ) -> Result<(f64, bool)> {
+        charge_query(k, Some(64), OP_TO_NURBS)?;
         if !self.has_curve {
             return Err(SolidError::InvalidInput {
                 operation: OP_TO_NURBS,
@@ -771,6 +797,7 @@ impl PolarConversion {
             } else {
                 // for every arc interval
                 for ii in 1..self.angles.len() {
+                    charge_query(k, Some(1), OP_TO_NURBS)?;
                     let angle = table(&self.angles, ii, OP_TO_NURBS)?;
 
                     // check interval other bound
@@ -784,6 +811,7 @@ impl PolarConversion {
                     if (!inside_out && polar_deg <= angle) || (inside_out && polar_deg >= angle) {
                         // Try cheap exact conversion when possible (the span's control
                         // points are 2 ii - 2 to 2 ii, the knots inside being double)
+                        charge_query(k, Some(32), OP_TO_NURBS)?;
                         nurbs_guess = Self::angle_param_to_nurb_param(
                             table(&self.natural_knots, ii - 1, OP_TO_NURBS)?,
                             table(&self.natural_knots, ii, OP_TO_NURBS)?,
@@ -801,7 +829,9 @@ impl PolarConversion {
 
         // for tolerance purposes - always refine the current guess with a NewtonRaphson
         // solution: get Target 3DPoint and see if current guess is good enough
+        charge_query(k, Some(48 + 16), OP_TO_NURBS)?;
         let step_pnt = curve.step_point(polar_deg);
+        curve.base.charge_query_point(k, OP_TO_NURBS)?;
         let nurb_pnt = curve.base.evaluate_point(nurbs_guess)?;
         let dist = (nurb_pnt - step_pnt).length();
 
@@ -841,6 +871,7 @@ impl PolarConversion {
             }
             param
         };
+        charge_query(k, Some(0), OP_TO_NURBS)?;
         *written = Some(nurbs_param);
         Ok((nurbs_param, true))
     }
@@ -1029,6 +1060,7 @@ impl Ellipse {
         if let Some(nurb) = opts.nurb {
             // copy and save the gw_CURVE
             let stat = e.set_from_gw_nurb(k, nurb.gw_nurb());
+            charge_query(k, Some(0), OP_SET_UP)?;
 
             // If problems there, call MakeNurb().
             if stat.is_ok() && e.polar.is_polar_conversion_possible() {
@@ -1038,9 +1070,11 @@ impl Ellipse {
 
         if call_make_nurb {
             ignore_status(e.make_nurb(k))?;
+            charge_query(k, Some(0), OP_SET_UP)?;
         }
 
         // set form factor
+        charge_query(k, Some(0), OP_SET_UP)?;
         e.base.form = BSplineCurveForm::EllipticArc;
         Ok(e)
     }
@@ -1052,13 +1086,16 @@ impl Ellipse {
         k: &Kernel,
         gw_nurb: Option<&crate::nurbs::crv_basic::Curve>,
     ) -> Result<()> {
+        charge_compact_source(k, gw_nurb, OP_SET_UP)?;
         self.base.set_from_gw_nurb(gw_nurb)?;
         self.notify_post_edit(k)
     }
 
     /// `Notify(SM_NO_POST_EDIT, ..)`: recompute the polar converter (status ignored).
     pub(crate) fn notify_post_edit(&mut self, k: &Kernel) -> Result<()> {
-        ignore_status(self.set_up_polar_conversion(k))
+        let result = ignore_status(self.set_up_polar_conversion(k));
+        charge_query(k, Some(0), OP_SET_UP)?;
+        result
     }
 
     // ---- access -----------------------------------------------------------------------
@@ -1369,8 +1406,8 @@ impl Ellipse {
 
         // get input in radians
         let angle_rad = t * PI / 180.0;
-        let cos_u = angle_rad.cos();
-        let sin_u = angle_rad.sin();
+        let cos_u = det::cos(angle_rad);
+        let sin_u = det::sin(angle_rad);
         let o = self.position.origin();
         let x = self.position.x_axis();
         let y = self.position.y_axis();
@@ -1427,7 +1464,7 @@ impl Ellipse {
         // get dAngleParam in radians [-Pi, +Pi]
         let mut angle_param = 0.0;
         if self.radius_y != 0.0 {
-            angle_param = (self.radius_x / self.radius_y * dy).atan2(dx);
+            angle_param = det::atan2(self.radius_x / self.radius_y * dy, dx);
         }
 
         // convert to degrees, in [ 0, 360 ) strictly positive result [B630]
@@ -1456,8 +1493,8 @@ impl Ellipse {
 
         // Calculate end point on Ellipse
         let angle_rad = self.anal_domain.max() * PI / 180.0;
-        let cos_u = angle_rad.cos();
-        let sin_u = angle_rad.sin();
+        let cos_u = det::cos(angle_rad);
+        let sin_u = det::sin(angle_rad);
         let end = self.position.origin()
             + self.radius_x * cos_u * self.position.x_axis()
             + self.radius_y * sin_u * self.position.y_axis();
@@ -1568,6 +1605,7 @@ impl Ellipse {
     ) -> Result<Vec<Solution<O>>> {
         // init outputs
         let mut solutions = Vec::new();
+        let mut solution_capacity = 0;
 
         // no work - no polar conversion
         if !self.polar.is_polar_conversion_possible() {
@@ -1601,6 +1639,7 @@ impl Ellipse {
 
         // get angle of TestPoint in ellipse coordinate system as a side effect of
         // rotating TestPoint about ellipse's Z-Axis to the X/Z Plane
+        charge_query(k, Some(40 + 16), OP_DROP)?;
         let sp = self.transform_point_to_start_plane(test_point, tol, false)?;
         let mut num_angles = sp.num_angles;
         let mut angles_deg = [
@@ -1632,6 +1671,7 @@ impl Ellipse {
         }
 
         // initialize solution object
+        charge_query(k, Some(512 + 64), OP_DROP)?;
         let mut sol = Solution::new();
         sol.solution_type = SolutionType::SingleValue;
         sol.num_objects = 1;
@@ -1647,6 +1687,7 @@ impl Ellipse {
 
         // For every angle, convert the angle to curve parameter and set up the Solutions.
         for (angle, dist) in angles_deg.iter().zip(dists.iter_mut()).take(num_angles) {
+            charge_query(k, Some(16), OP_DROP)?;
             // clamp angle to full curve analytic extent - so convert angle will work
             let clamped_angle = if num_angles == 1 {
                 self.anal_domain
@@ -1665,6 +1706,7 @@ impl Ellipse {
 
             // when the conversion is not exact
             if !exact {
+                charge_query(k, Some(48 + 16), OP_DROP)?;
                 let pnt = self.step_point(clamped_angle);
 
                 // refine parameter value with NewtonRaphson iteration
@@ -1676,6 +1718,7 @@ impl Ellipse {
 
             // reclamp point and get 3DPoint
             t = interval.clamp_value(t);
+            self.base.charge_query_point(k, OP_DROP)?;
             let pnt = self.base.evaluate_point(t)?;
 
             // get testPoint/ProjectedPoint gap
@@ -1692,11 +1735,20 @@ impl Ellipse {
             // save the solution
             sol.start.solution_value = *dist;
             sol.start.parameters[0] = t;
+            curve_base::proof_vec_capacity(
+                k.context.proof_work(),
+                &mut solutions,
+                &mut solution_capacity,
+                1,
+                512,
+                OP_DROP,
+            )?;
             solutions.push(sol);
         }
 
         // Chose the value to use when only one solution is requested
         if requested == SolutionRequested::Single && solutions.len() > 1 {
+            charge_query(k, Some(512 + 8), OP_DROP)?;
             // Note: if the two values are equal, use the first.
             if dists[1] < dists[0] {
                 solutions.remove(0);
@@ -1704,6 +1756,7 @@ impl Ellipse {
                 solutions.truncate(1);
             }
         }
+        charge_query(k, Some(0), OP_DROP)?;
         Ok(solutions)
     }
 
@@ -2497,6 +2550,7 @@ pub(crate) fn set_up_polar_conversion(
     e: &mut Ellipse,
     k: &Kernel,
 ) -> Result<()> {
+    charge_query(k, Some(64), OP_SET_UP)?;
     // init state
     pc.possible = false;
 
@@ -2511,6 +2565,15 @@ pub(crate) fn set_up_polar_conversion(
             OP_SET_UP,
             CurveFailure::EllipseWithoutNurb,
         ));
+    }
+    if let Some(work) = k.context.proof_work() {
+        let count = e.base.nurb.as_ref().map_or(0, |n| n.knots().len());
+        // Two output Vec growth/copy envelopes and actual knot scans.
+        let cost = u64::try_from(count)
+            .ok()
+            .and_then(|n| n.checked_mul(98))
+            .and_then(|n| n.checked_add(432));
+        crate::nurbs::crv_basic::charge_conic_work(Some(work), cost, OP_SET_UP)?;
     }
     let (knots, multiplicities) = e.base.knots(None)?;
     pc.natural_knots = knots;
@@ -2527,6 +2590,7 @@ pub(crate) fn set_up_polar_conversion(
 
     // no work - internal knots not double - no conversion possible
     for m in multiplicities.iter().take(cnt.saturating_sub(1)).skip(1) {
+        charge_query(k, Some(1), OP_SET_UP)?;
         if *m != 2 {
             return Ok(());
         }
@@ -2542,6 +2606,7 @@ pub(crate) fn set_up_polar_conversion(
     let mut anal_ivl = e.step_interval();
 
     if anal_ivl.length() < 360.0 - EFF_ZERO {
+        charge_query(k, Some(64), OP_SET_UP)?;
         let idx = if inside_out { cnt.saturating_sub(1) } else { 0 };
         let lowest_angle_param = table(&pc.natural_knots, idx, OP_SET_UP)?;
         let idx = if inside_out { 0 } else { cnt.saturating_sub(1) };
@@ -2552,7 +2617,9 @@ pub(crate) fn set_up_polar_conversion(
         e.set_step_interval(Extent1d::from_min_max(0.0, 360.0));
 
         // Get Polar angle about ZAxis from XAxis in degrees.
+        e.base.charge_query_point(k, OP_SET_UP)?;
         let pnt1 = e.base.evaluate_point(lowest_angle_param)?;
+        e.base.charge_query_point(k, OP_SET_UP)?;
         let pnt2 = e.base.evaluate_point(highest_angle_param)?;
 
         // WR-719 (the fork's cbeb14b): STEPInversion() on the full
@@ -2564,13 +2631,17 @@ pub(crate) fn set_up_polar_conversion(
         // angles, as STEPInversion() computes them before that rule.
         let (mut lowest_deg, mut highest_deg);
         if is_closed_base(k, &e.base, &e.base.natural_interval(), 0.0)? {
+            charge_query(k, Some(32), OP_SET_UP)?;
             lowest_deg = e.step_inversion(k, pnt1, false, 0.0).0;
+            charge_query(k, Some(32), OP_SET_UP)?;
             highest_deg = e.step_inversion(k, pnt2, false, 0.0).0;
         } else {
             let own_angle = |pnt: Point3| {
                 let vec = pnt - e.position.origin();
-                let mut angle = (e.radius_x / e.radius_y * vec.dot(e.position.y_axis()))
-                    .atan2(vec.dot(e.position.x_axis()));
+                let mut angle = det::atan2(
+                    e.radius_x / e.radius_y * vec.dot(e.position.y_axis()),
+                    vec.dot(e.position.x_axis()),
+                );
                 if angle < 0.0 {
                     angle += TWO_PI;
                 }
@@ -2598,6 +2669,10 @@ pub(crate) fn set_up_polar_conversion(
         };
         let mut shifts = 0usize;
         while this_mid > input_mid + 180.0 + EFF_ZERO {
+            if let Err(error) = charge_query(k, Some(8), OP_SET_UP) {
+                e.set_step_interval(anal_ivl);
+                return Err(error);
+            }
             let next_mid = this_mid - 360.0;
             shifts += 1;
             if next_mid == this_mid || shifts > MAX_PERIOD_SHIFTS {
@@ -2609,6 +2684,10 @@ pub(crate) fn set_up_polar_conversion(
             this_mid = next_mid;
         }
         while this_mid < input_mid - 180.0 - EFF_ZERO {
+            if let Err(error) = charge_query(k, Some(8), OP_SET_UP) {
+                e.set_step_interval(anal_ivl);
+                return Err(error);
+            }
             let next_mid = this_mid + 360.0;
             shifts += 1;
             if next_mid == this_mid || shifts > MAX_PERIOD_SHIFTS {
@@ -2639,10 +2718,22 @@ pub(crate) fn set_up_polar_conversion(
     // Tolerance is around 6 decimal places of accuracy (unused for an ellipse: the
     // placement and radius come from the curve).
     let nurb_ivl = e.base.natural_interval();
+    e.base.charge_query_point(k, OP_SET_UP)?;
     let _pnt1 = e.base.evaluate_point(nurb_ivl.min())?;
+    e.base.charge_query_point(k, OP_SET_UP)?;
     let _pnt2 = e.base.evaluate_point(nurb_ivl.evaluate(0.4567))?;
 
     // get curve control points and weights
+    if let Some(work) = k.context.proof_work() {
+        let count = e.base.nurb.as_ref().map_or(0, |n| n.cpts().len());
+        // Points24N +retained weights8N +nonrational shadow8N, headers72,
+        // and three actual map/initialization events per point.
+        let cost = u64::try_from(count)
+            .ok()
+            .and_then(|n| n.checked_mul(43))
+            .and_then(|n| n.checked_add(72));
+        crate::nurbs::crv_basic::charge_conic_work(Some(work), cost, OP_SET_UP)?;
+    }
     let (control_polygon, weights) = e.base.control_polygon()?;
 
     // UPSTREAM QUIRK: for a non-rational NURB, SmBSplineCurve::GetControlPolygon sizes the
@@ -2658,15 +2749,36 @@ pub(crate) fn set_up_polar_conversion(
     // Clear cached array values
     pc.angles.clear();
     pc.exact_conversion.clear();
+    let mut angle_capacity = 0;
+    let mut exact_capacity = 0;
+    curve_base::proof_vec_capacity(
+        k.context.proof_work(),
+        &mut pc.angles,
+        &mut angle_capacity,
+        cnt,
+        8,
+        OP_SET_UP,
+    )?;
+    curve_base::proof_vec_capacity(
+        k.context.proof_work(),
+        &mut pc.exact_conversion,
+        &mut exact_capacity,
+        cnt.saturating_sub(1),
+        8,
+        OP_SET_UP,
+    )?;
 
     let angle_tol = EFF_ZERO_DEG;
 
     // for every span boundary
     for ii in 0..cnt {
+        charge_query(k, Some(16), OP_SET_UP)?;
+        e.base.charge_query_point(k, OP_SET_UP)?;
         // get Polar angle about ZAxis from XAxis in degrees watching out for periodicity
         let pnt2 = e
             .base
             .evaluate_point(table(&pc.natural_knots, ii, OP_SET_UP)?)?;
+        charge_query(k, Some(32), OP_SET_UP)?;
         let (mut angle_deg, _) = e.step_inversion(k, pnt2, false, 0.0);
 
         // when knots match up with Interval endPoints - use the sAnalIvl end value when appropriate
@@ -2721,7 +2833,7 @@ pub(crate) fn set_up_polar_conversion(
         let weight_a = table(&weights, ii * 2 - 2, OP_SET_UP)?;
         let weight_b = table(&weights, ii * 2 - 1, OP_SET_UP)?;
         let weight_c = table(&weights, ii * 2, OP_SET_UP)?;
-        let cos_half_ang = ((span_end_angle - span_start_angle) / 2.0 * PI / 180.0).cos();
+        let cos_half_ang = det::cos((span_end_angle - span_start_angle) / 2.0 * PI / 180.0);
         pc.exact_conversion
             .push(are_same(weight_a, weight_c) && are_same(weight_b / weight_c, cos_half_ang));
     }
@@ -2737,6 +2849,7 @@ pub(crate) fn set_up_polar_conversion(
     e.set_step_interval(anal_ivl);
 
     // all done - conversion tables are set up
+    charge_query(k, Some(16), OP_SET_UP)?;
     pc.possible = true;
     Ok(())
 }
@@ -3199,7 +3312,7 @@ mod tests {
         let span = [quarter[0], q1, q2];
         let (w0, w2) = (span[0][2], span[2][2]);
         assert!((w0 - w2).abs() > 0.09, "end weights {w0}, {w2}");
-        let end_deg = q2[1].atan2(q2[0]).to_degrees();
+        let end_deg = det::atan2(q2[1], q2[0]).to_degrees();
         let point = |u: f64| {
             let b = [(1.0 - u) * (1.0 - u), 2.0 * u * (1.0 - u), u * u];
             let h = [0, 1, 2].map(|i| b[0] * span[0][i] + b[1] * span[1][i] + b[2] * span[2][i]);
@@ -3219,7 +3332,7 @@ mod tests {
             .expect("u");
             let (x, y) = point(u);
             let a = angle_deg.to_radians();
-            worst = worst.max((x - a.cos()).hypot(y - a.sin()));
+            worst = worst.max(det::hypot(x - det::cos(a), y - det::sin(a)));
         }
         assert!(worst < 1e-14, "worst distance {worst}");
     }
@@ -3389,7 +3502,7 @@ mod tests {
         let x = c + Vec3::new(s, 10.0 - delta, 0.0);
         // an arc that starts on the line at the right crossing touches it at its start, not
         // at the chord's midpoint further along it
-        let theta = 90.0 - (s / 10.0).asin().to_degrees();
+        let theta = 90.0 - det::asin(s / 10.0).to_degrees();
         let arc = circle(&k, theta, 180.0, 10.0, false);
         let r = flat
             .intersect_with_ellipse::<i64>(
@@ -3408,7 +3521,11 @@ mod tests {
         };
         let p = arc.base().evaluate_point(sol.start.parameters[1]).unwrap();
         assert!(p.distance(x) < 1e-6, "arc: {p:?} vs {x:?}");
-        let d = Vec3::new(3_f64.to_radians().cos(), 0.0, 3_f64.to_radians().sin());
+        let d = Vec3::new(
+            det::cos(3_f64.to_radians()),
+            0.0,
+            det::sin(3_f64.to_radians()),
+        );
         let tilted = Line::from_points(x - 20.0 * d, x + 20.0 * d, 3);
         let r = a
             .intersect_with_line::<i64>(
@@ -3427,5 +3544,133 @@ mod tests {
         };
         let p = a.base().evaluate_point(sol.start.parameters[0]).unwrap();
         assert!(p.distance(x) < 1e-6, "{p:?} vs {x:?}");
+    }
+
+    #[test]
+    fn optional_proof_circle_preserves_tables_and_fast_drop_below_a_period_bound() {
+        use crate::geom::context::ProofWork;
+        let ordinary_kernel = kernel();
+        let ordinary = circle(&ordinary_kernel, 0.0, 360.0, 2.0, false);
+        let mut query = kernel();
+        // Less than MAX_PERIOD_SHIFTS: a normal circle must not prepay that cap.
+        let work = ProofWork::new(250_000);
+        query.context.set_proof_work(Some(work.clone()));
+        let observed = circle(&query, 0.0, 360.0, 2.0, false);
+        assert!(ordinary
+            .base()
+            .gw_nurb()
+            .unwrap()
+            .same_definition(observed.base().gw_nurb().unwrap()));
+        assert_eq!(
+            ordinary.polar_converter().angles(),
+            observed.polar_converter().angles()
+        );
+        assert_eq!(
+            ordinary.polar_converter().natural_knots(),
+            observed.polar_converter().natural_knots()
+        );
+        assert_eq!(
+            ordinary.polar_converter().exact_conversion(),
+            observed.polar_converter().exact_conversion()
+        );
+        let interval = ordinary.base().natural_interval();
+        let point = Point3::new(5.0, 2.0, 3.0);
+        let plain = ordinary
+            .drop_point_fast(
+                &ordinary_kernel,
+                &interval,
+                SolverOperation::Minimize,
+                point,
+                None,
+                1.0e-9,
+                None,
+                SolutionRequested::Single,
+                None::<u64>,
+            )
+            .unwrap();
+        let metered = observed
+            .drop_point_fast(
+                &query,
+                &interval,
+                SolverOperation::Minimize,
+                point,
+                None,
+                1.0e-9,
+                None,
+                SolutionRequested::Single,
+                None::<u64>,
+            )
+            .unwrap();
+        assert_eq!(format!("{plain:?}"), format!("{metered:?}"));
+        assert!(!work.is_disabled());
+    }
+
+    #[test]
+    fn optional_proof_written_guess_is_not_returned_after_native_budget_declines() {
+        use crate::geom::context::ProofWork;
+        let ordinary = circle(&kernel(), 0.0, 360.0, 2.0, false);
+        let query = || {
+            let mut k = kernel();
+            let work = ProofWork::new(192);
+            k.context.set_proof_work(Some(work.clone()));
+            (k, work)
+        };
+        let (first, work) = query();
+        let mut written = None;
+        let result = ordinary.polar.convert_to_nurbs_parameter_into(
+            &first,
+            &ordinary,
+            0.0,
+            0.0,
+            &mut written,
+        );
+        assert!(matches!(result, Err(SolidError::OutOfFuel { .. })));
+        assert!(
+            written.is_some(),
+            "the table wrote its seam guess before native evaluation declined"
+        );
+        assert!(work.is_disabled());
+        let (second, work) = query();
+        assert!(matches!(
+            ordinary
+                .polar
+                .convert_to_nurbs_parameter_or_written(&second, &ordinary, 0.0, 0.0),
+            Err(SolidError::OutOfFuel { .. })
+        ));
+        assert!(work.is_disabled());
+    }
+
+    #[test]
+    fn optional_proof_soft_setup_errors_do_not_continue_to_success_or_fallback() {
+        use crate::geom::context::ProofWork;
+        let source = circle(&kernel(), 0.0, 360.0, 2.0, false);
+        let mut observed = source.clone_exact_bounded();
+        let mut query = kernel();
+        let work = ProofWork::new(100);
+        query.context.set_proof_work(Some(work.clone()));
+        assert!(matches!(
+            observed.notify_post_edit(&query),
+            Err(SolidError::OutOfFuel { .. })
+        ));
+        assert!(work.is_disabled());
+        let mut other = kernel();
+        let work = ProofWork::new(100);
+        other.context.set_proof_work(Some(work.clone()));
+        let result = Ellipse::new(
+            &other,
+            source.position.origin(),
+            source.position.x_axis(),
+            source.position.y_axis(),
+            source.step_interval(),
+            source.radius_x,
+            source.radius_y,
+            &EllipseOptions {
+                nurb: Some(source.base()),
+                ..EllipseOptions::default()
+            },
+        );
+        assert!(matches!(result, Err(SolidError::OutOfFuel { .. })));
+        assert!(work.is_disabled());
+        assert!(source.polar_converter().is_polar_conversion_possible());
     }
 }

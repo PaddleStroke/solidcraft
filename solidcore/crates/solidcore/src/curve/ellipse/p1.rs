@@ -114,6 +114,7 @@
 //!   (B-spline, ellipse, circle, line, parabola, hyperbola), others are
 //!   [`SolidError::InvalidInput`]. The ignored `EvaluatePoint` status propagates.
 
+use crate::math::det;
 use core::ops::Div;
 
 use crate::curve::curve::p1::GlobalPointSolveOptions;
@@ -143,14 +144,14 @@ use crate::nurbs::b_spline_curve::p3::DerivedOverrides;
 use crate::nurbs::b_spline_curve::{BSplineCurve, BSplineCurveForm};
 use crate::nurbs::b_spline_curve_n_lib::TrimMode;
 use crate::nurbs::crv_basic::ConicType;
-use crate::nurbs::crv_common::{elliptical_arc_tol, EllipseArc, DEFAULT_ANGLE_TOL};
+use crate::nurbs::crv_common::{elliptical_arc_tol_with_work, EllipseArc, DEFAULT_ANGLE_TOL};
 use crate::nurbs::index::at;
 use crate::nurbs::math::gamma;
 use crate::nurbs::nurbs_crv::to_euclid;
 use crate::surface::surface::Surface;
 use crate::topology::database_io::{DatabaseReader, DatabaseWriter, FileType, InputStream};
 
-use super::p2::{Ellipse, EllipseOptions, PolarConversion};
+use super::p2::{charge_query, Ellipse, EllipseOptions, PolarConversion};
 
 /// Not upstream (#17062): a STEP end converted by `Ellipse::step_to_nurbs_keeping_turns`,
 /// with the magnitudes its conversion's rounded additions and subtractions work at.
@@ -904,6 +905,19 @@ impl Ellipse {
     ///
     /// None but [`SolidError::Unported`] (never produced here).
     pub fn copy(&self, k: &Kernel) -> Result<Self> {
+        self.copy_with_source(k, None)
+    }
+
+    /// The same copy, witnessing its final direct source-NURB installation.
+    pub(crate) fn copy_with_source(
+        &self,
+        k: &Kernel,
+        outcome: Option<&mut crate::nurbs::b_spline_curve_n_lib::CopySourceOutcome>,
+    ) -> Result<Self> {
+        const OP_COPY: &str = "curve::ellipse::p1::Ellipse::copy";
+        if k.context.proof_work().is_some() {
+            charge_query(k, self.base.proof_base_copy_work(), OP_COPY)?;
+        }
         let mut c = Self {
             base: self.base.copy(),
             position: self.position,
@@ -917,9 +931,20 @@ impl Ellipse {
 
         // stop infinite recursion: don't copy underlying PolarConverter - reSet it
         ignore_status(c.set_up_polar_conversion(k))?;
+        charge_query(k, Some(0), OP_COPY)?;
 
         // (Copy / the circle copy constructor)
-        ignore_status(c.set_from_gw_nurb(k, self.base.gw_nurb()))?;
+        let installed = c.set_from_gw_nurb(k, self.base.gw_nurb());
+        let source_installed = installed.is_ok();
+        ignore_status(installed)?;
+        charge_query(k, Some(0), OP_COPY)?;
+        if let Some(outcome) = outcome {
+            *outcome = if source_installed {
+                crate::nurbs::b_spline_curve_n_lib::CopySourceOutcome::Preserved
+            } else {
+                crate::nurbs::b_spline_curve_n_lib::CopySourceOutcome::Uncertified
+            };
+        }
         Ok(c)
     }
 
@@ -1646,8 +1671,20 @@ impl Ellipse {
     /// `InvalidInput` when the extremal radius quadratic has no root (upstream:
     /// uninitialised values).
     pub fn convert_to_2d(&mut self, k: &Kernel) -> Result<()> {
+        if let Some(work) = k.context.proof_work() {
+            let cost = match self.base.nurb.as_ref() {
+                Some(nurb) => u64::try_from(nurb.storage().0)
+                    .ok()
+                    .and_then(|n| n.checked_mul(32))
+                    .and_then(|n| n.checked_add(u64::try_from(nurb.cpts().len()).ok()?))
+                    .and_then(|n| n.checked_add(40)),
+                None => Some(1),
+            };
+            crate::nurbs::crv_basic::charge_conic_work(Some(work), cost, OP_TO_2D)?;
+        }
         // modify the NURB
         ignore_status(self.base.convert_to_2d())?;
+        charge_query(k, Some(0), OP_TO_2D)?;
 
         // Get current position
         let mut origin = self.position.origin();
@@ -1679,6 +1716,7 @@ impl Ellipse {
                 ry * ry * y_dot_y - rx * rx * x_dot_x,
                 -ry * rx * x_dot_y,
             ];
+            charge_query(k, Some(56 + 32), OP_TO_2D)?;
             let sols = solve_quadratic(&coefs, scaled_zero);
             // Upstream only uses the first root: it also computes ThetaY from the second
             // (uninitialised when the solver finds one root, e.g. a degenerate radius
@@ -1690,9 +1728,9 @@ impl Ellipse {
                     "extremal radius quadratic without a root",
                 ));
             };
-            let theta_x_rad = first_root.atan();
+            let theta_x_rad = det::atan(first_root);
             let theta_y_rad = if let Some(&second_root) = sols.get(1) {
-                let mut ty = second_root.atan();
+                let mut ty = det::atan(second_root);
                 if ty < theta_x_rad {
                     ty += PI;
                 }
@@ -1702,8 +1740,8 @@ impl Ellipse {
             };
 
             // get max vectors for each angle
-            let v = rx * theta_x_rad.cos() * x_axis + ry * theta_x_rad.sin() * y_axis;
-            let w = rx * theta_y_rad.cos() * x_axis + ry * theta_y_rad.sin() * y_axis;
+            let v = rx * det::cos(theta_x_rad) * x_axis + ry * det::sin(theta_x_rad) * y_axis;
+            let w = rx * det::cos(theta_y_rad) * x_axis + ry * det::sin(theta_y_rad) * y_axis;
             (v, w)
         };
 
@@ -1747,7 +1785,9 @@ impl Ellipse {
                 nat.min()
             };
             self.anal_domain = Extent1d::from_min_max(0.0, 360.0);
+            self.base.charge_query_point(k, OP_TO_2D)?;
             if let Ok(seam_pt) = self.base.evaluate_point(low_t) {
+                charge_query(k, Some(32), OP_TO_2D)?;
                 let (seam_deg, _) = self.step_inversion(k, seam_pt, false, 0.0);
                 let was_neg_turn = (old_domain.min() + 360.0).abs() < EFF_ZERO * 1000.0
                     && old_domain.max().abs() < EFF_ZERO * 1000.0;
@@ -1772,6 +1812,7 @@ impl Ellipse {
 
         // recompute the polar conversion
         ignore_status(self.set_up_polar_conversion(k))?;
+        charge_query(k, Some(0), OP_TO_2D)?;
         Ok(())
     }
 
@@ -1864,9 +1905,17 @@ impl Ellipse {
             start: self.start_angle_deg(),
             end: self.end_angle_deg(),
         };
-        let cur = elliptical_arc_tol(&arc, closure_tol_deg, ConicType::Quadratic)
-            .map_err(SolidError::nurbs_routine(OP_MAKE_NURB))?;
-        ignore_status(self.set_from_gw_nurb(k, Some(&cur)))
+        let made = elliptical_arc_tol_with_work(
+            &arc,
+            closure_tol_deg,
+            ConicType::Quadratic,
+            k.context.proof_work(),
+        );
+        charge_query(k, Some(0), OP_MAKE_NURB)?;
+        let cur = made.map_err(SolidError::nurbs_routine(OP_MAKE_NURB))?;
+        let result = ignore_status(self.set_from_gw_nurb(k, Some(&cur)));
+        charge_query(k, Some(0), OP_MAKE_NURB)?;
+        result
     }
 
     /// [`Self::make_nurb_owned`] given the tolerance of the edge the ellipse's owner
@@ -1916,6 +1965,7 @@ impl Ellipse {
             let approx_tol_3d = z_tol_3d / 100.;
 
             let mid_p = (start_ang_deg + end_ang_deg) / 2.0;
+            charge_query(k, Some(72 + 16), OP_MAKE_NURB)?;
             let point_and_der = self.evaluate_step(mid_p, 1)?;
             let der = point_and_der.get(1).copied().ok_or_else(|| {
                 SolidError::curve(
@@ -1955,8 +2005,14 @@ impl Ellipse {
             start: start_ang_deg,
             end: end_ang_deg,
         };
-        let cur = elliptical_arc_tol(&arc, angle_tol, ConicType::Quadratic)
-            .map_err(SolidError::nurbs_routine(OP_MAKE_NURB))?;
+        let made = elliptical_arc_tol_with_work(
+            &arc,
+            angle_tol,
+            ConicType::Quadratic,
+            k.context.proof_work(),
+        );
+        charge_query(k, Some(0), OP_MAKE_NURB)?;
+        let cur = made.map_err(SolidError::nurbs_routine(OP_MAKE_NURB))?;
 
         // when arc's domain may have been modified
         if is_zero_to_tol(start_ang_deg, 3.0e-4)
@@ -1972,7 +2028,9 @@ impl Ellipse {
             let end_pt = to_euclid(cpts.last().copied().ok_or_else(empty_nurb)?);
 
             // convert endPoints to ellipse angles
+            charge_query(k, Some(32), OP_MAKE_NURB)?;
             let (mut anal_start, _) = self.step_inversion(k, start_pt, false, 0.0);
+            charge_query(k, Some(32), OP_MAKE_NURB)?;
             let (mut anal_end, _) = self.step_inversion(k, end_pt, false, 0.0);
 
             // Reset these to our analytic values.
@@ -2018,10 +2076,12 @@ impl Ellipse {
 
         // set the m_pNurb pointer and use Notify to rebuild polarConverter
         ignore_status(self.set_from_gw_nurb(k, Some(&cur)))?;
+        charge_query(k, Some(0), OP_MAKE_NURB)?;
 
         // Set ControlPoint Z values for 2d curves (status ignored)
         if self.base.dim == 2 {
             ignore_status(self.convert_to_2d(k))?;
+            charge_query(k, Some(0), OP_MAKE_NURB)?;
         }
 
         // When this is a SmSurfOfExtrusion GenCurve, look for Parent Surface NURB
@@ -2568,9 +2628,30 @@ impl Ellipse {
         mode: TrimMode,
         zone_tol_3d: f64,
     ) -> Result<()> {
+        self.trim_with_zone_tol_observed(k, trim_interval, mode, zone_tol_3d, None)
+    }
+
+    /// The same physical trim, forwarding only its actual base-trim outcome.
+    pub(crate) fn trim_with_zone_tol_observed(
+        &mut self,
+        k: &Kernel,
+        trim_interval: &mut Extent1d,
+        mode: TrimMode,
+        zone_tol_3d: f64,
+        mut outcome: Option<&mut crate::nurbs::b_spline_curve_n_lib::TrimSourceOutcome>,
+    ) -> Result<()> {
+        if let Some(outcome) = outcome.as_deref_mut() {
+            *outcome = crate::nurbs::b_spline_curve_n_lib::TrimSourceOutcome::Uncertified;
+        }
         // no work - current natural interval is a subSet of targetInterval
         let nat_ivl = self.base.natural_interval();
         if nat_ivl.is_contained_by(trim_interval, EFF_ZERO) {
+            if mode != TrimMode::IntervalOnly {
+                if let Some(outcome) = outcome.as_deref_mut() {
+                    *outcome =
+                        crate::nurbs::b_spline_curve_n_lib::TrimSourceOutcome::Retained(nat_ivl);
+                }
+            }
             return Ok(());
         }
 
@@ -2602,22 +2683,41 @@ impl Ellipse {
         let max_step = to_step(self, trim_interval.max())?;
 
         // pass the call to Trim the BSpline - skip its Notify call
-        self.base
-            .trim_with_zone_tol(trim_interval, TrimMode::Silent, zone_tol_3d)?;
+        let mut physical = crate::nurbs::b_spline_curve_n_lib::TrimSourceOutcome::Uncertified;
+        let record = outcome.is_some();
+        self.base.trim_with_zone_tol_observed(
+            trim_interval,
+            TrimMode::Silent,
+            zone_tol_3d,
+            record.then_some(&mut physical),
+        )?;
 
         // store the angular interval paying attention to m_bInsideOut
-        if self.inside_out {
-            let _ = self.anal_domain.set_min_max(max_step, min_step);
+        let domain_status = if self.inside_out {
+            self.anal_domain.set_min_max(max_step, min_step)
         } else {
-            let _ = self.anal_domain.set_min_max(min_step, max_step);
-        }
+            self.anal_domain.set_min_max(min_step, max_step)
+        };
 
         // rebuild the polar converter
-        ignore_status(self.set_up_polar_conversion(k))?;
+        let polar_status = self.set_up_polar_conversion(k);
+        let polar_ok = polar_status.is_ok();
+        ignore_status(polar_status)?;
 
         // all done
         if mode == TrimMode::Notify {
             self.notify(k, NotifyOperation::PostEdit)?;
+        }
+        if let Some(outcome) = outcome {
+            if domain_status.is_ok() && polar_ok {
+                if let crate::nurbs::b_spline_curve_n_lib::TrimSourceOutcome::Retained(source) =
+                    physical
+                {
+                    if self.base.natural_interval() == source {
+                        *outcome = physical;
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -3015,8 +3115,8 @@ mod tests {
     fn tilted_axes(rot_z_deg: f64, tilt_x_deg: f64, flip_z: bool) -> (Vec3, Vec3) {
         let a = rot_z_deg.to_radians();
         let b = tilt_x_deg.to_radians();
-        let (sa, ca) = (a.sin(), a.cos());
-        let (sb, cb) = (b.sin(), b.cos());
+        let (sa, ca) = (det::sin(a), det::cos(a));
+        let (sb, cb) = (det::sin(b), det::cos(b));
         let ux = Vec3::new(ca, sa * cb, sa * sb);
         let mut uy = Vec3::new(-sa, ca * cb, ca * sb);
         if flip_z {
@@ -3425,7 +3525,7 @@ mod tests {
         e.trim(k, &mut piece, TrimMode::Notify).unwrap();
         let (nurb, step) = (e.base.natural_interval(), e.step_interval());
         let d = e.base.evaluate_point(nurb.max()).unwrap() - o;
-        let mut angle = (rx / ry * d.dot(y)).atan2(d.dot(x)) * 180.0 / PI;
+        let mut angle = det::atan2(rx / ry * d.dot(y), d.dot(x)) * 180.0 / PI;
         if angle < 0.0 {
             angle += 360.0;
         }
@@ -3451,5 +3551,34 @@ mod tests {
         assert!(angle < 360.0 - 1e-6, "{angle}");
         assert!((end - angle).abs() <= 1e-9, "{end} against {angle}");
         assert!(off <= 1e-10, "{off}");
+    }
+
+    #[test]
+    fn optional_copy_allowance_does_not_throttle_the_separate_source_frame_observer() {
+        use crate::geom::context::ProofWork;
+        use crate::nurbs::b_spline_curve_n_lib::CopySourceOutcome;
+        let actual = kernel();
+        let source = circle(&actual, 0.0, 360.0, 2.0);
+        let mut query = kernel();
+        let work = ProofWork::new(100);
+        query.context.set_proof_work(Some(work.clone()));
+        let mut outcome = CopySourceOutcome::Uncertified;
+        assert!(matches!(
+            source.copy_with_source(&query, Some(&mut outcome)),
+            Err(SolidError::OutOfFuel { .. })
+        ));
+        assert!(work.is_disabled());
+        assert_eq!(outcome, CopySourceOutcome::Uncertified);
+        // Same source, actual Boolean Kernel: a frame witness is not a quota.
+        let copied = source
+            .copy_with_source(&actual, Some(&mut outcome))
+            .unwrap();
+        assert_eq!(outcome, CopySourceOutcome::Preserved);
+        assert!(source
+            .base()
+            .gw_nurb()
+            .unwrap()
+            .same_definition(copied.base().gw_nurb().unwrap()));
+        assert!(actual.context.proof_work().is_none());
     }
 }

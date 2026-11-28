@@ -621,16 +621,26 @@ pub fn wire_edges(b: &Brep, attribute: Option<&AttributeFilter<'_>>) -> Result<V
 }
 
 /// `GetTopologicalEdges`: the edges `SmEdge::IsTopological` (default gain) accepts:
-/// those removable by merging their two faces. As upstream the coverage test may
-/// expand a face's surface in place.
+/// those removable by merging their two faces.
+///
+/// Not upstream (WR-792, #23077): the edges are tested on a trial copy of `b`
+/// ([`Brep::clone_for_trial_keeping_definitions`], the same ids), never on `b` itself.
+/// The test prepares a merge: it expands the covering face's surface in place and drops
+/// that face's UV trims, and only the merge sets the face's domain anew. Upstream tests on
+/// the B-rep, and a caller that keeps the edges it lists (a keep list) leaves each face it
+/// covered on the expanded surface under its old domain (a revolution's NURB
+/// re-parameterised, its trims off it). The copy takes the expansions instead, in the same
+/// edge order, so the list is upstream's.
 ///
 /// # Errors
 ///
-/// Those of [`edge::is_topological`].
-pub fn topological_edges(k: &Kernel, b: &mut Brep) -> Result<Vec<EdgeId>> {
+/// Those of [`edge::is_topological`] and of the trial copy (a trimmed surface cache in
+/// use: no caller asks from inside a solve).
+pub fn topological_edges(k: &Kernel, b: &Brep) -> Result<Vec<EdgeId>> {
+    let mut trial = b.clone_for_trial_keeping_definitions()?;
     let mut out = Vec::new();
-    for e in edges(b, None)? {
-        if edge::is_topological(k, b, e, 1.0)?.is_topological {
+    for e in edges(&trial, None)? {
+        if edge::is_topological(k, &mut trial, e, 1.0)?.is_topological {
             out.push(e);
         }
     }
@@ -2182,6 +2192,14 @@ pub fn update_vertex_edge_intervals(
                 edited_edge = true;
                 let ivl = Extent1d::from_min_max(d.parameter, interval.max());
                 edge::set_interval(b, e, &ivl)?;
+                if ivl != interval {
+                    crate::geom::object::report_boundary_edit(
+                        env.context.as_deref_mut(),
+                        crate::geom::object::BoundaryEdit::UncertifiedExtentChanged {
+                            edge: edge_ref,
+                        },
+                    );
+                }
                 orig_dist = d.distance;
             }
         } else {
@@ -2209,6 +2227,14 @@ pub fn update_vertex_edge_intervals(
                 edited_edge = true;
                 let ivl = Extent1d::from_min_max(interval.min(), d.parameter);
                 edge::set_interval(b, e, &ivl)?;
+                if ivl != interval {
+                    crate::geom::object::report_boundary_edit(
+                        env.context.as_deref_mut(),
+                        crate::geom::object::BoundaryEdit::UncertifiedExtentChanged {
+                            edge: edge_ref,
+                        },
+                    );
+                }
                 orig_dist = d.distance;
             }
         }
@@ -3963,6 +3989,7 @@ mod tests {
     use super::*;
     use crate::error::SM_ERR_INVALID_INPUT;
     use crate::geom::a_object;
+    use crate::math::det;
     use crate::topology::Region;
 
     fn cross_body_face(k: &mut Kernel, surface: Surface) -> Brep {
@@ -4119,7 +4146,9 @@ mod tests {
                     assert!((p.z - 0.125).abs() <= 1e-9 * p.z.abs());
                     // The curve approximates the circle on the paraboloid to the
                     // requested 3D approximation tolerance, regardless of orientation.
-                    assert!(((p.x - 0.5).powi(2) + (p.y - 0.5).powi(2) - 0.125).abs() <= 1e-6);
+                    assert!(
+                        (det::powi(p.x - 0.5, 2) + det::powi(p.y - 0.5, 2) - 0.125).abs() <= 1e-6
+                    );
                     if !reverse {
                         for (actual, expected) in
                             [(p.x, expected.x), (p.y, expected.y), (p.z, expected.z)]
@@ -4622,5 +4651,131 @@ mod tests {
             assert!((p.x - u).abs() <= 1e-12 * hi.abs(), "{t}: {} {u}", p.x);
             assert!((p.y - v).abs() <= 1e-12, "{t}: {}", p.y);
         }
+    }
+
+    #[test]
+    fn actual_interval_extensions_report_unproved_history_without_changing_geometry() {
+        use crate::geom::context::{Context, NotifyCallback};
+        use crate::geom::object::BoundaryEdit;
+        use crate::surface::plane::Plane;
+        use crate::topology::brep::p2::ArenaNotifyState;
+        use std::sync::{Arc, Mutex};
+
+        type Legacy = (NotifyOperation, ObjectRef, [Option<ObjectRef>; 3]);
+        #[derive(Debug)]
+        struct Observer {
+            opt_in: bool,
+            legacy: Arc<Mutex<Vec<Legacy>>>,
+            changed: Arc<Mutex<Vec<ObjectKey>>>,
+        }
+        impl NotifyCallback for Observer {
+            fn execute(
+                &mut self,
+                operation: NotifyOperation,
+                caller: ObjectRef,
+                first: Option<ObjectRef>,
+                second: Option<ObjectRef>,
+                third: Option<ObjectRef>,
+            ) -> Result<()> {
+                self.legacy
+                    .lock()
+                    .unwrap()
+                    .push((operation, caller, [first, second, third]));
+                Ok(())
+            }
+            fn reserve_boundary_edit(&mut self, _work: usize) -> bool {
+                self.opt_in
+            }
+            fn boundary_edit(&mut self, event: BoundaryEdit) {
+                if let BoundaryEdit::UncertifiedExtentChanged { edge } = event {
+                    self.changed.lock().unwrap().push(edge.key);
+                }
+            }
+        }
+
+        let fixture = |opt_in| {
+            let mut k = Kernel::default();
+            let mut b = cross_body_face(
+                &mut k,
+                Surface::from(Plane::new(
+                    Point3::ZERO,
+                    Vec3::X,
+                    Vec3::Y,
+                    Point2::new(1.0, 1.0),
+                    &Extent2d::from_bounds(0.0, 0.0, 1.0, 1.0),
+                )),
+            );
+            let selected = b.edge_list()[0];
+            let original = edge::interval(&b, selected).unwrap();
+            let shortened =
+                Extent1d::from_min_max(original.evaluate(0.25), original.evaluate(0.75));
+            edge::set_interval(&mut b, selected, &shortened).unwrap();
+            let (Some(start), Some(end)) = edge::start_end_vertices(&b, selected).unwrap() else {
+                panic!("the square's edge has two end vertices");
+            };
+            let legacy = Arc::new(Mutex::new(Vec::new()));
+            let changed = Arc::new(Mutex::new(Vec::new()));
+            let mut context = Context::default();
+            context.set_user_notify_callback(Some(Box::new(Observer {
+                opt_in,
+                legacy: legacy.clone(),
+                changed: changed.clone(),
+            })));
+            let mut state = ArenaNotifyState::new(&b);
+            let mut env = state.env(Some(&mut context));
+            let selected_key = (env.key_of)(EntityRef::Edge(selected)).key;
+            update_vertex_edge_intervals(&k, &mut b, &mut env, start).unwrap();
+            update_vertex_edge_intervals(&k, &mut b, &mut env, end).unwrap();
+            assert_eq!(
+                edge::interval(&b, selected).unwrap(),
+                original,
+                "the existing line drop extends both ends back to the square vertices"
+            );
+            let mut bits = Vec::new();
+            for current in b.edge_list() {
+                let iv = edge::interval(&b, *current).unwrap();
+                bits.extend([
+                    iv.min().to_bits(),
+                    iv.max().to_bits(),
+                    edge::tolerance(&b, *current).unwrap().to_bits(),
+                ]);
+                let curve = edge::curve(&b, *current).unwrap().unwrap();
+                for t in [iv.min(), iv.evaluate(0.5), iv.max()] {
+                    let p = curve.evaluate_point(&k, t).unwrap();
+                    bits.extend([p.x.to_bits(), p.y.to_bits(), p.z.to_bits()]);
+                }
+            }
+            for current in b.vertex_list() {
+                let p = vertex::point(&b, *current).unwrap();
+                bits.extend([
+                    p.x.to_bits(),
+                    p.y.to_bits(),
+                    p.z.to_bits(),
+                    vertex::tolerance(&b, *current).unwrap().to_bits(),
+                ]);
+            }
+            let legacy = legacy.lock().unwrap().clone();
+            let changed = changed.lock().unwrap().clone();
+            (bits, legacy, changed, selected_key)
+        };
+        let ordinary = fixture(false);
+        let observed = fixture(true);
+        assert_eq!(
+            ordinary.0, observed.0,
+            "optional history leaves all edge/vertex geometry bits unchanged"
+        );
+        assert_eq!(
+            ordinary.1, observed.1,
+            "old notifications retain the same identities, payloads and order"
+        );
+        assert!(
+            ordinary.2.is_empty(),
+            "an observer that opts out receives no new payload"
+        );
+        assert_eq!(
+            observed.2,
+            vec![observed.3, observed.3],
+            "both actual endpoint extensions invalidate the selected edge"
+        );
     }
 }

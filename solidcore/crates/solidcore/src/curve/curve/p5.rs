@@ -136,6 +136,7 @@ use crate::geom::solution_array::{Solution, SolutionType};
 use crate::geom::tol::are_same;
 use crate::geom::vector3d::{acos, sqrt, Point3, Vec3};
 use crate::kernel::Kernel;
+use crate::math::det;
 use crate::math::{max2, BIG_DOUBLE, EFF_ZERO, EFF_ZERO_SQ, EFF_ZERO_SQRT, PI};
 use crate::nurbs::b_spline_curve::p2::ArcData;
 use crate::nurbs::b_spline_curve::speed::SpanSpeed;
@@ -345,6 +346,11 @@ pub fn make_curve_cache_with_zone_tol<O: Copy + PartialEq>(
     handle: Option<O>,
     zone_tol_3d: Option<f64>,
 ) -> Result<CurveCache<O>> {
+    // The optional proof uses its own cold cache; never touch a source memo,
+    // lookup/retag a cached tree, or publish a partial build after quota decline.
+    if k.context.proof_work().is_some() {
+        return build_curve_cache(k, curve, handle, zone_tol_3d);
+    }
     // not upstream: the memo of this build in the curve value (see CurveMemo)
     let key = CurveMemoKey::of(k, curve, zone_tol_3d);
     if let Some(key) = &key {
@@ -372,6 +378,9 @@ pub(crate) fn memoized_cache_top_box(
     curve: &Curve,
     zone_tol_3d: Option<f64>,
 ) -> Option<Extent3d> {
+    if k.context.proof_work().is_some() {
+        return None;
+    }
     let key = CurveMemoKey::of(k, curve, zone_tol_3d)?;
     curve.memo().top_box(&key)
 }
@@ -565,8 +574,20 @@ fn build_curve_cache<O: Copy + PartialEq>(
     let angular_tol_deg = 15.0; // 15 degrees might be ok
 
     // construct new CurveCache Object
+    let copied = if let Some(work) = k.context.proof_work() {
+        if !work.charge(Some(512)) {
+            return Err(work.stopped("curve::make_curve_cache"));
+        }
+        let Some(copy) = curve.clone_detached_for_optional_proof(work)? else {
+            work.disable();
+            return Err(work.stopped("curve::make_curve_cache"));
+        };
+        copy
+    } else {
+        curve.clone_detached()?
+    };
     let mut cache = CurveCache::new(
-        curve.clone_detached()?,
+        copied,
         ivl,
         CurveCacheOptions {
             make_full_tree: true,
@@ -1554,6 +1575,7 @@ where
     C: CurveEvaluate + ?Sized,
     D: FnOnce(&C, f64) -> Result<bool>,
 {
+    crate::curve::curve::p3::charge_query_work(k, Some(512), OP_CACHE)?;
     // no work - degenerate curve
     if is_degenerate(curve, tol)? {
         return Ok(None);
@@ -1622,6 +1644,7 @@ where
     // center of circle and on plane.
     let mut ave_radius = radius;
     for i in 1..num_samples {
+        crate::curve::curve::p3::charge_query_work(k, Some(64), OP_CACHE)?;
         // get next samplePoint param value
         let param = if i == num_samples - 1 {
             interval.max()
@@ -1995,7 +2018,7 @@ fn circle_length(e: &Ellipse, interval: &Extent1d) -> Result<Option<f64>> {
             first + Vec3::new(from[0], from[1], from[2]),
             first + Vec3::new(to[0], to[1], to[2]),
         );
-        angle += from.cross(to).length().atan2(from.dot(to));
+        angle += det::atan2(from.cross(to).length(), from.dot(to));
     }
     Ok(Some(radius * angle))
 }
@@ -2032,6 +2055,15 @@ pub fn local_property_analysis<C: CurveEvaluate + ?Sized, O: Copy>(
     vectors: &[Vec3],
     solution: &mut Solution<O>,
 ) -> Result<bool> {
+    // Only PointInversion is reached by the optional finite-domain query.
+    if let Some(work) = k.context.proof_work() {
+        if property != CurvePropertyType::PointInversion {
+            work.disable();
+            return Err(work.stopped(OP_LPA));
+        }
+        crate::curve::curve::p3::charge_local_scalar_work(k, OP_LPA)?;
+    }
+
     let vec = |i: usize| -> Result<Vec3> {
         vectors
             .get(i)
@@ -2072,7 +2104,9 @@ pub fn local_property_analysis<C: CurveEvaluate + ?Sized, O: Copy>(
     ls.set_desired_accuracy(EFF_ZERO_SQ);
 
     // solve with NewtonRaphson iteration
-    let outcome = match ls.solve_it(&mut efo, guess, EFF_ZERO_SQRT) {
+    let solved = ls.solve_it(&mut efo, guess, EFF_ZERO_SQRT);
+    crate::curve::curve::p3::charge_query_work(k, Some(0), OP_LPA)?;
+    let outcome = match solved {
         Ok(o) => o,
         Err(e) if e.is_unported_or_cancelled() => return Err(e),
         // Something went wrong in 1d solver return error
@@ -3249,7 +3283,7 @@ mod tests {
         let mut pts: Vec<Point3> = (0..8)
             .map(|i| {
                 let t = core::f64::consts::PI * f64::from(i) / 4.0;
-                Point3::new(5.0 * t.cos(), 3.0 * t.sin(), 0.5 * t)
+                Point3::new(5.0 * det::cos(t), 3.0 * det::sin(t), 0.5 * t)
             })
             .collect();
         pts.push(pts[0]);
@@ -3499,5 +3533,85 @@ mod tests {
         assert!(out.f > 1.9, "{out:?}");
         // a stall that misses the guess finds no root either
         assert!(!perpendicular_on_stalled_quartic(&k, 0.991).unwrap().0);
+    }
+
+    #[test]
+    fn optional_finite_proof_preserves_empty_and_populated_source_memos() {
+        use crate::geom::context::ProofWork;
+        type Snapshot = Option<(usize, Option<(CurveMemoKey, usize, usize, String)>)>;
+        fn snapshot(curve: &Curve) -> Snapshot {
+            let slot = curve.memo().0.get()?;
+            let state = slot.lock().unwrap();
+            let entry = state.as_ref().map(|e| {
+                (
+                    e.key,
+                    e.cache.spans().as_ptr() as usize,
+                    e.cache.parents().as_ptr() as usize,
+                    format!("{:?}", e.cache),
+                )
+            });
+            Some((Arc::as_ptr(slot) as usize, entry))
+        }
+        fn native_bits(curve: &Curve) -> (Vec<[u64; 4]>, Vec<u64>) {
+            let CurveKind::BSpline(b) = curve.kind() else {
+                panic!("the fixture is a native spline")
+            };
+            let n = b.gw_nurb().unwrap();
+            (
+                n.cpts()
+                    .iter()
+                    .map(|p| [p.x.to_bits(), p.y.to_bits(), p.z.to_bits(), p.w.to_bits()])
+                    .collect(),
+                n.knots().iter().map(|v| v.to_bits()).collect(),
+            )
+        }
+        for populated in [false, true] {
+            let k = Kernel {
+                memoize_curve_caches: true,
+                ..Kernel::default()
+            };
+            let a = bseg([0.0, 0.0, 0.0], [10.0, 0.0, 0.0]);
+            let b = bseg([10.0, 0.0, 0.0], [0.0, 0.0, 0.0]);
+            if populated {
+                make_curve_cache::<()>(&k, &a, None).unwrap();
+                make_curve_cache::<()>(&k, &b, None).unwrap();
+            }
+            let before_a = snapshot(&a);
+            let before_b = snapshot(&b);
+            assert_eq!(before_a.is_some(), populated);
+            assert_eq!(before_b.is_some(), populated);
+            let native_a = native_bits(&a);
+            let native_b = native_bits(&b);
+            let ia = a.natural_interval();
+            let ib = b.natural_interval();
+            let allowance = crate::prism::sheet::READ_WORK;
+            for headroom in [0, 512, allowance] {
+                let work = ProofWork::new(allowance);
+                let _ = work.charge(Some((allowance - headroom) as u64));
+                let proved = a
+                    .proved_together_with_work(&k, &ia, (&b, &ib), 1e-4, &[], &work)
+                    .unwrap();
+                assert_eq!(proved, !work.is_disabled());
+                if headroom == allowance {
+                    assert!(proved);
+                }
+                assert_eq!(
+                    snapshot(&a),
+                    before_a,
+                    "query changed the first source memo (populated={populated})"
+                );
+                assert_eq!(
+                    snapshot(&b),
+                    before_b,
+                    "query changed the second source memo (populated={populated})"
+                );
+                assert_eq!(native_bits(&a), native_a);
+                assert_eq!(native_bits(&b), native_b);
+                assert!(a.notify_key().is_none());
+                assert!(b.notify_key().is_none());
+            }
+            // Check the old path after observing the source state, so the cold control stays cold.
+            assert!(a.proved_together(&k, &ia, &b, &ib, 1e-4, &[]).unwrap());
+        }
     }
 }

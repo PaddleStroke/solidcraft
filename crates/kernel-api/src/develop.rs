@@ -256,6 +256,27 @@ pub struct Folded<F, B> {
     pub form: F,
 }
 
+/// One original contour segment consumed by an edit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CornerTailParent {
+    /// Index in the original input contour's outer loop.
+    pub segment: usize,
+    /// Whether this output certifies that the complete original parent remains.
+    pub whole: bool,
+}
+
+/// The edited record contour and complete ephemeral construction parents.
+/// At most three originals are consumed by one corner-step restoration; a
+/// split adds no parents. New bridges or an unrepresentable set are None.
+/// A missing output entry also means unknown, including geometry-only backends.
+#[derive(Clone, Debug)]
+pub struct CornerTailWithHistory {
+    /// The same edited geometry returned by the geometry-only entrypoint.
+    pub region: Region2,
+    /// Complete original-input parents per output segment; missing or None is unknown.
+    pub outer: Vec<Option<[Option<CornerTailParent>; 3]>>,
+}
+
 /// The sheet development of one kernel ([`crate::OpKind::Develop`]).
 pub trait Develop: Backend {
     /// The kernel's own fold.
@@ -297,11 +318,38 @@ pub trait Develop: Backend {
         old_cut: f64,
         new_cut: f64,
     ) -> Result<Region2, CornerTailRefusal>;
+    /// The same edit with original-input boundary construction parents.
+    fn retarget_corner_tail_with_history(
+        &self,
+        region: &Region2,
+        edge: [Vec2; 2],
+        anchor_origin: Vec2,
+        anchor_direction: Vec2,
+        bend_length: f64,
+        old_cut: f64,
+        new_cut: f64,
+    ) -> Result<CornerTailWithHistory, CornerTailRefusal> {
+        self.retarget_corner_tail(region, edge, anchor_origin, anchor_direction, bend_length, old_cut, new_cut)
+            .map(|region| CornerTailWithHistory { region, outer: Vec::new() })
+    }
     /// Sets a straight side back by `by` along `into`, preserving holes. The side starts
     /// at `from`, runs along `direction` for `rise`, and the setback starts at `height`.
     /// Returns `None` if the side or its straight successor cannot be found, or the
     /// setback would reverse the successor.
     fn set_back_past(&self, region: &Region2, from: Vec2, direction: Vec2, rise: f64, height: f64, into: Vec2, by: f64) -> Option<Region2>;
+    /// The same edit with original-input boundary construction parents.
+    fn set_back_past_with_history(
+        &self,
+        region: &Region2,
+        from: Vec2,
+        direction: Vec2,
+        rise: f64,
+        height: f64,
+        into: Vec2,
+        by: f64,
+    ) -> Option<CornerTailWithHistory> {
+        self.set_back_past(region, from, direction, rise, height, into, by).map(|region| CornerTailWithHistory { region, outer: Vec::new() })
+    }
     /// Where the flat is cut at one end of a bend's zone that a tear relief parts: along the zone's
     /// end from `from` toward `to`, from `depth` back inside the panel that runs on out to the
     /// farthest corner of the ending panel's `outline` on the line square to its anchor `ends` at

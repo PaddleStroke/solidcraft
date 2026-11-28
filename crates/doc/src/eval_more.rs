@@ -1344,6 +1344,7 @@ pub(super) fn sheet_eval(
             corner_relief,
             bend_relief_shape,
             corners,
+            offset,
         } if surface_flange_sheet(st, body, f, edges).is_some() => {
             if corners.len() > 2000 {
                 return Err(DocError::Invalid("at most 2000 flange corner choices are supported".into()));
@@ -1367,6 +1368,10 @@ pub(super) fn sheet_eval(
                 Some(name) => sheet::HeightFrom::parse(name)
                     .ok_or_else(|| DocError::Invalid(format!("unknown flange height datum `{name}` (outer, inner or tangent)")))?,
                 None => sheet::HeightFrom::Outer,
+            };
+            let offset = match offset {
+                Some(e) => val(vals, e, Kind::Length)?,
+                None => 0.0,
             };
             // Each edge's own height and angle, else the feature's, and the stretches it bends in:
             // the whole edge, or each run of its segments (see `segment_runs`). Every segment is
@@ -1448,7 +1453,7 @@ pub(super) fn sheet_eval(
             let mut square = Vec::with_capacity(picks.len());
             for (k, (edge, runs)) in picks.into_iter().enumerate() {
                 // One bend for each run: a split edge's butt where its runs meet.
-                let (joints, sides) = sk.flanges_on(edge, &runs, rr, position, from).map_err(named(k))?;
+                let (joints, sides) = sk.flanges_on(edge, &runs, rr, position, offset, from).map_err(named(k))?;
                 square.push(sides);
                 if let Some((relief, size)) = own {
                     for &joint in &joints {
@@ -1476,7 +1481,7 @@ pub(super) fn sheet_eval(
             }
             let made: Vec<usize> = made.into_iter().flatten().collect();
             sk.clear_of_neighbours(&made)?;
-            tag_panels(&mut sk, Some(&before), n0, f.id, PanelsBy::Bends(&[]));
+            tag_panels(&mut sk, Some(&before), n0, f.id, PanelsBy::Bends(&[], offset.abs()));
             if !corners.is_empty() {
                 let prev = std::mem::take(&mut sk.parts);
                 let solid = sk.build()?;
@@ -1542,7 +1547,7 @@ pub(super) fn sheet_eval(
                 let before = sk.clone();
                 let n0 = sk.sheet.panels.len();
                 sk.add_path_flange(edge.0, &path, rr)?;
-                tag_panels(sk, Some(&before), n0, f.id, PanelsBy::Bends(&lines));
+                tag_panels(sk, Some(&before), n0, f.id, PanelsBy::Bends(&lines, 0.0));
             }
             rebuild_surface_sheet(st, i)
         }
@@ -1614,7 +1619,7 @@ pub(super) fn sheet_eval(
             for edge in found {
                 sk.add_hem_on(edge, l, g, *flip)?;
             }
-            tag_panels(&mut sk, Some(&before), n0, f.id, PanelsBy::Bends(&[]));
+            tag_panels(&mut sk, Some(&before), n0, f.id, PanelsBy::Bends(&[], 0.0));
             if let Some(slot) = st.surface_sheets.get_mut(i) {
                 *slot = sk;
             }
@@ -1963,7 +1968,7 @@ struct ExtrudeCut {
 /// extrude or a missing sketch.
 fn extrude_cut(st: &ModelState, f: &Feature) -> Result<Option<ExtrudeCut>> {
     let FeatureKind::Extrude { sketch, profiles, operation, extent, .. } = &f.kind else { return Ok(None) };
-    if extent.taper.is_some() {
+    if extent.taper.is_some() || extent.taper2.is_some() {
         return Ok(None);
     }
     let Some(ss) = st.sketch(sketch.0) else { return Ok(None) };
@@ -2135,21 +2140,32 @@ pub(super) fn surface_prism_cut(
                     if out.bores.iter().any(|b| b.panel == p) {
                         return Ok(Vec::new());
                     }
-                    let Ok((kept, parted)) = crate::sheet_surface_cuts::left_of_panel(&out, p, std::slice::from_ref(&mapped), tol) else {
+                    let Ok((kept, origins, parted)) = crate::sheet_surface_cuts::left_of_panel(&out, p, std::slice::from_ref(&mapped), tol) else {
                         return Ok(Vec::new());
                     };
-                    let Some(panel) = out.sheet.panels.get_mut(p) else { return Ok(Vec::new()) };
-                    panel.region = kept;
+                    out.set_panel_region(p, kept, origins)?;
                     out.loose.extend(parted.into_iter().map(|region| crate::Loose { panel: p, region }));
                     continue;
                 }
+                let mut origins = out.panel_origins(p);
                 let Some(panel) = out.sheet.panels.get_mut(p) else { return Ok(Vec::new()) };
                 if !crate::sheet_surface::holds_clear(&panel.region, &Region2 { outer: mapped.outer.clone(), holes: Vec::new() }) {
                     return Ok(Vec::new());
                 }
                 let hole = mapped.outer.ccw().reversed();
+                if sheet::FlatWork::new().charge_history(
+                    hole.segs
+                        .len()
+                        .checked_mul(std::mem::size_of::<Option<Vec<crate::sheet_surface::ConvertedEdge>>>())
+                        .and_then(|n| n.checked_add(std::mem::size_of::<Vec<Option<Vec<crate::sheet_surface::ConvertedEdge>>>>())),
+                ) {
+                    origins.holes.push(vec![None; hole.segs.len()]);
+                } else {
+                    origins = crate::sheet_surface::RegionOrigins::default();
+                }
                 panel.region.holes.push(hole.clone());
                 let holder = panel.name.clone();
+                out.remember_panel_origins(p, origins);
                 out.loose.extend(mapped.holes.iter().map(|h| crate::Loose { panel: p, region: Region2 { outer: h.ccw(), holes: Vec::new() } }));
                 // Its walls are named after the curves of the cut's profiles they lie on, read in the
                 // sketch's plane, which is parallel to the panel (the cut goes square through both),
@@ -2359,6 +2375,7 @@ pub(super) fn surface_hole_cut(f: &Feature, st: &mut ModelState, tools: &[super:
                     }
                 }
             }
+            let mut origins = out.panel_origins(p);
             let Some(panel) = out.sheet.panels.get_mut(p) else { return Ok(Vec::new()) };
             if across {
                 let circle = Region2 { outer: Loop2::circle(Vec2::new(b.x, b.y), radius), holes: Vec::new() };
@@ -2373,7 +2390,20 @@ pub(super) fn surface_hole_cut(f: &Feature, st: &mut ModelState, tools: &[super:
                         drill_role: Some(format!("{role}:side:0")),
                     });
                 }
+                if sheet::FlatWork::new().charge_history(
+                    circle
+                        .outer
+                        .segs
+                        .len()
+                        .checked_mul(std::mem::size_of::<Option<Vec<crate::sheet_surface::ConvertedEdge>>>())
+                        .and_then(|n| n.checked_add(std::mem::size_of::<Vec<Option<Vec<crate::sheet_surface::ConvertedEdge>>>>())),
+                ) {
+                    origins.holes.push(vec![None; circle.outer.segs.len()]);
+                } else {
+                    origins = crate::sheet_surface::RegionOrigins::default();
+                }
                 panel.region.holes.push(circle.outer.ccw().reversed());
+                out.remember_panel_origins(p, origins);
             } else {
                 // Through the panel's material only, a hair past it where it runs out of it.
                 let source = role.as_ref().map(|role| crate::sheet::BoreSource { feature: f.id, role: role.clone() });
@@ -2406,7 +2436,7 @@ pub(super) fn surface_sheet_join(
     constructor: Option<&ExtrudeConstructor>,
 ) -> Result<Vec<String>> {
     let FeatureKind::Extrude { sketch, profiles, extent, .. } = &f.kind else { return Ok(Vec::new()) };
-    if extent.taper.is_some() {
+    if extent.taper.is_some() || extent.taper2.is_some() {
         return Ok(Vec::new());
     }
     let Some(c) = constructor else { return Ok(Vec::new()) };
@@ -2424,7 +2454,8 @@ pub(super) fn surface_sheet_join(
         }
         let Some((panels, _)) = sk.pieces_in_space() else { continue };
         let Ok(dev) = sk.develop() else { continue };
-        let Ok(pieces) = crate::sheet_surface::pieces(&dev, &mut sheet::FlatWork::new()) else { continue };
+        let Ok(pieces) = crate::sheet_surface::pieces(&dev, &[], &[], &mut sheet::FlatWork::new()) else { continue };
+        let pieces = pieces.geometry;
         let t = sk.thickness;
         let tol = 1e-7;
         // Each region into the one panel it is one sheet thick in, touches and joins, apart from
@@ -2469,11 +2500,25 @@ pub(super) fn surface_sheet_join(
                 break;
             }
             let Some((p, mapped)) = found else { break };
-            let Some(panel) = out.sheet.panels.get_mut(p) else { return Ok(Vec::new()) };
-            let grown =
-                kernel::planar_regions_boolean(std::slice::from_ref(&panel.region), std::slice::from_ref(&mapped), kernel::BoolOp::Union, 1e-7)?;
-            let Ok([one]) = <[Region2; 1]>::try_from(grown) else { return Ok(Vec::new()) };
-            panel.region = one;
+            let origins = out.panel_origins(p);
+            let Some(panel) = out.sheet.panels.get(p) else { return Ok(Vec::new()) };
+            let grown = crate::sheet_surface::compose_regions(
+                kernel::planar_regions_boolean_with_history(
+                    std::slice::from_ref(&panel.region),
+                    std::slice::from_ref(&mapped),
+                    kernel::BoolOp::Union,
+                    1e-7,
+                )?,
+                &[origins],
+                &[],
+                &mut crate::sheet::FlatWork::new(),
+            );
+            let Ok([(one, origins)]) =
+                <[(Region2, crate::sheet_surface::RegionOrigins); 1]>::try_from(grown.geometry.into_iter().zip(grown.origins).collect::<Vec<_>>())
+            else {
+                return Ok(Vec::new());
+            };
+            out.set_panel_region(p, one, origins)?;
             placed += 1;
         }
         if placed == 0 {
@@ -3046,7 +3091,7 @@ pub(super) fn plastic_eval(doc: &Document, vals: &BTreeMap<String, Value>, f: &F
                 let i = st.bodies.iter().position(|b| b.name == target).ok_or_else(|| DocError::Invalid("boss body".into()))?;
                 let Some(mb) = st.bodies.get(i).cloned() else { return Err(DocError::Invalid("boss body".into())) };
                 let mut warn = None;
-                let edges = resolve_edges(&mb.body, &[position.0 + x * r0], &[], &mut warn)?;
+                let edges: Vec<Vec3> = resolve_edges(&mb.body, &[position.0 + x * r0], &[], false, &mut warn)?.into_iter().map(|(_, p)| p).collect();
                 let nb = mb.traced().then(kernel::fillet(&mb.body, &edges, rf)?);
                 if let Some(slot) = st.bodies.get_mut(i) {
                     *slot = mb.remade(nb);
@@ -3232,8 +3277,9 @@ fn drawn_lines(ss: &SolvedSketch, ids: &[String]) -> Vec<(String, String)> {
 #[derive(Clone, Copy)]
 enum PanelsBy<'a> {
     /// Bends on rims of the sheet before the feature (flanges, hems), and on each other along a
-    /// path flange's path, whose lines these are (see [`drawn_lines`]), in its order.
-    Bends(&'a [(String, String)]),
+    /// path flange's path, whose lines these are (see [`drawn_lines`]), in its order; the second
+    /// is how far a bend may stand past its position's setback (an edge flange's bend offset).
+    Bends(&'a [(String, String)], f64),
     /// A fold along the line between these points (the body's coordinates), from the first to
     /// the second, parting panels of the sheet before it.
     Fold([Vec3; 2]),
@@ -3281,7 +3327,7 @@ fn tag_panels(sk: &mut crate::SurfaceSheet, before: Option<&crate::SurfaceSheet>
                 let along = fold_way(j.a.panel).map_or(j.b.origin.dot(j.b.dir), |way| j.b.origin.dot(way));
                 made.push((p, PanelMade::Fold { feature, from: on_key.clone(), place: 0 }, format!("F{feature}/{on_key}"), along));
             }
-            PanelsBy::Bends(lines) if j.a.panel >= from => {
+            PanelsBy::Bends(lines, _) if j.a.panel >= from => {
                 // Along a path flange's path: its line at the panel's place along the path.
                 let mut depth = 1;
                 let mut at = j.a.panel;
@@ -3297,12 +3343,12 @@ fn tag_panels(sk: &mut crate::SurfaceSheet, before: Option<&crate::SurfaceSheet>
                 let Some((curve, line)) = lines.get(depth) else { continue };
                 made.push((p, PanelMade::Chain { feature, curve: curve.clone() }, format!("F{feature}/{line}"), stands));
             }
-            PanelsBy::Bends(_) => {
+            PanelsBy::Bends(_, past) => {
                 // On a rim of the sheet as it was: a bend's anchor lies inside the edge it was
                 // drawn on by its setback, within the radius and a thickness, whichever way the
-                // bend was placed on the edge.
+                // bend was placed on the edge, and past that by its offset.
                 let band = match &j.kind {
-                    JointKind::Bend(bend) => 2.0 * (bend.radius + sk.thickness),
+                    JointKind::Bend(bend) => 2.0 * (bend.radius + sk.thickness) + past,
                     _ => 0.0,
                 };
                 let on = before.and_then(|b| b.rim_part_along(j.a.panel, j.a.origin, j.a.dir, band));
@@ -3337,6 +3383,9 @@ fn tag_panels(sk: &mut crate::SurfaceSheet, before: Option<&crate::SurfaceSheet>
     for (p, recipe, _, _) in made {
         let Some(key) = keys.get(p).cloned() else { continue };
         if let Some(panel) = sk.sheet.panels.get_mut(p) {
+            if let Some(boundary) = sk.converted_boundaries.remove(&panel.name) {
+                sk.converted_boundaries.insert(key.clone(), boundary);
+            }
             panel.name.clone_from(&key);
         }
         sk.recipes.retain(|(k, _)| *k != key);

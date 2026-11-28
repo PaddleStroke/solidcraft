@@ -87,7 +87,7 @@ use crate::curve::curve::p2::FindCurveDistanceExtrema;
 use crate::curve::curve::p2::{
     at, unitize_tangent, Curve, CurveEvaluate, CurveKind, CurvePropertyType,
 };
-use crate::curve::curve::p3::eval_n;
+use crate::curve::curve::p3::{charge_query_work, eval_n};
 use crate::curve::ellipse::Ellipse;
 use crate::curve::line::Line;
 use crate::error::curve::{CurveFailure, FunctionGap, PropertyOption};
@@ -1382,6 +1382,9 @@ impl<'a, C: CurveEvaluate + ?Sized> CurvePropertyEfo<'a, C> {
 
     /// `m_crCurve.Evaluate(dT, n, TRUE, sC, non_zero)` into four entries.
     fn eval(&self, k: &Kernel, t: f64, n: usize, non_zero: bool) -> Result<[Vec3; 4]> {
+        // PointInversion requests D1 into four caller entries: two extra Vec3s
+        // beyond that native call's ordinary two-entry caller allowance.
+        charge_query_work(k, Some(48), OP_EFO)?;
         eval_n(k, self.curve, t, n, true, non_zero)
     }
 }

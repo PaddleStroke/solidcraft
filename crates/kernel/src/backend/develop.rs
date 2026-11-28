@@ -9,7 +9,8 @@ use solidcore_record::brep::Curve;
 use solidcore_record::develop::{Anchor, Bead, BeadForm, BeadOutline, Bend, Development, Lap, Rigid2, Rigid3, Sheet, Surface};
 use solidcore_record::{Loop2, Region2, Seg2, Vec2, Vec3};
 use solidcraft_kernel_api::develop::{
-    BeadAgainst, BeadRefusal, ContourRefusal, CornerTailRefusal, Develop, Folded, JointRefusal, PanelRefusal, Refusal, RuleRefusal,
+    BeadAgainst, BeadRefusal, ContourRefusal, CornerTailParent, CornerTailRefusal, CornerTailWithHistory, Develop, Folded, JointRefusal,
+    PanelRefusal, Refusal, RuleRefusal,
 };
 
 use super::Solidcore;
@@ -164,8 +165,50 @@ impl Develop for Solidcore {
         ops::retarget_corner_tail(region, edge, anchor_origin, anchor_direction, bend_length, old_cut, new_cut).map_err(corner_tail_refusal)
     }
 
+    fn retarget_corner_tail_with_history(
+        &self,
+        region: &Region2,
+        edge: [Vec2; 2],
+        anchor_origin: Vec2,
+        anchor_direction: Vec2,
+        bend_length: f64,
+        old_cut: f64,
+        new_cut: f64,
+    ) -> Result<CornerTailWithHistory, CornerTailRefusal> {
+        ops::retarget_corner_tail_with_history(region, edge, anchor_origin, anchor_direction, bend_length, old_cut, new_cut)
+            .map_err(corner_tail_refusal)
+            .map(|out| CornerTailWithHistory {
+                region: out.region,
+                outer: out
+                    .outer
+                    .into_iter()
+                    .map(|p| p.map(|ps| ps.map(|p| p.map(|p| CornerTailParent { segment: p.segment, whole: p.whole }))))
+                    .collect(),
+            })
+    }
+
     fn set_back_past(&self, region: &Region2, from: Vec2, direction: Vec2, rise: f64, height: f64, into: Vec2, by: f64) -> Option<Region2> {
         ops::set_back_past(region, from, direction, rise, height, into, by)
+    }
+
+    fn set_back_past_with_history(
+        &self,
+        region: &Region2,
+        from: Vec2,
+        direction: Vec2,
+        rise: f64,
+        height: f64,
+        into: Vec2,
+        by: f64,
+    ) -> Option<CornerTailWithHistory> {
+        ops::set_back_past_with_history(region, from, direction, rise, height, into, by).map(|out| CornerTailWithHistory {
+            region: out.region,
+            outer: out
+                .outer
+                .into_iter()
+                .map(|p| p.map(|ps| ps.map(|p| p.map(|p| CornerTailParent { segment: p.segment, whole: p.whole }))))
+                .collect(),
+        })
     }
 
     fn tear_slit(&self, from: Vec2, to: Vec2, depth: f64, ends: &Anchor, at: f64, outline: &Loop2, place: &Rigid2) -> Option<[Vec2; 2]> {

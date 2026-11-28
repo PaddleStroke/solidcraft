@@ -110,7 +110,9 @@ use crate::curve::curve::p2::{
     proj_signed_angle, push_point, stack_look, test_step, CpGlobalSolver, Curve, CurveKind,
     CurvePropertyType, TessStepResult, BSPLINE_CURVE_TYPE, CRV_ON_SURF_TYPE,
 };
-use crate::curve::curve::p3::{eval_n, local_curve_intersect, PointSolveOptions};
+use crate::curve::curve::p3::{
+    charge_query_work, eval_n, local_curve_intersect, PointSolveOptions,
+};
 use crate::curve::curve::p4::proj_dist;
 use crate::curve::curve::p5::{local_property_analysis, make_curve_cache};
 use crate::curve::curve_cache::CurveCache;
@@ -1050,6 +1052,22 @@ impl<'t, O: SolutionObject + 't> CpGlobalSolver<'t, O> {
     /// branch node, curve or option vector or a node that is not a curve leaf; those
     /// of `Unitize`, the signed angle, `AddSortedSolution` and `LocalPropertyAnalysis`.
     pub fn local_solve_branch(&mut self, k: &Kernel, branch: &Branch) -> Result<bool> {
+        if let Some(work) = k.context.proof_work() {
+            if self.base.operation != SolverOperation::Minimize
+                || self.base.solution_requested != SolutionRequested::Single
+                || !self.base.opt_vectors.is_empty()
+                || !self
+                    .base
+                    .proof_work
+                    .as_ref()
+                    .is_some_and(|owner| owner.same_operation(work))
+            {
+                work.disable();
+                return Err(work.stopped(OP_LOCAL));
+            }
+        }
+        // Actual span264, interval16, empty option header24 and fixed leaf slots.
+        charge_query_work(k, Some(264 + 16 + 24 + 128), OP_LOCAL)?;
         // init outputs
         let needs_more_subdivision = false;
         // the fork passes on the statuses below (tangency-labs/smlib 8311f8e)
@@ -1117,14 +1135,18 @@ impl<'t, O: SolutionObject + 't> CpGlobalSolver<'t, O> {
         if (is_zero(bez_ivl.min() - parent_ivl.min()) || is_zero(bez_ivl.max() - parent_ivl.max()))
             && (is_zero(interval.min() - parent_ivl.min())
                 && is_zero(interval.max() - parent_ivl.max()))
-            && curve.is_closed(k, &parent_ivl, 0.0)?
+            && {
+                let closed = curve.is_closed(k, &parent_ivl, 0.0);
+                charge_query_work(k, Some(0), OP_LOCAL)?;
+                closed?
+            }
         {
             // get pCurve1's end continuity. A continuity that cannot be evaluated is no
             // evidence of one: the ends stay discontinuous, upstream's initial value
             // (the fork's `SER` here fails every closed curve that cannot give three
             // derivatives, a conic or a tangent field, so nothing could be dropped onto
             // one; [`SolidError::Unported`] and cancellation still propagate)
-            let continuity = ignored(evaluate_continuity(
+            let continuity = evaluate_continuity(
                 k,
                 curve,
                 parent_ivl.min(),
@@ -1133,8 +1155,10 @@ impl<'t, O: SolutionObject + 't> CpGlobalSolver<'t, O> {
                 parent_ivl.max(),
                 true,
                 CONTINUITY_ANGLE,
-            ))?
-            .map_or(ContinuityType::Discontinuous, |c| c.continuity);
+            );
+            charge_query_work(k, Some(0), OP_LOCAL)?;
+            let continuity =
+                ignored(continuity)?.map_or(ContinuityType::Discontinuous, |c| c.continuity);
             // set span endContinuities as appropriate
             if is_zero(bez_ivl.min() - parent_ivl.min()) {
                 conts[0] = continuity;
@@ -1176,6 +1200,7 @@ impl<'t, O: SolutionObject + 't> CpGlobalSolver<'t, O> {
                         && (conts[1] as i32) > (ContinuityType::C0 as i32))));
 
         // locals
+        charge_query_work(k, Some(6 * 8 + 24 + 64), OP_LOCAL)?;
         let mut guesses: Vec<f64> = Vec::with_capacity(6);
 
         // get BezierCurve EndPoints and the vector between them (statuses ignored
@@ -1209,6 +1234,7 @@ impl<'t, O: SolutionObject + 't> CpGlobalSolver<'t, O> {
                 }
 
                 // save this as a solution
+                charge_query_work(k, Some(512), OP_LOCAL)?;
                 let mut solution: Solution<O> = Solution::new();
                 solution.solution_type = SolutionType::SingleValue;
                 solution.nodes[0] = branch[0];
@@ -1255,7 +1281,14 @@ impl<'t, O: SolutionObject + 't> CpGlobalSolver<'t, O> {
                         [point, tangent, ..] => (*point, *tangent),
                         _ => continue,
                     },
-                    Err(e) if e.is_unported_or_cancelled() => return Err(e),
+                    Err(e)
+                        if e.is_unported_or_cancelled()
+                            || k.context
+                                .proof_work()
+                                .is_some_and(crate::geom::context::ProofWork::is_disabled) =>
+                    {
+                        return Err(e)
+                    }
                     Err(_) => continue,
                 };
                 let outward = if is_start { -tangent } else { tangent };
@@ -1265,7 +1298,14 @@ impl<'t, O: SolutionObject + 't> CpGlobalSolver<'t, O> {
                 let value =
                     match proj_dist(k, curve, parameter, test_pnt, normal, true, Vec3::ZERO, op) {
                         Ok(d) => d,
-                        Err(e) if e.is_unported_or_cancelled() => return Err(e),
+                        Err(e)
+                            if e.is_unported_or_cancelled()
+                                || k.context
+                                    .proof_work()
+                                    .is_some_and(crate::geom::context::ProofWork::is_disabled) =>
+                        {
+                            return Err(e)
+                        }
                         Err(_) => continue,
                     };
                 let mut at_end: Solution<O> = Solution::new();
@@ -1323,6 +1363,14 @@ impl<'t, O: SolutionObject + 't> CpGlobalSolver<'t, O> {
         };
 
         // init solution search locals
+        if let Some(work) = k.context.proof_work() {
+            if guesses.len() > 4 {
+                work.disable();
+                return Err(work.stopped(OP_LOCAL));
+            }
+        }
+        // Six fixed solution slots, one scratch solution and bounded guess work.
+        charge_query_work(k, Some(7 * 512 + 24 + 32), OP_LOCAL)?;
         let mut solution: Solution<O> = Solution::new();
         let mut coin_solutions: Vec<Solution<O>> = Vec::with_capacity(6);
         let mut found_solution: bool;
@@ -1361,6 +1409,9 @@ impl<'t, O: SolutionObject + 't> CpGlobalSolver<'t, O> {
 
         // for every guess point
         for i in 0..num_guesses {
+            // Fixed leaf iteration/solution-copy work; native evaluations and
+            // sorted Single insertion are debited at their actual own calls.
+            charge_query_work(k, Some(2 * 512), OP_LOCAL)?;
             let guess = guesses.get(i).copied().unwrap_or(0.0);
 
             // for projected, directed, and signed pivot cases
@@ -1428,7 +1479,14 @@ impl<'t, O: SolutionObject + 't> CpGlobalSolver<'t, O> {
                     &mut solution,
                 ) {
                     Ok(f) => found_solution = f,
-                    Err(e) if e.is_unported_or_cancelled() => return Err(e),
+                    Err(e)
+                        if e.is_unported_or_cancelled()
+                            || k.context
+                                .proof_work()
+                                .is_some_and(crate::geom::context::ProofWork::is_disabled) =>
+                    {
+                        return Err(e)
+                    }
                     Err(_) => continue, // If error try another guess
                 }
 
@@ -1471,7 +1529,14 @@ impl<'t, O: SolutionObject + 't> CpGlobalSolver<'t, O> {
                         op,
                     ) {
                         Ok(d) => d,
-                        Err(e) if e.is_unported_or_cancelled() => return Err(e),
+                        Err(e)
+                            if e.is_unported_or_cancelled()
+                                || k.context
+                                    .proof_work()
+                                    .is_some_and(crate::geom::context::ProofWork::is_disabled) =>
+                        {
+                            return Err(e)
+                        }
                         Err(e) => status_value(&e),
                     };
                 }
@@ -1497,7 +1562,14 @@ impl<'t, O: SolutionObject + 't> CpGlobalSolver<'t, O> {
                         found_solution = f;
                         merge_point_solution(&mut solution, f, &s, local_op);
                     }
-                    Err(e) if e.is_unported_or_cancelled() => return Err(e),
+                    Err(e)
+                        if e.is_unported_or_cancelled()
+                            || k.context
+                                .proof_work()
+                                .is_some_and(crate::geom::context::ProofWork::is_disabled) =>
+                    {
+                        return Err(e)
+                    }
                     Err(_) => continue, // If have an error move on to next guess
                 }
             }
@@ -1688,7 +1760,14 @@ impl<'t, O: SolutionObject + 't> CpGlobalSolver<'t, O> {
                             continue;
                         }
                     }
-                    Err(e) if e.is_unported_or_cancelled() => return Err(e),
+                    Err(e)
+                        if e.is_unported_or_cancelled()
+                            || k.context
+                                .proof_work()
+                                .is_some_and(crate::geom::context::ProofWork::is_disabled) =>
+                    {
+                        return Err(e)
+                    }
                     // nothing to measure, or a curve without second derivatives: no verdict
                     Ok(None) | Err(_) => {}
                 }
@@ -1718,6 +1797,7 @@ impl<'t, O: SolutionObject + 't> CpGlobalSolver<'t, O> {
             self.add_solution(&solution, by_value_main)?;
         }
 
+        charge_query_work(k, Some(2 * 512), OP_LOCAL)?;
         let by_value_coin = matches!(
             op,
             SolverOperation::Minimize
@@ -1833,7 +1913,10 @@ fn drop_point_fast<O: Copy>(
     handle: Option<O>,
 ) -> Result<Vec<Solution<O>>> {
     match curve.kind() {
-        CurveKind::Line(l) => l.drop_point_fast(interval, op, point, tol, target_distance, handle),
+        CurveKind::Line(l) => {
+            charge_query_work(k, Some(512 + 24), OP_GLOBAL)?;
+            l.drop_point_fast(interval, op, point, tol, target_distance, handle)
+        }
         CurveKind::Ellipse(e) => e.drop_point_fast(
             k,
             interval,
@@ -1852,6 +1935,17 @@ fn drop_point_fast<O: Copy>(
             },
         )),
     }
+}
+
+fn reserve_fast_result_array(k: &Kernel, count: usize, fresh: bool) -> Result<()> {
+    if let Some(work) = k.context.proof_work() {
+        if count > 1 {
+            work.disable();
+            return Err(work.stopped(OP_GLOBAL));
+        }
+    }
+    // Primary capacity4S plus one copiedS; fresh header is not paid twice.
+    charge_query_work(k, Some(5 * 512 + if fresh { 64 } else { 0 }), OP_GLOBAL)
 }
 
 impl Curve {
@@ -1979,6 +2073,16 @@ impl Curve {
         opts: &GlobalPointSolveOptions<'_, O>,
         cache: &mut Option<CurveCache<O>>,
     ) -> Result<SolutionArray<O>> {
+        if let Some(work) = k.context.proof_work() {
+            if op != SolverOperation::Minimize
+                || requested != SolutionRequested::Single
+                || opts.opt_vectors.is_some_and(|v| !v.is_empty())
+                || opts.target_distance.is_some()
+            {
+                work.disable();
+                return Err(work.stopped(OP_GLOBAL));
+            }
+        }
         let target = opts.target_distance;
 
         // (not upstream, #13675) A tangent field switches to its stored end vectors in
@@ -1998,7 +2102,7 @@ impl Curve {
 
         // Try quick solves when MINIMIZING and INTERSECTING (without using curve cache)
         if op == SolverOperation::Minimize || op == SolverOperation::Intersect {
-            if let Some(sols) = ignored(drop_point_fast(
+            let fast = drop_point_fast(
                 k,
                 self,
                 interval,
@@ -2008,7 +2112,10 @@ impl Curve {
                 target,
                 requested,
                 opts.handle,
-            ))? {
+            );
+            charge_query_work(k, Some(0), OP_GLOBAL)?;
+            if let Some(sols) = ignored(fast)? {
+                reserve_fast_result_array(k, sols.len(), true)?;
                 let mut out = SolutionArray::new();
                 for s in &sols {
                     out.add(s);
@@ -2018,30 +2125,37 @@ impl Curve {
         }
 
         // get target curve's cache
+        charge_query_work(k, Some(64), OP_GLOBAL)?;
         let mut solutions: SolutionArray<O> = SolutionArray::new();
         let cache = match cache {
             Some(c) => c,
-            slot @ None => slot.insert(match make_curve_cache::<O>(k, self, opts.handle) {
-                Ok(c) => c,
-                Err(e) if e.is_unported_or_cancelled() => return Err(e),
-                Err(e) => {
-                    return Err(Failure::new(OP_GLOBAL, CurveFailure::CacheNotBuilt)
-                        .caused_by(e)
-                        .into_error())
-                }
-            }),
+            slot @ None => {
+                let built = make_curve_cache::<O>(k, self, opts.handle);
+                charge_query_work(k, Some(0), OP_GLOBAL)?;
+                slot.insert(match built {
+                    Ok(c) => c,
+                    Err(e) if e.is_unported_or_cancelled() => return Err(e),
+                    Err(e) => {
+                        return Err(Failure::new(OP_GLOBAL, CurveFailure::CacheNotBuilt)
+                            .caused_by(e)
+                            .into_error())
+                    }
+                })
+            }
         };
 
         // Analytical Curve Optimization
         if op == SolverOperation::Minimize || op == SolverOperation::Intersect {
-            if let Some(analytic) = cache.analytic_curve(k)? {
+            let analytic = cache.analytic_curve(k);
+            charge_query_work(k, Some(0), OP_GLOBAL)?;
+            if let Some(analytic) = analytic? {
                 // (the cache's analytic curve is this curve when it is analytic)
                 let analytic_handle = if self.is_analytic() {
                     opts.handle
                 } else {
                     opts.analytic_handle
                 };
-                if let Some(sols) = ignored(drop_point_fast(
+                let fast = drop_point_fast(
                     k,
                     analytic,
                     interval,
@@ -2051,7 +2165,10 @@ impl Curve {
                     target,
                     requested,
                     analytic_handle,
-                ))? {
+                );
+                charge_query_work(k, Some(0), OP_GLOBAL)?;
+                if let Some(sols) = ignored(fast)? {
+                    reserve_fast_result_array(k, sols.len(), false)?;
                     for s in &sols {
                         solutions.add(s);
                     }
@@ -2089,7 +2206,8 @@ impl Curve {
 
         // Execute a Point/CurveLeafNode solution for every LeafNode in the target
         // curve's cache.
-        let point_tree: Tree<O> = Tree::from_point(test_point, 0.0, false);
+        let point_tree: Tree<O> =
+            Tree::from_point_with_work(test_point, 0.0, false, k.context.proof_work())?;
         let curve_tree = cache.tree().ok_or_else(|| {
             Failure::new(
                 OP_GLOBAL,
@@ -2102,7 +2220,11 @@ impl Curve {
         })?;
 
         // Construct and init global solver
+        // Four fixed record envelopes cover original constructor state/moves.
+        // Point-tree1448, owner setter32 and global setup280 pay their own hooks.
+        charge_query_work(k, Some(4 * 512), OP_GLOBAL)?;
         let mut gs = CpGlobalSolver::new(k, &point_tree, curve_tree, *interval).with_curve(self);
+        gs.base.set_proof_work(k.context.proof_work())?;
         gs.base.fixes = k.fixes;
         gs.zone_tol_3d = opts.zone_tol_3d;
 
@@ -3252,5 +3374,79 @@ mod tests {
             .unwrap();
         assert!(r.passes);
         assert!(r.max_dist < 1e-12);
+    }
+
+    #[test]
+    fn optional_fast_line_result_array_is_priced_before_returning() {
+        use crate::curve::line::Line;
+        use crate::geom::context::ProofWork;
+        let original = Kernel::default();
+        let curve = Curve::from(Line::from_points(Vec3::ZERO, Vec3::new(10.0, 0.0, 0.0), 3));
+        let interval = curve.natural_interval();
+        let point = Vec3::new(2.5, 2.0, 0.0);
+        let expected = curve
+            .drop_point(
+                &original,
+                &interval,
+                point,
+                None,
+                1e-8,
+                None,
+                SolverOperation::Minimize,
+            )
+            .unwrap();
+        assert!(expected.success);
+        assert!((expected.parameter - 0.25).abs() < 1e-9);
+        assert!((expected.distance - 2.0).abs() < 1e-9);
+        let allowance = crate::prism::sheet::READ_WORK;
+        let work = ProofWork::new(allowance);
+        let query = original.optional_proof_view(&work).unwrap();
+        // The simple line takes the existing immediate fast return, never a tree.
+        // This headroom admits its one-result Vec but not the outer result array.
+        assert!(work.charge(Some(u64::try_from(allowance - 6400).unwrap())));
+        assert!(!work.is_disabled());
+        assert!(matches!(
+            curve.drop_point(
+                &query,
+                &interval,
+                point,
+                None,
+                1e-8,
+                None,
+                SolverOperation::Minimize,
+            ),
+            Err(SolidError::OutOfFuel { .. })
+        ));
+        assert!(work.is_disabled());
+        let ample = ProofWork::new(allowance);
+        let query = original.optional_proof_view(&ample).unwrap();
+        let actual = curve
+            .drop_point(
+                &query,
+                &interval,
+                point,
+                None,
+                1e-8,
+                None,
+                SolverOperation::Minimize,
+            )
+            .unwrap();
+        assert_eq!(actual.success, expected.success);
+        assert_eq!(actual.parameter.to_bits(), expected.parameter.to_bits());
+        assert_eq!(actual.distance.to_bits(), expected.distance.to_bits());
+        assert!(!ample.is_disabled());
+        let after = curve
+            .drop_point(
+                &original,
+                &interval,
+                point,
+                None,
+                1e-8,
+                None,
+                SolverOperation::Minimize,
+            )
+            .unwrap();
+        assert_eq!(after.parameter.to_bits(), expected.parameter.to_bits());
+        assert_eq!(after.distance.to_bits(), expected.distance.to_bits());
     }
 }

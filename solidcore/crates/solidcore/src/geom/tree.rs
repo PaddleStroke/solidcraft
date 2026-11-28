@@ -92,6 +92,8 @@
 
 use std::sync::Arc;
 
+use crate::geom::context::ProofWork;
+
 use crate::curve::curve_cache::{BezierAux1d, BezierSpan};
 use crate::error::{Result, SolidError};
 use crate::geom::extent3d::Extent3d;
@@ -682,6 +684,32 @@ impl<O: Copy + PartialEq> Tree<O> {
         tree.nodes.push(node);
         tree.top = Some(NodeId(0));
         tree
+    }
+
+    /// Query-only companion. Ordinary construction remains the original body.
+    pub(crate) fn from_point_with_work(
+        point: Point3,
+        point_size: f64,
+        with_object_list: bool,
+        work: Option<&ProofWork>,
+    ) -> Result<Self> {
+        if let Some(work) = work {
+            // CurveHandle query records: Tree168, initial node capacity4*208,
+            // node scratch/init+write2*208 and fixed bbox/bookkeeping32.
+            let cost = 168
+                + 4 * 208
+                + 2 * 208
+                + 32
+                + if with_object_list {
+                    4 * 88 + 2 * 88 + 16
+                } else {
+                    0
+                };
+            if !work.charge(Some(cost)) {
+                return Err(work.stopped("geom::tree::Tree::from_point_with_work"));
+            }
+        }
+        Ok(Self::from_point(point, point_size, with_object_list))
     }
 
     /// A spatial tree with one empty object-list node whose box is
@@ -2048,5 +2076,24 @@ mod tests {
         );
         t.set_owner_object(Some(TreeOwner::BrepCache));
         assert_eq!(t.owner_object().unwrap(), None);
+    }
+
+    #[test]
+    fn optional_proof_point_tree_keeps_exact_constructor_and_declines_before_allocation() {
+        let point = Point3::new(2.0, -3.0, 4.0);
+        let ordinary = Tree::<u64>::from_point(point, 0.125, false);
+        let work = ProofWork::new(16_000);
+        let observed = Tree::<u64>::from_point_with_work(point, 0.125, false, Some(&work)).unwrap();
+        assert_eq!(format!("{ordinary:?}"), format!("{observed:?}"));
+        assert!(!work.is_disabled());
+        let short = ProofWork::new(100);
+        assert!(matches!(
+            Tree::<u64>::from_point_with_work(point, 0.125, false, Some(&short)),
+            Err(SolidError::OutOfFuel { .. })
+        ));
+        assert!(short.is_disabled());
+        let ordinary_companion =
+            Tree::<u64>::from_point_with_work(point, 0.125, false, None).unwrap();
+        assert_eq!(format!("{ordinary:?}"), format!("{ordinary_companion:?}"));
     }
 }

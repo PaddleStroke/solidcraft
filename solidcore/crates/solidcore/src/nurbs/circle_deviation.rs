@@ -98,6 +98,7 @@
 
 use crate::error::query::QueryFailure;
 use crate::error::{Result, SolidError};
+use crate::geom::context::ProofWork;
 use crate::math::Vec3;
 use crate::nurbs::crv_basic::Curve;
 use crate::nurbs::knots::MAX_DEGREE;
@@ -154,6 +155,91 @@ pub fn hausdorff_about_circle(
     ib: [f64; 2],
     circle: &RefCircle,
 ) -> Result<Option<f64>> {
+    hausdorff_observed(a, ia, b, ib, circle, None)
+}
+
+/// The same finite-subarc certificate with one shared optional-proof allowance.
+pub(crate) fn hausdorff_about_circle_with_work(
+    a: &Curve,
+    ia: [f64; 2],
+    b: &Curve,
+    ib: [f64; 2],
+    circle: &RefCircle,
+    work: &ProofWork,
+) -> Result<Option<f64>> {
+    hausdorff_observed(a, ia, b, ib, circle, Some(work))
+}
+
+// Optional observer credit only. None does not evaluate new metadata readers.
+fn observe(work: Option<&ProofWork>, cost: impl FnOnce() -> Option<u64>) -> Result<()> {
+    if let Some(work) = work {
+        if !work.charge(cost()) {
+            return Err(work.stopped(OP));
+        }
+    }
+    Ok(())
+}
+
+fn count(n: usize) -> Option<u64> {
+    u64::try_from(n).ok()
+}
+
+// Raw NURB refine uses fresh arrays, with at most two inserted end knots here.
+fn refine_credit(c: &Curve, added: usize) -> Option<u64> {
+    let (n, k, p, h) = (
+        count(c.cpts().len())?,
+        count(c.knots().len())?,
+        count(c.degree())?,
+        count(added)?,
+    );
+    let storage = n
+        .checked_add(h)?
+        .checked_mul(32)?
+        .checked_add(k.checked_add(h)?.checked_mul(8)?)?
+        .checked_add(120)?;
+    let events = n
+        .checked_mul(7)?
+        .checked_add(k.checked_mul(17)?)?
+        .checked_add(h.checked_mul(2)?)?
+        .checked_add(h.checked_mul(p.checked_mul(24)?.checked_add(16)?)?)?
+        .checked_add(34)?;
+    storage.checked_add(events)
+}
+
+// The SAME native decomposition allocates every span before the interval filter.
+fn decompose_credit(c: &Curve, pieces: usize) -> Option<u64> {
+    let (k, p, s) = (count(c.knots().len())?, count(c.degree())?, count(pieces)?);
+    let q = p.checked_add(1)?;
+    let t = p.checked_mul(q)?.checked_div(2)?;
+    let growth = s.checked_mul(2)?.checked_add(4)?;
+    let storage = growth
+        .checked_mul(88)?
+        .checked_add(s.checked_mul(q.checked_mul(48)?.checked_add(80)?)?)?
+        .checked_add(q.checked_mul(16)?)?
+        .checked_add(96)?;
+    let row = 38_u64
+        .checked_add(p.checked_mul(16)?)?
+        .checked_add(t.checked_mul(32)?)?
+        .checked_add(q.checked_mul(7)?)?;
+    let events = k
+        .checked_mul(row)?
+        .checked_add(s.checked_mul(q.checked_mul(3)?.checked_add(64)?)?)?
+        .checked_add(q.checked_mul(5)?)?
+        .checked_add(k.checked_mul(6)?)?
+        .checked_add(64)?;
+    storage.checked_add(events)
+}
+
+fn hausdorff_observed(
+    a: &Curve,
+    ia: [f64; 2],
+    b: &Curve,
+    ib: [f64; 2],
+    circle: &RefCircle,
+    work: Option<&ProofWork>,
+) -> Result<Option<f64>> {
+    // Frame, two Near records and fixed comparison/rounding temporaries.
+    observe(work, || Some(4 * 512))?;
     let r = circle.radius;
     if !(r.is_finite() && r > 0.0) {
         return Err(SolidError::invalid_input(
@@ -165,10 +251,10 @@ pub fn hausdorff_about_circle(
         return Ok(None);
     }
     let frame = Frame::of(circle)?;
-    let Some(na) = Near::of(a, ia, &frame, r)? else {
+    let Some(na) = Near::of(a, ia, &frame, r, work)? else {
         return Ok(None);
     };
-    let Some(nb) = Near::of(b, ib, &frame, r)? else {
+    let Some(nb) = Near::of(b, ib, &frame, r, work)? else {
         return Ok(None);
     };
     // `b`'s ends on `a`'s side, so that all four ends' angles share `a`'s chart
@@ -329,8 +415,14 @@ impl Near {
         d > e
     }
 
-    fn of(c: &Curve, [lo, hi]: [f64; 2], frame: &Frame, r: f64) -> Result<Option<Self>> {
-        let Some((c, pieces, inserted)) = checked_pieces(c, [lo, hi])? else {
+    fn of(
+        c: &Curve,
+        [lo, hi]: [f64; 2],
+        frame: &Frame,
+        r: f64,
+        work: Option<&ProofWork>,
+    ) -> Result<Option<Self>> {
+        let Some((c, pieces, inserted)) = checked_pieces(c, [lo, hi], work)? else {
             return Ok(None);
         };
         let c = &c;
@@ -340,6 +432,8 @@ impl Near {
             [p.x, p.y, p.z, w]
         };
         // the refinement's error (module docs)
+        // Both ALL-input folds: homogeneous records, abs/max/divides and iteration.
+        observe(work, || count(c.cpts().len())?.checked_mul(128))?;
         let size = c.cpts().iter().fold(0.0_f64, |m, p| {
             let [x, y, z, w] = homog(p);
             m.max(x.abs()).max(y.abs()).max(z.abs()).max(w.abs())
@@ -351,11 +445,15 @@ impl Near {
         let e_ref = gamma(inserted.saturating_add(1).saturating_mul(12)) * 2.0 * size;
 
         let mut mapped: Vec<Vec<[f64; 4]>> = Vec::new();
+        let mut mapped_capacity = 0;
         let mut e_frame = 0.0_f64;
         let mut w_min = f64::INFINITY;
         for piece in &pieces {
             let mut pts = Vec::new();
+            let mut point_capacity = 0;
             for p in piece.cpts() {
+                // Frame::map's fixed scalar/array record plus its finite checks.
+                observe(work, || Some(512))?;
                 let h = homog(p);
                 let [_, _, _, w] = h;
                 if !(w > 0.0 && w.is_finite()) {
@@ -367,8 +465,24 @@ impl Near {
                     return Err(SolidError::query(OP, QueryFailure::BoundOverflows));
                 }
                 e_frame = e_frame.max(e);
+                crate::curve::curve::p2::proof_vec_capacity(
+                    work,
+                    &mut pts,
+                    &mut point_capacity,
+                    1,
+                    32,
+                    OP,
+                )?;
                 pts.push(q);
             }
+            crate::curve::curve::p2::proof_vec_capacity(
+                work,
+                &mut mapped,
+                &mut mapped_capacity,
+                1,
+                24,
+                OP,
+            )?;
             mapped.push(pts);
         }
         if !(w_min > 0.0 && w_min.is_finite()) {
@@ -420,6 +534,7 @@ impl Near {
         let mut d_z = 0.0_f64;
         let mut over = 0.0_f64;
         for &[x, y, z, w] in mapped.iter().flatten() {
+            observe(work, || Some(128))?;
             let (d, e) = dot([x, y], m);
             if d <= e {
                 return Ok(None);
@@ -437,7 +552,7 @@ impl Near {
                 over = over.max(if o < FLOOR { FLOOR } else { o });
             }
         }
-        let (f_abs, f_low) = f_bounds(&mapped, r)?;
+        let (f_abs, f_low) = f_bounds(&mapped, r, work)?;
         let r2 = r * r;
         // `r² + min F`, rounded down
         let rho2 = if f_low < 0.0 {
@@ -470,7 +585,17 @@ impl Near {
 /// underflow), its Bézier pieces over `[lo, hi]`, and how many knots the refinement and the
 /// extraction inserted in all (module docs): the whole decomposition's joined knot vector
 /// (each inner knot `p` times) less `c`'s. `None` when the scaling is not exact.
-fn checked_pieces(c: &Curve, [lo, hi]: [f64; 2]) -> Result<Option<(Curve, Vec<Curve>, usize)>> {
+fn checked_pieces(
+    c: &Curve,
+    [lo, hi]: [f64; 2],
+    work: Option<&ProofWork>,
+) -> Result<Option<(Curve, Vec<Curve>, usize)>> {
+    observe(work, || {
+        count(c.cpts().len())?
+            .checked_mul(80)?
+            .checked_add(count(c.knots().len())?.checked_mul(64)?)?
+            .checked_add(128)
+    })?;
     let p = c.degree();
     if !((1..=MAX_DEGREE).contains(&p) && c.knots().len() == c.cpts().len() + p + 1) {
         return Err(SolidError::invalid_input(
@@ -518,18 +643,26 @@ fn checked_pieces(c: &Curve, [lo, hi]: [f64; 2]) -> Result<Option<(Curve, Vec<Cu
             "an interval reversed, of no length or not inside its curve's domain",
         ));
     }
-    let Some(c) = weights_near_one(c)? else {
+    let Some(c) = weights_near_one(c, work)? else {
         return Ok(None);
     };
+    observe(work, || count(knots.len())?.checked_mul(2)?.checked_add(56))?;
     let missing: Vec<f64> = [lo, hi]
         .into_iter()
         .filter(|&u| u > k0 && u < k1 && !knots.contains(&u))
         .collect();
     let refined = if missing.is_empty() {
+        observe(work, || Some(42))?;
         c.clone()
     } else {
+        observe(work, || refine_credit(&c, missing.len()))?;
         c.refine(&missing)?
     };
+    if let Some(work) = work {
+        observe(Some(work), || count(refined.knots().len())?.checked_add(1))?;
+        let spans = refined.knot_vector()?.span_count(p);
+        observe(Some(work), || decompose_credit(&refined, spans))?;
+    }
     let all = refined.decompose_bez()?;
     let joined = all
         .len()
@@ -537,6 +670,14 @@ fn checked_pieces(c: &Curve, [lo, hi]: [f64; 2]) -> Result<Option<(Curve, Vec<Cu
         .saturating_mul(p)
         .saturating_add(2 * (p + 1));
     let inserted = joined.saturating_sub(knots.len());
+    observe(work, || {
+        count(all.len())?
+            .checked_mul(2)?
+            .checked_add(4)?
+            .checked_mul(40)?
+            .checked_add(24)?
+            .checked_add(count(all.len())?.checked_mul(4)?)
+    })?;
     let pieces = all
         .into_iter()
         .filter(|x| {
@@ -551,23 +692,30 @@ fn checked_pieces(c: &Curve, [lo, hi]: [f64; 2]) -> Result<Option<(Curve, Vec<Cu
 /// largest weight into `[1, 2)`: the same curve (module docs, underflow); a non-rational curve
 /// unchanged. `None` when the scaling is not exact (a coordinate leaving the normal range).
 /// The weights are finite and positive (checked).
-fn weights_near_one(c: &Curve) -> Result<Option<Curve>> {
+fn weights_near_one(c: &Curve, work: Option<&ProofWork>) -> Result<Option<Curve>> {
+    observe(work, || {
+        count(c.cpts().len())?.checked_mul(8)?.checked_add(64)
+    })?;
     let w_max = c
         .cpts()
         .iter()
         .filter(|q| q.w != NOW)
         .fold(0.0_f64, |m, q| m.max(q.w));
     if w_max == 0.0 {
+        observe(work, || Some(42))?;
         return Ok(Some(c.clone()));
     }
     let mut s = 1.0_f64;
     while w_max * s >= 2.0 {
+        observe(work, || Some(8))?;
         s *= 0.5;
     }
     while w_max * s < 1.0 {
+        observe(work, || Some(8))?;
         s *= 2.0;
     }
     if s == 1.0 {
+        observe(work, || Some(42))?;
         return Ok(Some(c.clone()));
     }
     let exact = |v: f64| {
@@ -575,18 +723,39 @@ fn weights_near_one(c: &Curve) -> Result<Option<Curve>> {
         t.is_finite() && t / s == v
     };
     let mut pw = Vec::new();
+    let mut point_capacity = 0;
     for q in c.cpts() {
+        observe(work, || Some(64))?;
         if q.w == NOW || !(exact(q.x) && exact(q.y) && exact(q.z) && exact(q.w)) {
             return Ok(None);
         }
+        crate::curve::curve::p2::proof_vec_capacity(work, &mut pw, &mut point_capacity, 1, 32, OP)?;
         pw.push(CPoint::new(q.x * s, q.y * s, q.z * s, q.w * s));
     }
+    // Knot Vec header/payload and the Curve/Arc records (point Vec header paid above).
+    observe(work, || {
+        count(c.knots().len())?.checked_mul(8)?.checked_add(24 + 72)
+    })?;
     Ok(Some(Curve::new(pw, c.degree(), c.knots().to_vec())?))
 }
 
 /// `C(n, k)` for `k = 0..=n` (exact: every value is an integer below `2^53` for
 /// `n <= 2 MAX_DEGREE`).
-fn binomials(n: usize) -> Vec<f64> {
+fn binomials(n: usize, work: Option<&ProofWork>) -> Result<Vec<f64>> {
+    observe(work, || {
+        let rows = count(n)?.checked_add(1)?;
+        let cells = rows.checked_mul(rows.checked_add(1)?)?.checked_div(2)?;
+        cells
+            .checked_mul(48)?
+            .checked_add(rows.checked_mul(56)?)?
+            .checked_add(
+                count(n)?
+                    .checked_mul(count(n)?.saturating_sub(1))?
+                    .checked_div(2)?,
+            )?
+            .checked_add(count(n)?.checked_mul(2)?)?
+            .checked_add(64)
+    })?;
     let mut row = vec![1.0_f64];
     for _ in 0..n {
         let mut next = Vec::new();
@@ -595,7 +764,7 @@ fn binomials(n: usize) -> Vec<f64> {
         next.push(1.0);
         row = next;
     }
-    row
+    Ok(row)
 }
 
 /// One piece of `N` and `V = W²` being halved: their Bernstein coefficients and its level.
@@ -606,7 +775,22 @@ struct Item {
 }
 
 /// The halves of a Bernstein polynomial's coefficients (de Casteljau at 1/2).
-fn halve(c: &[f64]) -> (Vec<f64>, Vec<f64>) {
+fn halve(c: &[f64], work: Option<&ProofWork>) -> Result<(Vec<f64>, Vec<f64>)> {
+    observe(work, || {
+        let m = count(c.len())?;
+        let rows = m.checked_add(1)?;
+        let cells = m.checked_mul(rows)?.checked_div(2)?;
+        let storage = cells
+            .checked_mul(16)?
+            .checked_add(rows.checked_mul(32)?)?
+            .checked_add(m.checked_mul(32)?)?
+            .checked_add(64)?
+            .checked_add(m.checked_add(3)?.checked_mul(24)?)?;
+        storage
+            .checked_add(m.checked_mul(m.saturating_sub(1))?.checked_div(2)?)?
+            .checked_add(m.checked_mul(4)?)?
+            .checked_add(64)
+    })?;
     let mut left = Vec::new();
     let mut right = Vec::new();
     let mut row = c.to_vec();
@@ -621,20 +805,30 @@ fn halve(c: &[f64]) -> (Vec<f64>, Vec<f64>) {
             .collect();
     }
     right.reverse();
-    (left, right)
+    Ok((left, right))
 }
 
 /// Bounds `(max |F|, min F)` of `F = x² + y² - r²` over the mapped
 /// pieces, every rounding included (module docs).
-fn f_bounds(pieces: &[Vec<[f64; 4]>], r: f64) -> Result<(f64, f64)> {
+fn f_bounds(pieces: &[Vec<[f64; 4]>], r: f64, work: Option<&ProofWork>) -> Result<(f64, f64)> {
     let r2 = r * r;
     // each piece's coefficients, the largest magnitude of `N`'s and of `V`'s terms
     let mut stack: Vec<(Item, f64, f64)> = Vec::new();
+    let mut stack_capacity = 0;
     let mut seen = 0.0_f64;
     for pts in pieces.iter().rev() {
         let p = pts.len().saturating_sub(1);
         let deg = 2 * p;
-        let (bp, b2p) = (binomials(p), binomials(deg));
+        let (bp, b2p) = (binomials(p, work)?, binomials(deg, work)?);
+        observe(work, || {
+            let m = count(deg)?.checked_add(1)?;
+            let q = count(p)?.checked_add(1)?;
+            // Three coefficient arrays, q² actual pair bodies, finite/max scans.
+            m.checked_mul(24 + 32)?
+                .checked_add(72)?
+                .checked_add(q.checked_mul(q)?.checked_mul(128)?)?
+                .checked_add(128)
+        })?;
         let mut n = vec![0.0_f64; deg + 1];
         let mut v = vec![0.0_f64; deg + 1];
         let mut mag = vec![0.0_f64; deg + 1];
@@ -665,11 +859,27 @@ fn f_bounds(pieces: &[Vec<[f64; 4]>], r: f64) -> Result<(f64, f64)> {
                 seen = seen.max((nv / vv).abs());
             }
         }
+        crate::curve::curve::p2::proof_vec_capacity(
+            work,
+            &mut stack,
+            &mut stack_capacity,
+            1,
+            72,
+            OP,
+        )?;
         stack.push((Item { n, v, level: 0 }, s_n, s_v));
     }
     let (mut f_abs, mut f_low) = (0.0_f64, f64::INFINITY);
     let mut taken = 0usize;
-    while let Some((item, s_n, s_v)) = stack.pop() {
+    while let Some((item, s_n, s_v)) = {
+        // None retains the old pop without inspecting new metadata state.
+        if work.is_some() && !stack.is_empty() {
+            observe(work, || Some(128))?;
+        }
+        stack.pop()
+    } {
+        // Both coefficient zip/lower-bound scan and the subsequent n_abs scan.
+        observe(work, || count(item.n.len())?.checked_mul(64))?;
         taken += 1;
         let deg = item.n.len().saturating_sub(1);
         let k = (deg + 12).saturating_add(deg.saturating_mul(item.level));
@@ -696,12 +906,21 @@ fn f_bounds(pieces: &[Vec<[f64; 4]>], r: f64) -> Result<(f64, f64)> {
             && upper > 1.0625 * seen
             && n_abs > 4.0 * e_n;
         if split {
-            let (nl, nr) = halve(&item.n);
-            let (vl, vr) = halve(&item.v);
+            let (nl, nr) = halve(&item.n, work)?;
+            let (vl, vr) = halve(&item.v, work)?;
             if let (Some(&nv), Some(&vv)) = (nl.last(), vl.last()) {
                 seen = seen.max((nv / vv).abs());
             }
+            observe(work, || Some(2 * 72 + 32))?;
             let level = item.level + 1;
+            crate::curve::curve::p2::proof_vec_capacity(
+                work,
+                &mut stack,
+                &mut stack_capacity,
+                1,
+                72,
+                OP,
+            )?;
             stack.push((
                 Item {
                     n: nr,
@@ -711,6 +930,14 @@ fn f_bounds(pieces: &[Vec<[f64; 4]>], r: f64) -> Result<(f64, f64)> {
                 s_n,
                 s_v,
             ));
+            crate::curve::curve::p2::proof_vec_capacity(
+                work,
+                &mut stack,
+                &mut stack_capacity,
+                1,
+                72,
+                OP,
+            )?;
             stack.push((
                 Item {
                     n: nl,
@@ -734,13 +961,14 @@ fn f_bounds(pieces: &[Vec<[f64; 4]>], r: f64) -> Result<(f64, f64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::math::det;
     use crate::nurbs::knots::Side;
     use std::f64::consts::FRAC_1_SQRT_2;
 
     /// The quarter circle of radius `r` about `(cx, cy, z)` from angle `a0` (a rational
     /// quadratic Bézier, weights 1, √½, 1).
     fn quarter(r: f64, cx: f64, cy: f64, z: f64, a0: f64) -> Curve {
-        let (c, s) = (a0.cos(), a0.sin());
+        let (c, s) = (det::cos(a0), det::sin(a0));
         let at = |x: f64, y: f64| (cx + r * (c * x - s * y), cy + r * (s * x + c * y));
         let (p0, p1, p2) = (at(1.0, 0.0), at(1.0, 1.0), at(0.0, 1.0));
         let w = FRAC_1_SQRT_2;
@@ -767,13 +995,13 @@ mod tests {
     /// circle).
     fn cubic_along(r: f64, n: u32, dz: f64) -> Curve {
         let h = std::f64::consts::FRAC_PI_2 / f64::from(n);
-        let k = 4.0 / 3.0 * (h / 4.0).tan();
+        let k = 4.0 / 3.0 * det::tan(h / 4.0);
         let mut pw = Vec::new();
         let mut knots = vec![0.0; 4];
         for i in 0..n {
             let (a, b) = (h * f64::from(i), h * f64::from(i + 1));
-            let p = |t: f64| (r * t.cos(), r * t.sin());
-            let d = |t: f64| (-r * t.sin(), r * t.cos());
+            let p = |t: f64| (r * det::cos(t), r * det::sin(t));
+            let d = |t: f64| (-r * det::sin(t), r * det::cos(t));
             let (pa, pb, da, db) = (p(a), p(b), d(a), d(b));
             if i == 0 {
                 pw.push(CPoint::new(pa.0, pa.1, dz, NOW));
@@ -845,7 +1073,7 @@ mod tests {
         for theta in [1e-5, 1e-3, 0.1] {
             let a = quarter(r, 0.0, 0.0, 0.0, 0.0);
             let b = quarter(r, 0.0, 0.0, 0.0, theta);
-            let want = 2.0 * r * (theta / 2.0).sin();
+            let want = 2.0 * r * det::sin(theta / 2.0);
             let d = hausdorff_about_circle(&a, [0.0, 1.0], &b, [0.0, 1.0], &c)
                 .unwrap()
                 .unwrap();
@@ -879,7 +1107,7 @@ mod tests {
             for i in 0..=4000 {
                 let p = b.eval(hi * f64::from(i) / 4000.0, Side::Left).unwrap();
                 let rho = (p.x * p.x + p.y * p.y).sqrt();
-                sampled = sampled.max(((rho - r).powi(2) + p.z * p.z).sqrt());
+                sampled = sampled.max((det::powi(rho - r, 2) + p.z * p.z).sqrt());
             }
             let d = hausdorff_about_circle(&a, [0.0, 1.0], &b, [0.0, hi], &c)
                 .unwrap()
@@ -964,7 +1192,7 @@ mod tests {
                 .collect();
             Curve::new(pw, 2, vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0]).unwrap()
         };
-        let tiny = 2.0_f64.powi(-536);
+        let tiny = det::powi(2.0_f64, -536);
         let mut got = Vec::new();
         for w in [1.0, tiny, 4.0] {
             let (a, b) = (bez(1.0, w), bez(33.0 / 32.0, w));
@@ -989,7 +1217,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(d < 1e-11, "{d}");
-        let want = 2.0 * r * (std::f64::consts::PI / 8.0).sin();
+        let want = 2.0 * r * det::sin(std::f64::consts::PI / 8.0);
         let d = hausdorff_about_circle(&a, [0.0, 0.5], &a, [0.0, 1.0], &c)
             .unwrap()
             .unwrap();

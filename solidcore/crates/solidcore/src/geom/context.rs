@@ -85,8 +85,8 @@
 //!   `Dump`, `GetTypeString` and `IsLockedMark` are unused upstream and not ported.
 
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
-    Arc,
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    Arc, Mutex,
 };
 
 use crate::error::{Result, SolidError};
@@ -94,6 +94,89 @@ use crate::geom::attribute::ObjectKey;
 use crate::geom::object;
 use crate::geom::tol;
 use crate::kernel::Kernel;
+
+/// One operation-owned optional metadata allowance. All query copies share it.
+/// Canonical units are architecture-independent; exhaustion is permanently unknown.
+#[derive(Clone, Debug)]
+pub(crate) struct ProofWork {
+    state: Arc<ProofWorkState>,
+}
+
+#[derive(Debug)]
+struct ProofWorkState {
+    remaining: AtomicUsize,
+    disabled: AtomicBool,
+    limit: usize,
+}
+
+impl ProofWork {
+    /// Creates the existing observer allowance, including its fixed owner storage.
+    pub(crate) fn new(limit: usize) -> Self {
+        const OWNER_WORK: usize = 64;
+        Self {
+            state: Arc::new(ProofWorkState {
+                remaining: AtomicUsize::new(limit.saturating_sub(OWNER_WORK)),
+                disabled: AtomicBool::new(limit < OWNER_WORK),
+                limit,
+            }),
+        }
+    }
+
+    /// Debits checked canonical work before optional computation or allocation.
+    pub(crate) fn charge(&self, amount: Option<u64>) -> bool {
+        let Some(amount) = amount.and_then(|n| usize::try_from(n).ok()) else {
+            self.disable();
+            return false;
+        };
+        if self.is_disabled() {
+            return false;
+        }
+        // As in geometry_key: preserve MSRV 1.85 while 1.99 renames this API.
+        #[allow(deprecated, reason = "try_update is newer than 1.85 (#14360)")]
+        let charged =
+            self.state
+                .remaining
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+                    left.checked_sub(amount)
+                });
+        if charged.is_ok() {
+            return !self.is_disabled();
+        }
+        self.disable();
+        false
+    }
+
+    /// Stops only the optional proof; it never changes a geometry operation.
+    pub(crate) fn disable(&self) {
+        self.state.disabled.store(true, Ordering::Relaxed);
+        self.state.remaining.store(0, Ordering::Relaxed);
+    }
+
+    /// Whether a prior decline permanently discarded this operation's evidence.
+    pub(crate) fn is_disabled(&self) -> bool {
+        self.state.disabled.load(Ordering::Relaxed)
+    }
+
+    /// Retains the existing opaque certificate-owner equality.
+    pub(crate) fn same_operation(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.state, &other.state)
+    }
+
+    /// Retains the existing cross-owner certificate ordering, never a source ID.
+    pub(crate) fn operation_key(&self) -> usize {
+        Arc::as_ptr(&self.state) as usize
+    }
+
+    /// The real optional allowance is spent; caught only at its query boundary.
+    pub(crate) fn stopped(&self, operation: &'static str) -> SolidError {
+        let remaining = self.state.remaining.load(Ordering::Relaxed);
+        SolidError::OutOfFuel {
+            operation,
+            spent: self.state.limit.saturating_sub(remaining) as u64,
+            limit: self.state.limit as u64,
+        }
+    }
+}
 
 /// Which traversal mark of a context to use (`SmMarkType`). The discriminants are the
 /// upstream bit values.
@@ -163,7 +246,7 @@ const MARK_IO: usize = 3;
 pub type BoxedCallback = Option<Box<dyn NotifyCallback>>;
 
 /// One call to each installed observer. Owner links and notifications share their order.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 pub(super) enum CallbackEvent {
     Notify(
         object::NotifyOperation,
@@ -171,16 +254,189 @@ pub(super) enum CallbackEvent {
         [Option<object::ObjectRef>; 3],
     ),
     OwnerLink(ObjectKey, Option<object::ObjectRef>),
+    BoundaryEdit(Box<object::BoundaryEdit>),
 }
 
 impl CallbackEvent {
-    fn send(self, callback: &mut dyn NotifyCallback) {
+    fn send(&self, callback: &mut dyn NotifyCallback) {
         match self {
             Self::Notify(operation, caller, [a, b, c]) => {
-                let _status = callback.execute(operation, caller, a, b, c);
+                let _status = callback.execute(*operation, *caller, *a, *b, *c);
             }
-            Self::OwnerLink(object, owner) => callback.owner_link(object, owner),
+            Self::OwnerLink(object, owner) => callback.owner_link(*object, *owner),
+            Self::BoundaryEdit(event) => callback.boundary_edit(**event),
         }
+    }
+}
+
+/// Operation-local metadata events, separate from original callback ownership.
+/// Both operands share this stream; no object identity is allocated by the relay.
+#[derive(Clone, Debug)]
+pub(crate) struct MetadataRelay {
+    work: ProofWork,
+    state: Arc<Mutex<MetadataRelayState>>,
+}
+
+#[derive(Debug, Default)]
+struct MetadataRelayState {
+    events: Vec<CallbackEvent>,
+    capacity: usize,
+}
+
+impl MetadataRelay {
+    /// Reserves fixed relay ownership before allocating its shared state.
+    pub(crate) fn new(work: ProofWork) -> Option<Self> {
+        work.charge(Some(128)).then(|| Self {
+            work,
+            state: Arc::new(Mutex::new(MetadataRelayState::default())),
+        })
+    }
+
+    fn same_stream(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.state, &other.state)
+    }
+
+    fn disable(&self) {
+        self.work.disable();
+        if let Ok(mut state) = self.state.lock() {
+            // Every retained slot prepaid its later move/drop work.
+            state.events.clear();
+        }
+    }
+
+    fn record(&self, event: &CallbackEvent) {
+        if self.work.is_disabled() {
+            return;
+        }
+        let Ok(mut state) = self.state.lock() else {
+            self.work.disable();
+            return;
+        };
+        // A fixed event copy includes the boxed typed payload, when present.
+        if !self.work.charge(Some(object::BOUNDARY_EVENT_WORK as u64)) {
+            state.events.clear();
+            return;
+        }
+        if state.events.len() == state.capacity {
+            let capacity = state.capacity.max(4).checked_mul(2);
+            let cost = capacity
+                .and_then(|n| n.checked_mul(object::BOUNDARY_EVENT_WORK))
+                .and_then(|n| n.checked_add(state.events.len()));
+            if !self.work.charge(cost.and_then(|n| u64::try_from(n).ok())) {
+                state.events.clear();
+                return;
+            }
+            let Some(capacity) = capacity else {
+                state.events.clear();
+                return;
+            };
+            let additional = capacity - state.events.len();
+            if state.events.try_reserve_exact(additional).is_err() {
+                self.work.disable();
+                state.events.clear();
+                return;
+            }
+            state.capacity = capacity;
+        }
+        let copied = match event {
+            CallbackEvent::Notify(operation, caller, data) => {
+                CallbackEvent::Notify(*operation, *caller, *data)
+            }
+            CallbackEvent::OwnerLink(object, owner) => CallbackEvent::OwnerLink(*object, *owner),
+            CallbackEvent::BoundaryEdit(edit) => CallbackEvent::BoundaryEdit(Box::new(**edit)),
+        };
+        state.events.push(copied);
+    }
+
+    /// Delivery uses Context's existing pending/callback pipeline, outside locks.
+    pub(crate) fn drain_into(&self, context: &mut Context) {
+        if !context
+            .proof_work()
+            .is_some_and(|work| work.same_operation(&self.work))
+        {
+            self.disable();
+            return;
+        }
+        let events = {
+            let Ok(mut state) = self.state.lock() else {
+                self.work.disable();
+                return;
+            };
+            if !self.work.charge(
+                u64::try_from(state.events.len())
+                    .ok()
+                    .and_then(|n| n.checked_mul(2)),
+            ) {
+                state.events.clear();
+                return;
+            }
+            if let Some(pending) = &mut context.pending_notifications {
+                // The moved events must not cause uncharged growth in the destination.
+                let cost = pending
+                    .len()
+                    .checked_add(state.events.len())
+                    .and_then(|n| n.checked_mul(object::BOUNDARY_EVENT_WORK))
+                    .and_then(|n| n.checked_add(pending.len()));
+                if !self.work.charge(cost.and_then(|n| u64::try_from(n).ok()))
+                    || pending.try_reserve_exact(state.events.len()).is_err()
+                {
+                    self.work.disable();
+                    state.events.clear();
+                    return;
+                }
+            }
+            state.capacity = 0;
+            core::mem::take(&mut state.events)
+        };
+        // No relay/Work lock is held across callbacks. These were already recorded
+        // on emission; forwarding/replay must never record them a second time.
+        for event in events {
+            context.deliver_observers(event);
+        }
+    }
+}
+
+/// A failed/unwound atomic edit invalidates optional evidence, without refunds.
+struct MetadataCheckpoint {
+    relay: MetadataRelay,
+    committed: bool,
+}
+
+impl MetadataCheckpoint {
+    fn new(relay: MetadataRelay) -> Self {
+        Self {
+            relay,
+            committed: false,
+        }
+    }
+
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for MetadataCheckpoint {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.relay.disable();
+        }
+    }
+}
+
+/// Restores only the optional relay after all inner notification leases restore.
+struct MetadataRelayScope<'a> {
+    kernel: &'a mut Kernel,
+    previous: Option<MetadataRelay>,
+    relay: MetadataRelay,
+    committed: bool,
+}
+
+impl Drop for MetadataRelayScope<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.relay.disable();
+        }
+        self.kernel.context.metadata_relay = self.previous.take();
     }
 }
 
@@ -211,6 +467,21 @@ pub trait NotifyCallback: std::fmt::Debug + Send {
     fn as_any(&self) -> Option<&dyn core::any::Any> {
         None
     }
+
+    /// Mutable downcast for an owning observer. The default imposes no Any or
+    /// static bound on existing callback implementations.
+    fn as_any_mut(&mut self) -> Option<&mut dyn core::any::Any> {
+        None
+    }
+
+    /// Reserves canonical architecture-independent producer-event work/storage
+    /// before a deferred allocation. Old observers opt out without state changes.
+    fn reserve_boundary_edit(&mut self, _logical_work: usize) -> bool {
+        false
+    }
+
+    /// Observes only a successful producer's typed coverage construction.
+    fn boundary_edit(&mut self, _event: object::BoundaryEdit) {}
 
     /// Records the object `object` is owned by (`SmCurve::GetOwner`,
     /// `SmSurface::GetOwner`, `SmEdgeuse::GetEdge`; `None` for a null owner) for the
@@ -251,6 +522,10 @@ pub struct Context {
     sys_notify_callback: Option<Box<dyn NotifyCallback>>,
     /// Calls awaiting the outcome of an atomic edit, lent alongside the callbacks.
     pending_notifications: Option<Vec<CallbackEvent>>,
+    /// Optional observed operation fuel, without borrowing its callback.
+    proof_work: Option<ProofWork>,
+    /// Optional operation observer, lent with callbacks but never query metadata.
+    metadata_relay: Option<MetadataRelay>,
     /// This context's notification identity domain (`Context::geometry_key`,
     /// `Context::brep_serial`), lent with the callbacks ([`NotifyLease`]).
     identities: IdentityDomain,
@@ -366,6 +641,7 @@ pub struct NotifyLease {
     user: BoxedCallback,
     sys: BoxedCallback,
     pending: Option<Vec<CallbackEvent>>,
+    relay: Option<MetadataRelay>,
     identities: IdentityDomain,
 }
 
@@ -578,6 +854,8 @@ impl Context {
             user_notify_callback: None,
             sys_notify_callback: None,
             pending_notifications: None,
+            proof_work: None,
+            metadata_relay: None,
             identities: IdentityDomain::new(),
         }
     }
@@ -598,6 +876,8 @@ impl Context {
             user_notify_callback: None,
             sys_notify_callback: None,
             pending_notifications: None,
+            proof_work: None,
+            metadata_relay: None,
             identities: IdentityDomain::new(),
         }
     }
@@ -616,6 +896,63 @@ impl Context {
     /// Sets the Boolean flag (`SetDoingBoolean`).
     pub fn set_doing_boolean(&mut self, doing_boolean: bool) {
         self.doing_boolean = doing_boolean;
+    }
+
+    /// Attaches the same optional owner without moving a notification callback.
+    pub(crate) fn set_proof_work(&mut self, work: Option<ProofWork>) {
+        self.proof_work = work;
+    }
+
+    /// The observed operation's allowance; metadata copies deliberately omit it.
+    pub(crate) fn proof_work(&self) -> Option<&ProofWork> {
+        self.proof_work.as_ref()
+    }
+
+    /// Producer opt-in while original Kernel callbacks remain installed.
+    pub(crate) fn reserve_relay_boundary_edit(&self, work: usize) -> bool {
+        self.metadata_relay
+            .as_ref()
+            .is_some_and(|relay| relay.work.charge(u64::try_from(work).ok()))
+    }
+
+    /// A relay-only producer must not notify original callbacks that opted out.
+    pub(super) fn notify_relay_boundary_edit(&mut self, event: object::BoundaryEdit) {
+        if let Some(relay) = &self.metadata_relay {
+            if !relay.work.is_disabled() {
+                // Producer storage was reserved before this temporary payload.
+                relay.record(&CallbackEvent::BoundaryEdit(Box::new(event)));
+            }
+        }
+    }
+
+    /// The actual planar operation borrows this metadata stream, not callbacks.
+    pub(crate) fn with_metadata_relay<T>(
+        k: &mut Kernel,
+        relay: Option<MetadataRelay>,
+        edit: impl FnOnce(&mut Kernel) -> Result<T>,
+    ) -> Result<T> {
+        let Some(relay) = relay else {
+            return edit(k);
+        };
+        if k.context
+            .metadata_relay
+            .as_ref()
+            .is_some_and(|old| !old.same_stream(&relay))
+        {
+            // A different nested observer cannot replace the outer operation.
+            relay.disable();
+            return edit(k);
+        }
+        let previous = k.context.metadata_relay.replace(relay.clone());
+        let mut scope = MetadataRelayScope {
+            kernel: k,
+            previous,
+            relay,
+            committed: false,
+        };
+        let result = edit(scope.kernel);
+        scope.committed = result.is_ok();
+        result
     }
 
     /// The application's notify callback (`GetUserNotifyCallback`).
@@ -654,6 +991,14 @@ impl Context {
     }
 
     pub(super) fn notify_observers(&mut self, event: CallbackEvent) {
+        if let Some(relay) = &self.metadata_relay {
+            relay.record(&event);
+        }
+        self.deliver_observers(event);
+    }
+
+    /// Existing callback delivery, also used for replay of already-recorded events.
+    fn deliver_observers(&mut self, event: CallbackEvent) {
         if let Some(pending) = &mut self.pending_notifications {
             pending.push(event);
             return;
@@ -674,8 +1019,19 @@ impl Context {
         edit: impl FnOnce(&mut Kernel) -> Result<T>,
     ) -> Result<T> {
         use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
+        let checkpoint = k
+            .context
+            .metadata_relay
+            .clone()
+            .map(MetadataCheckpoint::new);
         if k.context.user_notify_callback.is_none() && k.context.sys_notify_callback.is_none() {
-            return edit(k);
+            let result = edit(k);
+            if result.is_ok() {
+                if let Some(checkpoint) = checkpoint {
+                    checkpoint.commit();
+                }
+            }
+            return result;
         }
         let outer = k.context.pending_notifications.replace(Vec::new());
         let outcome = catch_unwind(AssertUnwindSafe(|| edit(k)));
@@ -685,7 +1041,10 @@ impl Context {
             Err(panic) => resume_unwind(panic),
         };
         for event in events.into_iter().flatten() {
-            k.context.notify_observers(event);
+            k.context.deliver_observers(event);
+        }
+        if let Some(checkpoint) = checkpoint {
+            checkpoint.commit();
         }
         Ok(value)
     }
@@ -735,6 +1094,7 @@ impl Context {
             user: self.user_notify_callback.take(),
             sys: self.sys_notify_callback.take(),
             pending: self.pending_notifications.take(),
+            relay: self.metadata_relay.take(),
             identities: core::mem::replace(&mut self.identities, IdentityDomain::new()),
         }
     }
@@ -746,6 +1106,7 @@ impl Context {
         self.user_notify_callback = lease.user;
         self.sys_notify_callback = lease.sys;
         self.pending_notifications = lease.pending;
+        self.metadata_relay = lease.relay;
         self.identities = lease.identities;
     }
 
@@ -1536,5 +1897,361 @@ mod tests {
             let mut empty: [Context; 0] = [];
             assert!(MarkLock::new_pair(&mut empty, 0, 0).is_err());
         }
+    }
+    #[test]
+    fn old_observers_keep_generic_notifications_without_boundary_event_storage() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        #[derive(Debug)]
+        struct OldObserver(Arc<AtomicUsize>);
+        impl NotifyCallback for OldObserver {
+            fn execute(
+                &mut self,
+                _operation: object::NotifyOperation,
+                _caller: object::ObjectRef,
+                _first: Option<object::ObjectRef>,
+                _second: Option<object::ObjectRef>,
+                _third: Option<object::ObjectRef>,
+            ) -> Result<()> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut context = Context::default();
+        context.set_user_notify_callback(Some(Box::new(OldObserver(calls.clone()))));
+        context.pending_notifications = Some(Vec::new());
+        let source = object::ObjectRef {
+            type_code: crate::topology::edge::TYPE,
+            key: ObjectKey(101),
+        };
+        let target = object::ObjectRef {
+            key: ObjectKey(102),
+            ..source
+        };
+        object::report_boundary_edit(
+            Some(&mut context),
+            object::BoundaryEdit::Copied { source, target },
+        );
+        assert!(
+            context.pending_notifications.as_ref().unwrap().is_empty(),
+            "default observers opt out before the optional boxed event can be queued"
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        context.notify_observers(CallbackEvent::Notify(
+            object::NotifyOperation::Copy,
+            source,
+            [Some(target), None, None],
+        ));
+        let pending = context.pending_notifications.take().unwrap();
+        assert_eq!(
+            pending.len(),
+            1,
+            "the old generic notification is retained unchanged"
+        );
+        for event in pending {
+            event.send(context.user_notify_callback_mut().unwrap());
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn producer_event_storage_fits_the_canonical_architecture_independent_charge() {
+        let payload = size_of::<object::BoundaryEdit>();
+        let queued = size_of::<CallbackEvent>();
+        assert!(payload + queued + 8 <= object::BOUNDARY_EVENT_WORK);
+        assert_eq!(object::BOUNDARY_EVENT_WORK, 24 * 8);
+    }
+    #[test]
+    fn optional_proof_work_clones_spend_one_operation_allowance() {
+        let work = ProofWork::new(80);
+        let second_direction = work.clone();
+        assert!(work.charge(Some(8)));
+        assert!(second_direction.charge(Some(8)));
+        assert!(!work.charge(Some(1)));
+        assert!(second_direction.is_disabled());
+        assert!(!second_direction.charge(Some(0)));
+    }
+
+    #[test]
+    fn optional_proof_work_overflow_cannot_reset_or_rebind_its_owner() {
+        let work = ProofWork::new(2_000_000);
+        let same_round = work.clone();
+        let other_operation = ProofWork::new(2_000_000);
+        assert!(work.same_operation(&same_round));
+        assert!(!work.same_operation(&other_operation));
+        assert!(!work.charge(None));
+        assert!(!same_round.charge(Some(1)));
+        assert!(other_operation.charge(Some(1)));
+        assert!(matches!(
+            work.stopped("optional proof"),
+            SolidError::OutOfFuel { .. }
+        ));
+    }
+
+    #[derive(Debug)]
+    struct RelayLog(Arc<Mutex<Vec<ObjectKey>>>);
+
+    impl NotifyCallback for RelayLog {
+        fn execute(
+            &mut self,
+            _operation: object::NotifyOperation,
+            caller: object::ObjectRef,
+            _first: Option<object::ObjectRef>,
+            _second: Option<object::ObjectRef>,
+            _third: Option<object::ObjectRef>,
+        ) -> Result<()> {
+            self.0.lock().unwrap().push(caller.key);
+            Ok(())
+        }
+
+        fn boundary_edit(&mut self, _event: object::BoundaryEdit) {
+            self.0.lock().unwrap().push(ObjectKey(u64::MAX));
+        }
+    }
+
+    fn relay_event(context: &mut Context, key: u64) {
+        context.notify_observers(CallbackEvent::Notify(
+            object::NotifyOperation::PreEdit,
+            object::ObjectRef {
+                type_code: crate::topology::edge::TYPE,
+                key: ObjectKey(key),
+            },
+            [None; 3],
+        ));
+    }
+
+    fn relay_destination(work: &ProofWork, log: &Arc<Mutex<Vec<ObjectKey>>>) -> Context {
+        let mut context = Context::default();
+        context.set_proof_work(Some(work.clone()));
+        context.set_user_notify_callback(Some(Box::new(RelayLog(log.clone()))));
+        context
+    }
+
+    #[test]
+    fn metadata_relay_records_nested_commit_emissions_once_with_or_without_callbacks() {
+        for old_callback in [false, true] {
+            let mut k = Kernel::default();
+            let old = Arc::new(Mutex::new(Vec::new()));
+            if old_callback {
+                k.context
+                    .set_user_notify_callback(Some(Box::new(RelayLog(old.clone()))));
+            }
+            let callback = k
+                .context
+                .user_notify_callback()
+                .map(|c| std::ptr::from_ref(c).cast::<()>());
+            let work = ProofWork::new(32_000);
+            let relay = MetadataRelay::new(work.clone()).unwrap();
+            Context::with_metadata_relay(&mut k, Some(relay.clone()), |k| {
+                Context::with_committed_notifications(k, |k| {
+                    relay_event(&mut k.context, 1);
+                    Context::with_committed_notifications(k, |k| {
+                        relay_event(&mut k.context, 2);
+                        Ok(())
+                    })?;
+                    relay_event(&mut k.context, 3);
+                    Ok(())
+                })
+            })
+            .unwrap();
+            assert_eq!(
+                callback,
+                k.context
+                    .user_notify_callback()
+                    .map(|c| std::ptr::from_ref(c).cast::<()>())
+            );
+            assert!(k.context.metadata_relay.is_none());
+            let expected = vec![ObjectKey(1), ObjectKey(2), ObjectKey(3)];
+            assert_eq!(
+                *old.lock().unwrap(),
+                if old_callback {
+                    expected.clone()
+                } else {
+                    vec![]
+                }
+            );
+            let log = Arc::new(Mutex::new(Vec::new()));
+            relay.drain_into(&mut relay_destination(&work, &log));
+            assert_eq!(*log.lock().unwrap(), expected);
+            assert!(!work.is_disabled());
+        }
+    }
+
+    #[test]
+    fn metadata_relay_survives_leases_and_drains_before_outer_callback_commit() {
+        let mut k = Kernel::default();
+        let old = Arc::new(Mutex::new(Vec::new()));
+        k.context
+            .set_user_notify_callback(Some(Box::new(RelayLog(old.clone()))));
+        let work = ProofWork::new(32_000);
+        let relay = MetadataRelay::new(work.clone()).unwrap();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut destination = relay_destination(&work, &log);
+        Context::with_committed_notifications(&mut k, |k| {
+            Context::with_metadata_relay(k, Some(relay.clone()), |k| {
+                Context::with_committed_notifications(k, |k| {
+                    relay_event(&mut k.context, 11);
+                    Context::with_notification_context(k, |k, notifications| {
+                        assert!(k.context.metadata_relay.is_none());
+                        assert!(notifications.metadata_relay.is_some());
+                        assert!(notifications.metadata_copy().metadata_relay.is_none());
+                        relay_event(notifications, 12);
+                    })?;
+                    Ok(())
+                })
+            })?;
+            assert!(
+                old.lock().unwrap().is_empty(),
+                "original outer transaction remains pending"
+            );
+            relay.drain_into(&mut destination);
+            assert_eq!(*log.lock().unwrap(), vec![ObjectKey(11), ObjectKey(12)]);
+            relay_event(&mut k.context, 13);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            *old.lock().unwrap(),
+            vec![ObjectKey(11), ObjectKey(12), ObjectKey(13)]
+        );
+        assert_eq!(*log.lock().unwrap(), vec![ObjectKey(11), ObjectKey(12)]);
+        assert!(k.context.metadata_relay.is_none());
+    }
+
+    #[test]
+    fn metadata_relay_failed_or_unwound_edits_restore_scope_and_disable_evidence() {
+        for unwind in [false, true] {
+            let mut k = Kernel::default();
+            let old = Arc::new(Mutex::new(Vec::new()));
+            if unwind {
+                k.context
+                    .set_user_notify_callback(Some(Box::new(RelayLog(old.clone()))));
+            }
+            let work = ProofWork::new(32_000);
+            let relay = MetadataRelay::new(work.clone()).unwrap();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                Context::with_metadata_relay(&mut k, Some(relay.clone()), |k| {
+                    Context::with_committed_notifications(k, |k| {
+                        relay_event(&mut k.context, 21);
+                        assert!(!unwind, "test atomic edit unwind");
+                        Err::<(), _>(SolidError::invalid_input("relay test", "refused edit"))
+                    })
+                })
+            }));
+            if unwind {
+                assert!(result.is_err());
+            } else {
+                assert!(matches!(
+                    result.unwrap(),
+                    Err(SolidError::InvalidInput {
+                        operation: "relay test",
+                        ..
+                    })
+                ));
+            }
+            assert!(k.context.metadata_relay.is_none());
+            assert!(old.lock().unwrap().is_empty());
+            assert!(work.is_disabled());
+            let log = Arc::new(Mutex::new(Vec::new()));
+            relay.drain_into(&mut relay_destination(&work, &log));
+            assert!(log.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn metadata_relay_exhaustion_keeps_original_callback_and_result() {
+        let mut k = Kernel::default();
+        let old = Arc::new(Mutex::new(Vec::new()));
+        k.context
+            .set_user_notify_callback(Some(Box::new(RelayLog(old.clone()))));
+        let work = ProofWork::new(1_000);
+        let relay = MetadataRelay::new(work.clone()).unwrap();
+        let value = Context::with_metadata_relay(&mut k, Some(relay.clone()), |k| {
+            relay_event(&mut k.context, 31);
+            Ok(7)
+        })
+        .unwrap();
+        assert_eq!(value, 7);
+        assert_eq!(*old.lock().unwrap(), vec![ObjectKey(31)]);
+        assert!(work.is_disabled());
+        assert!(k.context.metadata_relay.is_none());
+        let log = Arc::new(Mutex::new(Vec::new()));
+        relay.drain_into(&mut relay_destination(&work, &log));
+        assert!(log.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn metadata_relay_conflict_preserves_outer_stream_and_pending_destination() {
+        let mut k = Kernel::default();
+        let work = ProofWork::new(32_000);
+        let relay = MetadataRelay::new(work.clone()).unwrap();
+        let other_work = ProofWork::new(32_000);
+        let other = MetadataRelay::new(other_work.clone()).unwrap();
+        Context::with_metadata_relay(&mut k, Some(relay.clone()), |k| {
+            Context::with_metadata_relay(k, Some(other.clone()), |k| {
+                relay_event(&mut k.context, 41);
+                Ok(())
+            })
+        })
+        .unwrap();
+        assert!(other_work.is_disabled());
+        assert!(!work.is_disabled());
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut destination = relay_destination(&work, &log);
+        destination.pending_notifications = Some(Vec::new());
+        relay.drain_into(&mut destination);
+        assert!(log.lock().unwrap().is_empty());
+        let events = destination.pending_notifications.take().unwrap();
+        assert_eq!(events.len(), 1);
+        for event in events {
+            destination.deliver_observers(event);
+        }
+        assert_eq!(*log.lock().unwrap(), vec![ObjectKey(41)]);
+    }
+
+    #[test]
+    fn metadata_relay_typed_producers_opt_in_without_replacing_old_observer() {
+        let mut k = Kernel::default();
+        let old = Arc::new(Mutex::new(Vec::new()));
+        k.context
+            .set_user_notify_callback(Some(Box::new(RelayLog(old.clone()))));
+        let work = ProofWork::new(32_000);
+        let relay = MetadataRelay::new(work.clone()).unwrap();
+        Context::with_metadata_relay(&mut k, Some(relay.clone()), |k| {
+            assert!(object::reserve_boundary_source_work(
+                Some(&mut k.context),
+                2
+            ));
+            let source = object::ObjectRef {
+                type_code: crate::topology::edge::TYPE,
+                key: ObjectKey(51),
+            };
+            object::report_boundary_edit(
+                Some(&mut k.context),
+                object::BoundaryEdit::Copied {
+                    source,
+                    target: object::ObjectRef {
+                        key: ObjectKey(52),
+                        ..source
+                    },
+                },
+            );
+            Ok(())
+        })
+        .unwrap();
+        let events = relay.state.lock().unwrap();
+        assert_eq!(events.events.len(), 1);
+        assert!(
+            matches!(&events.events[0], CallbackEvent::BoundaryEdit(edit)
+            if matches!(**edit, object::BoundaryEdit::Copied { source, target }
+                if source.key == ObjectKey(51) && target.key == ObjectKey(52)))
+        );
+        assert!(
+            old.lock().unwrap().is_empty(),
+            "the original observer opted out and must receive no boundary callback"
+        );
     }
 }

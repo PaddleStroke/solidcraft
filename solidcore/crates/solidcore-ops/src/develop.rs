@@ -32,6 +32,18 @@ pub use solidcore::develop::{
     Refusal, RuleRefusal, MAX_JOINTS, MAX_PANELS, MIN_BEAD_RADIUS,
 };
 
+/// Original contour construction indices returned by the kernel.
+pub use solidcore::develop::CornerTailParent;
+
+/// A record contour and its ephemeral original-input parent sets.
+#[derive(Clone, Debug)]
+pub struct CornerTailWithHistory {
+    /// The same edited geometry returned by the geometry-only entrypoint.
+    pub region: Region2,
+    /// Complete original-input parents per output segment; missing or None is unknown.
+    pub outer: Vec<Option<[Option<CornerTailParent>; 3]>>,
+}
+
 /// Sets back a record region's flange side using the kernel's contour edit.
 ///
 /// See [`k::set_back_past`] for parameter geometry and when it returns `None`.
@@ -54,6 +66,33 @@ pub fn set_back_past(
         by,
     )
     .map(|region| record_region2(&region))
+}
+
+/// The same edit with exact original-input construction parents.
+///
+/// Returns `None` under the same conditions as [`set_back_past`].
+pub fn set_back_past_with_history(
+    region: &Region2,
+    from: Vec2,
+    direction: Vec2,
+    rise: f64,
+    height: f64,
+    into: Vec2,
+    by: f64,
+) -> Option<CornerTailWithHistory> {
+    k::set_back_past_with_history(
+        &region2(region),
+        vec2(from),
+        vec2(direction),
+        rise,
+        height,
+        vec2(into),
+        by,
+    )
+    .map(|out| CornerTailWithHistory {
+        region: record_region2(&out.region),
+        outer: out.outer,
+    })
 }
 
 /// Replaces a previous corner setback on a record region.
@@ -81,6 +120,35 @@ pub fn retarget_corner_tail(
         new_cut,
     )
     .map(|region| record_region2(&region))
+}
+
+/// The same edit with exact original-input construction parents.
+///
+/// # Errors
+/// The same [`CornerTailRefusal`] as [`retarget_corner_tail`] when the contour
+/// cannot be restored or trimmed unambiguously.
+pub fn retarget_corner_tail_with_history(
+    region: &Region2,
+    edge: [Vec2; 2],
+    anchor_origin: Vec2,
+    anchor_direction: Vec2,
+    bend_length: f64,
+    old_cut: f64,
+    new_cut: f64,
+) -> Result<CornerTailWithHistory, CornerTailRefusal> {
+    k::retarget_corner_tail_with_history(
+        &region2(region),
+        edge.map(vec2),
+        vec2(anchor_origin),
+        vec2(anchor_direction),
+        bend_length,
+        old_cut,
+        new_cut,
+    )
+    .map(|out| CornerTailWithHistory {
+        region: record_region2(&out.region),
+        outer: out.outer,
+    })
 }
 
 /// Lays the sheet out flat ([`solidcore::develop::develop`]): `anchors` says where some panels'

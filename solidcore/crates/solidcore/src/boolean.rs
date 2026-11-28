@@ -6,6 +6,7 @@
 
 pub mod apart;
 pub mod api_brep;
+pub mod edge_history;
 pub mod merge;
 pub mod operand_tolerances;
 pub mod topology_intersector;

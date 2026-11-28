@@ -20,10 +20,10 @@ use crate::SurfaceSheet;
 /// face, `at` the middle of the piece, a wall along the run of its outline from `a` through
 /// `mid` to `b` (flat coordinates), or a face of the sheet's `bead`th bead (see
 /// [`crate::sheet_surface_bead::Form`]).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) enum FaceRole {
     Cap { surface: bool, at: Vec2 },
-    Wall { a: Vec2, b: Vec2, mid: Vec2 },
+    Wall { a: Vec2, b: Vec2, mid: Vec2, source: Option<Vec<crate::sheet_surface::ConvertedEdge>> },
     Bead { bead: usize, face: solidcraft_develop::BeadFace },
 }
 
@@ -142,7 +142,10 @@ impl<'a> FaceNamer<'a> {
                 let before = pieces.filter(|(_, p)| p.name < mine).count();
                 Some((SheetPart::Cap { panel: key(r)?, surface }, Some(before as f64)))
             }
-            (Piece::Panel(i), FaceRole::Wall { a, b, mid }) => {
+            (Piece::Panel(i), FaceRole::Wall { a, b, mid, source }) => {
+                if let Some([edge]) = source.as_deref() {
+                    return Some((SheetPart::Rim { panel: parted(i)?, edge: RimEdge::Converted { edge: edge.edge, faces: edge.faces } }, None));
+                }
                 let m = (a + b) * 0.5;
                 if let Some(relief) = cut([a, mid, b]).filter(|(p, _)| matches!(p, SheetPart::Relief { .. })) {
                     return Some(relief);
@@ -162,7 +165,7 @@ impl<'a> FaceNamer<'a> {
                     // Where the bend turns toward the material, the sheet's surface runs round its
                     // outside.
                     FaceRole::Cap { surface, .. } => Some((SheetPart::Bend { panel: made, outer: surface == bend.toward_material }, None)),
-                    FaceRole::Wall { a, b, mid } => {
+                    FaceRole::Wall { a, b, mid, .. } => {
                         let m = (a + b) * 0.5;
                         match (0..2).find(|&k| on(m, zone.near[k], zone.far[k])) {
                             Some(k) => Some((SheetPart::BendEnd { panel: made, at_origin: k == 0 }, None)),
@@ -179,7 +182,7 @@ impl<'a> FaceNamer<'a> {
                 let along = (zone.near[1] - zone.near[0]).normalized().map(|d| (at - zone.near[0]).dot(d));
                 Some((SheetPart::Tab { panel: key(joint.b.panel)?, surface }, along))
             }
-            (Piece::Tab(..), FaceRole::Wall { a, b, mid }) => cut([a, mid, b]),
+            (Piece::Tab(..), FaceRole::Wall { a, b, mid, .. }) => cut([a, mid, b]),
         }
     }
 }

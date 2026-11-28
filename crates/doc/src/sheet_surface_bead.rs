@@ -232,7 +232,7 @@ impl SurfaceSheet {
     /// limits.
     pub(crate) fn check_new_bead(&self, b: &SurfaceBead, margin: f64, notes: &mut Vec<String>) -> Result<()> {
         let dev = self.develop().map_err(|e| DocError::Invalid(e.to_string()))?;
-        let pieces = crate::sheet_surface::pieces(&dev, &mut crate::sheet::FlatWork::new())?;
+        let pieces = crate::sheet_surface::pieces(&dev, &[], &[], &mut crate::sheet::FlatWork::new())?.geometry;
         let fold = crate::sheet_surface_convert::fold_onto(&self.sheet, &dev, &self.places)?;
         self.check_bead(b, &pieces, &fold, Some(margin), notes)
     }

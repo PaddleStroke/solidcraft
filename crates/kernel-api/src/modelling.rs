@@ -2,9 +2,10 @@
 //! ([`Modelling`]), with their inputs.
 
 use serde::{Deserialize, Serialize};
-use solidcore_record::{Plane, Region2, Seg2, Vec2, Vec3};
+use solidcore_record::{Loop2, Plane, Region2, Seg2, Vec2, Vec3};
 
 use crate::Backend;
+use crate::sweep::{Helix, PathSpan, PointPath, RailFit, SweepOptions};
 
 /// Which boolean: the names are saved in designs, so they never change.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -247,7 +248,7 @@ impl TrimKeep<'_> {
 }
 
 /// The body-making operations of one kernel ([`crate::OpKind`]'s primitives, `Extrude` to
-/// `OffsetFaces`).
+/// `Split`).
 ///
 /// Edges and faces are picked by points, as the application picks them: the edge or face nearest
 /// each point.
@@ -311,6 +312,9 @@ pub trait Modelling: Backend {
     fn thicken(&self, sheet: &Self::Form, thickness: f64, symmetric: bool) -> Result<Self::Form, Self::Error>;
     /// The faces nearest `at` moved `distance` along their normals.
     fn offset_faces(&self, body: &Self::Form, at: &[Vec3], distance: f64) -> Result<Self::Form, Self::Error>;
+    /// Rotate one face's support by `angle` radians about the axis through `origin`, then
+    /// translate it (mm). Adjacent faces stay on their own supports.
+    fn transform_face(&self, body: &Self::Form, at: Vec3, translate: Vec3, origin: Vec3, axis: Vec3, angle: f64) -> Result<Self::Form, Self::Error>;
     /// The faces nearest `faces` tilted by `angle` about their line on the `neutral` plane, so
     /// that they lean in (positive angle) going along `pull`.
     fn draft(&self, body: &Self::Form, faces: &[Vec3], neutral: &Plane, pull: Vec3, angle: f64) -> Result<Self::Form, Self::Error>;
@@ -327,4 +331,18 @@ pub trait Modelling: Backend {
     fn split_body_by_sheet_where_it_cuts(&self, body: &Self::Form, sheet: &Self::Form, face: usize) -> Result<Option<Vec<Self::Form>>, Self::Error>;
     /// A surface body cut where `tool` meets it, keeping what `keep` says.
     fn trim_keep(&self, body: &Self::Form, tool: &SplitTool<'_, Self::Form>, keep: TrimKeep<'_>) -> Result<Self::Form, Self::Error>;
+    /// A planar region on `plane` swept along `path` (segments end to end), as `options` say.
+    fn sweep(&self, plane: &Plane, region: &Region2, path: &[PathSpan], options: &SweepOptions) -> Result<Self::Form, Self::Error>;
+    /// A planar region swept along a path through 3D sketch curves, as `options` say.
+    fn sweep_points(&self, plane: &Plane, region: &Region2, path: &PointPath, options: &SweepOptions) -> Result<Self::Form, Self::Error>;
+    /// A planar region's outer loop swept along a helix.
+    fn sweep_helix(&self, plane: &Plane, region: &Region2, helix: &Helix<'_>) -> Result<Self::Form, Self::Error>;
+    /// A solid through closed planar sections in order, following 0 to 16 guide `rails`
+    /// (polylines from the first section to the last), `fit` saying how they reshape the
+    /// sections between.
+    fn loft(&self, sections: &[(Plane, Loop2)], rails: &[Vec<Vec3>], fit: RailFit) -> Result<Self::Form, Self::Error>;
+    /// A loft through regions with matching hole counts: the hole walls share the end caps.
+    fn loft_regions(&self, sections: &[(Plane, Region2)]) -> Result<Self::Form, Self::Error>;
+    /// A solid from a planar loop to an apex off its plane, following 0 to 2 guide `rails`.
+    fn loft_to_point(&self, plane: &Plane, section: &Loop2, apex: Vec3, rails: &[Vec<Vec3>], fit: RailFit) -> Result<Self::Form, Self::Error>;
 }

@@ -2166,3 +2166,136 @@ fn a_bend_split_by_slots_across_it_converts_as_one_bend() {
         }
     }
 }
+
+#[test]
+fn converted_plate_side_accepts_an_exact_face_sketch_attachment() {
+    // Keep the reported picks as inputs; face indices are not geometry oracles.
+    for (convert, pick) in [
+        (false, json!({"face": [100, 0, 1.75], "body": "Body1", "index": 3})),
+        (true, json!({"face": [100, 50, 3], "body": "Body1", "index": 1})),
+        (true, json!({"face": [100, 0, 1.75], "body": "Body1", "index": 4})),
+    ] {
+        let mut s = Session::default();
+        run(&mut s, "solid.box", json!({"length": 200, "width": 100, "height": 3, "body_name": "Body1"}));
+        if convert {
+            // The default sheet rule is part of the reproduction.
+            run(&mut s, "sheet.convert", json!({"body": "Body1", "face": [100, 50, 3]}));
+        }
+        let made = run(&mut s, "sketch.create", json!({"plane": pick}));
+        assert_eq!(made["attachment"], json!("exact_face"), "{made}");
+    }
+}
+
+/// A positive side moves when its source dimension changes; y=0 alone cannot detect a fixed plane.
+fn converted_plate_side_fixture(axis: usize) -> (Session, u64, u64, f64) {
+    let (field, initial, point) = if axis == 0 { ("length", 200.0, [200.0, 50.0, 1.75]) } else { ("width", 100.0, [100.0, 100.0, 1.75]) };
+    let mut s = Session::default();
+    run(&mut s, "parameters.add", json!({"name":"Span","expression":format!("{initial} mm")}));
+    let mut stock = json!({"length":200,"width":100,"height":3,"body_name":"Body1"});
+    stock[field] = json!("Span");
+    run(&mut s, "solid.box", stock);
+    run(&mut s, "sheet.convert", json!({"body":"Body1","face":[100,50,3]}));
+    let attached = run(&mut s, "sketch.create", json!({"name":"Attached","plane":{"face":point},"project_edges":false}));
+    assert_eq!(attached["attachment"], json!("exact_face"), "{attached}");
+    let attached = attached["sketch"].as_u64().unwrap();
+    run(&mut s, "sketch.line", json!({"points":[[0,0],[1,0]]}));
+    run(&mut s, "sketch.finish", json!({}));
+    let fixed =
+        run(&mut s, "sketch.create", json!({"name":"Fixed","plane":{"face":point,"fixed":true},"project_edges":false}))["sketch"].as_u64().unwrap();
+    run(&mut s, "sketch.line", json!({"points":[[0,0],[1,0]]}));
+    run(&mut s, "sketch.finish", json!({}));
+    (s, attached, fixed, initial)
+}
+
+fn converted_plate_attachment_ref(s: &Session, sketch: u64) -> &solidcraft_doc::PlaneRef {
+    let solidcraft_doc::FeatureKind::Sketch { plane, .. } = &s.doc.feature(sketch).unwrap().kind else { panic!("not a sketch") };
+    plane
+}
+
+fn check_converted_plate_side(s: &Session, attached: u64, fixed: u64, axis: usize, expected: f64, initial: f64) {
+    use solidcraft_doc::FaceAttachmentStatus;
+    let on_axis = |p: solidcore_record::Vec3| if axis == 0 { p.x } else { p.y };
+    let plane = s.model.state().sketch(attached).unwrap().plane;
+    assert!((on_axis(plane.origin) - expected).abs() < 1e-6, "attached: {plane:?}; expected axis {axis} at {expected}");
+    assert!(on_axis(plane.normal()) > 1.0 - 1e-9, "{plane:?}");
+    let control = s.model.state().sketch(fixed).unwrap().plane;
+    assert!((on_axis(control.origin) - initial).abs() < 1e-6, "fixed control: {control:?}");
+    assert!(matches!(s.placed_document().sketch_face_attachment(attached, &s.model), FaceAttachmentStatus::Healthy { .. }));
+    assert!(matches!(s.placed_document().sketch_face_attachment(fixed, &s.model), FaceAttachmentStatus::Fixed { .. }));
+    assert!(matches!(converted_plate_attachment_ref(s, attached), solidcraft_doc::PlaneRef::Face { anchor: Some(_), .. }));
+    assert!(matches!(converted_plate_attachment_ref(s, fixed), solidcraft_doc::PlaneRef::Custom { .. }));
+    assert!(
+        s.model.results.iter().all(|result| result.error.is_none()),
+        "{:?}",
+        s.model.results.iter().map(|r| (&r.name, &r.error)).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn converted_plate_side_attachment_follows_source_dimensions_and_undo() {
+    for axis in [0, 1] {
+        let (mut s, attached, fixed, initial) = converted_plate_side_fixture(axis);
+        let reference = converted_plate_attachment_ref(&s, attached).clone();
+        let changed = initial + if axis == 0 { 40.0 } else { 20.0 };
+        check_converted_plate_side(&s, attached, fixed, axis, initial, initial);
+        run(&mut s, "parameters.change", json!({"name":"Span","expression":format!("{changed} mm")}));
+        check_converted_plate_side(&s, attached, fixed, axis, changed, initial);
+        assert_eq!(converted_plate_attachment_ref(&s, attached), &reference);
+        run(&mut s, "edit.undo", json!({}));
+        check_converted_plate_side(&s, attached, fixed, axis, initial, initial);
+        run(&mut s, "edit.redo", json!({}));
+        check_converted_plate_side(&s, attached, fixed, axis, changed, initial);
+        assert_eq!(converted_plate_attachment_ref(&s, attached), &reference);
+    }
+}
+
+#[test]
+fn converted_plate_side_attachment_reopens_and_follows_another_source_edit() {
+    for axis in [0, 1] {
+        let (s, attached, fixed, initial) = converted_plate_side_fixture(axis);
+        let reference = converted_plate_attachment_ref(&s, attached).clone();
+        let step = if axis == 0 { 40.0 } else { 20.0 };
+        let mut reopened = Session::new(solidcraft_doc::Document::from_json(&s.doc.to_json()).unwrap());
+        check_converted_plate_side(&reopened, attached, fixed, axis, initial, initial);
+        assert_eq!(converted_plate_attachment_ref(&reopened, attached), &reference);
+        run(&mut reopened, "parameters.change", json!({"name":"Span","expression":format!("{} mm",initial + step)}));
+        check_converted_plate_side(&reopened, attached, fixed, axis, initial + step, initial);
+        let mut reopened_again = Session::new(solidcraft_doc::Document::from_json(&reopened.doc.to_json()).unwrap());
+        check_converted_plate_side(&reopened_again, attached, fixed, axis, initial + step, initial);
+        run(&mut reopened_again, "parameters.change", json!({"name":"Span","expression":format!("{} mm",initial + 2.0 * step)}));
+        check_converted_plate_side(&reopened_again, attached, fixed, axis, initial + 2.0 * step, initial);
+        assert_eq!(converted_plate_attachment_ref(&reopened_again, attached), &reference);
+    }
+}
+
+/// SavedModel adoption, unlike cold evaluation, must deserialize the retained sheet origins.
+#[test]
+fn converted_plate_side_attachment_survives_saved_model_adoption_and_source_edit() {
+    for axis in [0, 1] {
+        let (s, attached, fixed, initial) = converted_plate_side_fixture(axis);
+        let reference = converted_plate_attachment_ref(&s, attached).clone();
+        let fixed_reference = converted_plate_attachment_ref(&s, fixed).clone();
+        let mut saved = s.model.saved(&s.doc).expect("the evaluated sheet model saves");
+        assert!(
+            saved.records["surface_sheets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|sheet| sheet.get("converted_boundaries").and_then(Value::as_object).is_some_and(|origins| !origins.is_empty())),
+            "the saved model must contain the new sheet boundary metadata"
+        );
+        saved.records = serde_json::from_slice(&serde_json::to_vec(&saved.records).unwrap()).unwrap();
+        let reloaded_doc = solidcraft_doc::Document::from_json(&s.doc.to_json()).unwrap();
+        let adopted = solidcraft_doc::Model::adopt(&reloaded_doc, &saved).expect("the cache must be adopted without reevaluation fallback");
+        assert!(adopted.state().surface_sheets.iter().any(|sheet| !sheet.converted_boundaries.is_empty()));
+        let mut reopened = Session::opened(reloaded_doc, Some(&saved));
+        check_converted_plate_side(&reopened, attached, fixed, axis, initial, initial);
+        assert_eq!(converted_plate_attachment_ref(&reopened, attached), &reference);
+        assert_eq!(converted_plate_attachment_ref(&reopened, fixed), &fixed_reference);
+        let changed = initial + if axis == 0 { 40.0 } else { 20.0 };
+        run(&mut reopened, "parameters.change", json!({"name":"Span","expression":format!("{changed} mm")}));
+        check_converted_plate_side(&reopened, attached, fixed, axis, changed, initial);
+        assert_eq!(converted_plate_attachment_ref(&reopened, attached), &reference);
+        assert_eq!(converted_plate_attachment_ref(&reopened, fixed), &fixed_reference);
+    }
+}

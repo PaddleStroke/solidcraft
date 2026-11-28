@@ -51,15 +51,32 @@ fn flat_budget_error() -> DocError {
 /// The work left to a sheet's flat: each planar boolean its flat is cut and joined by charges what
 /// it may cost, and a flat that would take more than [`MAX_FLAT_WORK`] returns an error rather than
 /// running on. A limit on work, never on the geometry.
-pub(crate) struct FlatWork(usize);
+pub(crate) struct FlatWork {
+    geometry: usize,
+    history: usize,
+}
 
 impl FlatWork {
     pub(crate) fn new() -> Self {
-        Self(MAX_FLAT_WORK)
+        Self { geometry: MAX_FLAT_WORK, history: MAX_FLAT_WORK }
     }
     pub(crate) fn charge(&mut self, work: usize) -> Result<()> {
-        self.0 = self.0.checked_sub(work).ok_or_else(flat_budget_error)?;
+        self.geometry = self.geometry.checked_sub(work).ok_or_else(flat_budget_error)?;
         Ok(())
+    }
+
+    /// Independent optional observer work: exhausting history never refuses valid geometry.
+    pub(crate) fn charge_history(&mut self, bytes_and_work: Option<usize>) -> bool {
+        match bytes_and_work.and_then(|cost| self.history.checked_sub(cost)) {
+            Some(left) => {
+                self.history = left;
+                true
+            }
+            None => {
+                self.history = 0;
+                false
+            }
+        }
     }
 }
 

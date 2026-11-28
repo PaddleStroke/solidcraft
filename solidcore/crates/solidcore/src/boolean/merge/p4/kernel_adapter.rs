@@ -58,52 +58,7 @@ fn key(namespace: u32, other: bool, kind: u64, index: u32) -> ObjectKey {
 // Cache construction takes only &Kernel; preserve the caller's settings and
 // seed for that read-only work rather than evaluating under defaults.
 fn cache_kernel(k: &Kernel, context: &Context) -> Kernel {
-    Kernel {
-        tolerances: k.tolerances,
-        seed: k.seed,
-        caches: crate::kernel::Caches {
-            fit_gap_memo: std::sync::Arc::clone(&k.caches.fit_gap_memo),
-            prove_lazy_trim_raise: k.caches.prove_lazy_trim_raise,
-            ..crate::kernel::Caches::default()
-        },
-        context: context.metadata_copy(),
-        upstream_ub_passed: Vec::new(),
-        memoize_curve_caches: k.memoize_curve_caches,
-        fixes: k.fixes,
-        cancel: k.cancel.clone(),
-        notify_records: crate::topology::topology::NotifyRecords::new(),
-        blend_net_tolerance: core::cell::Cell::new(k.blend_net_tolerance.get()),
-        blend_counts: core::cell::Cell::new(k.blend_counts.get()),
-        // (the memo is the kernel's own: a copy starts empty and solves afresh)
-        blend_station_memo: core::cell::RefCell::default(),
-        arena_notify_records: (
-            std::sync::Weak::new(),
-            crate::topology::topology::NotifyRecords::new(),
-        ),
-        blend_w_memo: core::cell::RefCell::default(),
-        loop_area_memo: core::cell::RefCell::default(),
-        check_memo: core::cell::RefCell::default(),
-        // (shared with the parent: a hit returns what recertifying the same blend again
-        // returns, so the certificates the parent finished serve the copy's workers too)
-        recertify_memo: std::sync::Arc::clone(&k.recertify_memo),
-        // (inside the caller's operation: a scope opened on the copy keeps its memo)
-        blend_operation_scopes: std::sync::Arc::new(core::sync::atomic::AtomicU32::new(
-            k.blend_operation_scopes
-                .load(core::sync::atomic::Ordering::Relaxed),
-        )),
-        // (building cache trees does none of the counted work)
-        work_counters: crate::kernel::WorkCounters::default(),
-        // (building cache trees makes no blend faces)
-        blend_face_log: None,
-        // (building cache trees makes no corner patches)
-        coons_tangency_log: core::cell::RefCell::new(None),
-        // (the caller's profiler: the copy's scopes record into its tree)
-        #[cfg(feature = "profile")]
-        profiler: k.profiler.clone(),
-        // (the test seam is shared: the copy's drops are the operation's)
-        #[cfg(test)]
-        strip_probe: k.strip_probe.clone(),
-    }
+    k.metadata_view(context)
 }
 
 fn cache_kernels(k: &Kernel, other: Option<&Kernel>, context: &Context) -> [Kernel; 2] {

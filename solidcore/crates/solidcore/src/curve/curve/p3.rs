@@ -150,6 +150,29 @@ const OP_LINE_FIT: &str = "curve::curve::p3::BestLineFitEnfo::evaluate";
 /// component is below about `1e154`, and then needs at most 152 more divisions.
 pub const MAX_PC_SCALE_STEPS: u64 = 400;
 
+/// Debits only private query work; a zero amount checks sticky exhaustion before
+/// an existing soft-error fallback. Ordinary geometry has no attached owner.
+pub(crate) fn charge_query_work(
+    k: &Kernel,
+    amount: Option<u64>,
+    operation: &'static str,
+) -> Result<()> {
+    if let Some(work) = k.context.proof_work() {
+        if !work.charge(amount) {
+            return Err(work.stopped(operation));
+        }
+    }
+    Ok(())
+}
+
+/// Reserves the default Newton solver's scalar/queue work, without charging
+/// native evaluations again. The same helper serves `PointInversion`'s local solve.
+pub(crate) fn charge_local_scalar_work(k: &Kernel, operation: &'static str) -> Result<()> {
+    // Queue8*32+24, <=360*8 oscillation visits,360 Newton steps,50 fallback
+    // steps, and three fixed512 record envelopes (solver/EFO/solution).
+    charge_query_work(k, Some(280 + 2880 + 360 + 50 + 3 * 512), operation)
+}
+
 /// `EvaluatePoint` whose status upstream ignores, or `None` when the point cannot be
 /// evaluated (the fork's curve-list helpers then skip the gap, tangency-labs/smlib
 /// 8311f8e); [`SolidError::Unported`] is propagated.
@@ -1048,6 +1071,8 @@ impl EvalFunction for FindPcExtremaEfo<'_, Curve> {
     /// is `SM_ERR` when maximising.
     fn evaluate(&mut self, t: f64, out: &mut FunctionValue, _signal_errors: bool) -> Result<()> {
         let k = self.kernel;
+        // One actual EFO call: native D2 is separately debited by dispatch.
+        charge_query_work(k, MAX_PC_SCALE_STEPS.checked_add(32), OP_PC)?;
         // init output
         out.f = 0.0;
         out.f_prime = 0.0;
@@ -1456,6 +1481,13 @@ impl Curve {
         guess: f64,
         intersecting: bool,
     ) -> Result<(bool, Solution<O>)> {
+        if let Some(work) = k.context.proof_work() {
+            if op != SolverOperation::Minimize {
+                work.disable();
+                return Err(work.stopped(OP_POINT));
+            }
+        }
+        charge_local_scalar_work(k, OP_POINT)?;
         let mut solution = Solution::new();
 
         // Final solution will be within the interval.
@@ -1573,7 +1605,9 @@ impl Curve {
         efo.intersecting = intersecting;
         let mut ls = LocalSolve1d::with_interval(*interval, false);
         // acceptable accuracy when Func(t) < tolerance
-        let r = match ls.solve_it(&mut efo, guess, 1.0e-8) {
+        let solved = ls.solve_it(&mut efo, guess, 1.0e-8);
+        charge_query_work(k, Some(0), OP_POINT)?;
+        let r = match solved {
             Ok(r) => r,
             Err(e) if e.is_unported_or_cancelled() => return Err(e),
             // some solver error - return without answer
@@ -2590,6 +2624,7 @@ mod tests {
     use crate::curve::hermite_curve::HermiteCurve;
     use crate::curve::line::{BoundedLineOptions, Line};
     use crate::error::{SM_ERR, SM_ERR_NULL_POINTER};
+    use crate::math::det;
 
     fn hermite(p1: [f64; 3], d1: [f64; 3], p2: [f64; 3], d2: [f64; 3]) -> Curve {
         Curve::from(HermiteCurve::new(
@@ -2864,11 +2899,11 @@ mod tests {
     #[test]
     fn tilted_chains_of_cancelling_area_answer_their_plane_at_every_scale() {
         let k = Kernel::default();
-        let u = Vec3::new(0.3_f64.cos(), 0.3_f64.sin(), 0.0);
+        let u = Vec3::new(det::cos(0.3_f64), det::sin(0.3_f64), 0.0);
         let v = Vec3::new(
-            -0.3_f64.sin() * 0.7_f64.cos(),
-            0.3_f64.cos() * 0.7_f64.cos(),
-            0.7_f64.sin(),
+            -det::sin(0.3_f64) * det::cos(0.7_f64),
+            det::cos(0.3_f64) * det::cos(0.7_f64),
+            det::sin(0.7_f64),
         );
         let plane = u.cross(v).unitize().unwrap();
         for scale in [1.0, 10.0, 100.0, 1e3, 1e4] {
@@ -3068,7 +3103,7 @@ mod tests {
                 "{size:e}"
             );
         }
-        let (l, d) = (2f64.powi(516), 2f64.powi(-20));
+        let (l, d) = (det::powi(2f64, 516), det::powi(2f64, -20));
         let parallelogram = polyline(&[
             [0.0, 0.0, 0.0],
             [l, 1.0, 0.0],
@@ -3333,7 +3368,7 @@ mod tests {
         let ivl = c.natural_interval();
         let angle = 30f64.to_radians();
         for rho in [1e-2, 1e-4, 1e-6] {
-            let p = Vec3::new(rho * angle.cos(), rho * angle.sin(), 0.0);
+            let p = Vec3::new(rho * det::cos(angle), rho * det::sin(angle), 0.0);
             {
                 let k = Kernel::default();
                 let (found, sol): (bool, Solution<()>) = c
@@ -3348,7 +3383,7 @@ mod tests {
                     .unwrap();
                 assert!(found, "rho {rho}");
                 let q = c.evaluate_point(&k, sol.start.parameters[0]).unwrap();
-                let at = q.y.atan2(q.x);
+                let at = det::atan2(q.y, q.x);
                 // the solve stops where the gap is square to the tangent within EFF_ZERO,
                 // an angle of (rho / R) (at - angle) there: the point is as ill-conditioned
                 // as R / rho, its distance not
@@ -3383,5 +3418,96 @@ mod tests {
         assert!((r.my_param - 0.5).abs() < 1e-9, "{r:?}");
         assert!((r.other_param - 0.5).abs() < 1e-9, "{r:?}");
         assert!(r.deviation < 1e-9);
+    }
+
+    #[test]
+    fn optional_local_minimum_preserves_the_exact_ordinary_solution() {
+        use crate::geom::context::ProofWork;
+        let original = Kernel::default();
+        let curve = Curve::from(Line::from_points(Vec3::ZERO, Vec3::new(10.0, 0.0, 0.0), 3));
+        let interval = curve.natural_interval();
+        let point = Vec3::new(2.5, 2.0, 0.0);
+        let options = PointSolveOptions::default();
+        let expected = curve
+            .local_point_solve::<u64>(
+                &original,
+                &interval,
+                SolverOperation::Minimize,
+                point,
+                &options,
+                0.5,
+            )
+            .unwrap();
+        assert!(expected.0);
+        assert!((expected.1.start.parameters[0] - 0.25).abs() < 1e-9);
+        assert!((expected.1.start.solution_value - 2.0).abs() < 1e-9);
+        let work = ProofWork::new(crate::prism::sheet::READ_WORK);
+        let query = original.optional_proof_view(&work).unwrap();
+        let actual = curve
+            .local_point_solve::<u64>(
+                &query,
+                &interval,
+                SolverOperation::Minimize,
+                point,
+                &options,
+                0.5,
+            )
+            .unwrap();
+        assert_eq!(actual.0, expected.0);
+        assert_eq!(format!("{:?}", actual.1), format!("{:?}", expected.1));
+        assert!(!work.is_disabled());
+    }
+
+    #[test]
+    fn optional_local_scalar_exhaustion_precedes_newton_and_preserves_plain_geometry() {
+        use crate::geom::context::ProofWork;
+        let original = Kernel::default();
+        let curve = Curve::from(Line::from_points(Vec3::ZERO, Vec3::new(10.0, 0.0, 0.0), 3));
+        let interval = curve.natural_interval();
+        let point = Vec3::new(2.5, 2.0, 0.0);
+        let options = PointSolveOptions::default();
+        let expected = curve
+            .local_point_solve::<u64>(
+                &original,
+                &interval,
+                SolverOperation::Minimize,
+                point,
+                &options,
+                0.5,
+            )
+            .unwrap();
+        let allowance = crate::prism::sheet::READ_WORK;
+        let work = ProofWork::new(allowance);
+        let query = original.optional_proof_view(&work).unwrap();
+        // Full owner and actual view first, then deliberately small scalar headroom.
+        assert!(work.charge(Some(u64::try_from(allowance - 8192).unwrap())));
+        assert!(
+            !work.is_disabled(),
+            "the local invocation, not owner/view setup, must stop"
+        );
+        assert!(matches!(
+            curve.local_point_solve::<u64>(
+                &query,
+                &interval,
+                SolverOperation::Minimize,
+                point,
+                &options,
+                0.5,
+            ),
+            Err(SolidError::OutOfFuel { .. })
+        ));
+        assert!(work.is_disabled());
+        let after = curve
+            .local_point_solve::<u64>(
+                &original,
+                &interval,
+                SolverOperation::Minimize,
+                point,
+                &options,
+                0.5,
+            )
+            .unwrap();
+        assert_eq!(after.0, expected.0);
+        assert_eq!(format!("{:?}", after.1), format!("{:?}", expected.1));
     }
 }

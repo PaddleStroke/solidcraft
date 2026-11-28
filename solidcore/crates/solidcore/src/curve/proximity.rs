@@ -86,11 +86,13 @@ use crate::curve::curve::{Curve, CurveKind};
 use crate::curve::length_bound::Span;
 use crate::error::Result;
 use crate::geom::certified::{next_down, next_up};
+use crate::geom::context::ProofWork;
 use crate::geom::extent1d::Extent1d;
 use crate::geom::extent3d::Extent3d;
 use crate::geom::global_solver::SolverOperation;
 use crate::geom::vector3d::Vec3;
 use crate::kernel::Kernel;
+use crate::math::det;
 use crate::math::EFF_ZERO;
 use crate::nurbs::b_spline_curve::BSplineCurve;
 use crate::nurbs::math::gamma;
@@ -231,11 +233,164 @@ fn segment_distance(p: Vec3, a: Vec3, b: Vec3) -> f64 {
     ((w - along * t).length() + gamma(4) * (w.length() + along.length())) * (1.0 + gamma(2))
 }
 
+fn charged_order(values: &mut [f64], mut spend: impl FnMut(usize) -> bool) -> Option<()> {
+    fn exchange(
+        values: &mut [f64],
+        a: usize,
+        b: usize,
+        spend: &mut impl FnMut(usize) -> bool,
+    ) -> Option<()> {
+        if !spend(4) {
+            return None;
+        }
+        let first = *values.get(a)?;
+        let second = *values.get(b)?;
+        *values.get_mut(a)? = second;
+        *values.get_mut(b)? = first;
+        Some(())
+    }
+    fn sift(
+        values: &mut [f64],
+        mut root: usize,
+        end: usize,
+        spend: &mut impl FnMut(usize) -> bool,
+    ) -> Option<()> {
+        if !spend(1) {
+            return None;
+        }
+        loop {
+            let left = root.checked_mul(2)?.checked_add(1)?;
+            if left >= end {
+                return Some(());
+            }
+            let right = left.checked_add(1)?;
+            let mut greatest = left;
+            if right < end {
+                if !spend(1) {
+                    return None;
+                }
+                if values.get(left)?.total_cmp(values.get(right)?).is_lt() {
+                    greatest = right;
+                }
+            }
+            if !spend(1) {
+                return None;
+            }
+            if !values.get(root)?.total_cmp(values.get(greatest)?).is_lt() {
+                return Some(());
+            }
+            exchange(values, root, greatest, spend)?;
+            root = greatest;
+        }
+    }
+    let n = values.len();
+    for root in (0..n / 2).rev() {
+        sift(values, root, n, &mut spend)?;
+    }
+    for end in (1..n).rev() {
+        exchange(values, 0, end, &mut spend)?;
+        sift(values, 0, end, &mut spend)?;
+    }
+    Some(())
+}
+
+// Checked accounting for the same native span/hull helpers, not a new hull.
+fn proof_spline_counts(c: &BSplineCurve) -> Option<(u64, u64, u64)> {
+    let nurb = c.nurb.as_ref()?;
+    let k = u64::try_from(nurb.knots().len()).ok()?;
+    let p = u64::try_from(nurb.degree()).ok()?;
+    (p < 32).then_some((k, p, p.checked_add(1)?))
+}
+
+fn charge_optional(work: Option<&ProofWork>, cost: Option<u64>) -> Result<()> {
+    if let Some(work) = work {
+        if !work.charge(cost) {
+            return Err(work.stopped(OP));
+        }
+    }
+    Ok(())
+}
+
+fn charge_span_hull(c: &BSplineCurve, work: Option<&ProofWork>) -> Result<()> {
+    let Some(work) = work else {
+        return Ok(());
+    };
+    let cost = (|| {
+        let (k, p, q) = proof_spline_counts(c)?;
+        let growth = k.checked_mul(2)?.checked_add(8)?;
+        // Two unique-knot/multiplicity vectors plus expanded knots and H points.
+        let span_storage = growth
+            .checked_mul(48)?
+            .checked_add(k.checked_mul(8)?)?
+            .checked_add(q.checked_mul(32)?)?
+            .checked_add(p.checked_mul(16)?)?
+            .checked_add(120)?;
+        let span_events = k
+            .checked_mul(3)?
+            .checked_add(q.checked_mul(4)?)?
+            .checked_add(p.checked_mul(2)?)?
+            .checked_add(1)?;
+        let t = p.checked_mul(q)?.checked_div(2)?;
+        let hull_events = q
+            .checked_mul(p.checked_add(q)?.checked_add(t)?)?
+            .checked_add(q.checked_mul(4)?)?;
+        let hull_storage = q.checked_mul(56)?.checked_add(48)?.checked_add(
+            q.checked_mul(
+                p.checked_mul(8)?
+                    .checked_add(q.checked_mul(32)?)?
+                    .checked_add(48)?,
+            )?,
+        )?;
+        span_storage
+            .checked_add(span_events)?
+            .checked_add(hull_events)?
+            .checked_add(hull_storage)
+    })();
+    charge_optional(Some(work), cost)
+}
+
 /// `a`, and the unique knots of `c` strictly inside `(a, b)`, and `b`.
 fn spline_breaks(c: &BSplineCurve, a: f64, b: f64) -> Result<Vec<f64>> {
+    spline_breaks_observed(c, a, b, None)
+}
+
+fn spline_breaks_observed(
+    c: &BSplineCurve,
+    a: f64,
+    b: f64,
+    work: Option<&ProofWork>,
+) -> Result<Vec<f64>> {
+    if let Some(work) = work {
+        let cost = proof_spline_counts(c).and_then(|(k, _, _)| {
+            let growth = k.checked_mul(2)?.checked_add(8)?;
+            growth
+                .checked_mul(48)?
+                .checked_add(48)?
+                .checked_add(k.checked_mul(2)?)
+        });
+        charge_optional(Some(work), cost)?;
+    }
     let (unique, _) = c.knots(None)?;
-    let mut out = vec![a];
-    out.extend(unique.into_iter().filter(|&t| t > a && t < b));
+    let mut logical = 0;
+    let mut out = if work.is_some() {
+        let mut values = Vec::new();
+        crate::curve::curve::p2::proof_vec_capacity(work, &mut values, &mut logical, 1, 8, OP)?;
+        values.push(a);
+        values
+    } else {
+        vec![a]
+    };
+    // Iterator order and cut values remain the existing ones.
+    let inside = unique.into_iter().filter(|&t| t > a && t < b);
+    if work.is_some() {
+        for t in inside {
+            crate::curve::curve::p2::proof_vec_capacity(work, &mut out, &mut logical, 1, 8, OP)?;
+            out.push(t);
+        }
+    } else {
+        out.extend(inside);
+    }
+    crate::curve::curve::p2::proof_vec_capacity(work, &mut out, &mut logical, 1, 8, OP)?;
     out.push(b);
     Ok(out)
 }
@@ -274,15 +429,27 @@ fn spline_piece_connected(c: &BSplineCurve, a: f64, b: f64) -> Result<bool> {
 impl Form<'_> {
     /// The parameters to cut `[a, b]` at so that each piece lies in one knot span.
     fn breaks(&self, a: f64, b: f64) -> Result<Vec<f64>> {
+        self.breaks_observed(a, b, None)
+    }
+
+    fn breaks_observed(&self, a: f64, b: f64, work: Option<&ProofWork>) -> Result<Vec<f64>> {
         match self {
-            Form::Line(_) => Ok(vec![a, b]),
-            Form::Spline(c) => spline_breaks(c, a, b),
+            Form::Line(_) => {
+                charge_optional(work, Some(42))?;
+                Ok(vec![a, b])
+            }
+            Form::Spline(c) => spline_breaks_observed(c, a, b, work),
         }
     }
 
     /// The tube of the piece over `[a, b]` (`a <= b`); `None` where it has no certified
     /// hull (a weight not positive, a number not finite, a malformed B-spline).
     fn tube(&self, a: f64, b: f64) -> Result<Option<Tube>> {
+        self.tube_observed(a, b, None)
+    }
+
+    fn tube_observed(&self, a: f64, b: f64, work: Option<&ProofWork>) -> Result<Option<Tube>> {
+        charge_optional(work, Some(1))?;
         let sqrt3 = 3.0_f64.sqrt();
         match self {
             Form::Line(l) => {
@@ -296,18 +463,30 @@ impl Form<'_> {
                 }))
             }
             Form::Spline(c) => {
+                if let Some(work) = work {
+                    let cost = proof_spline_counts(c)
+                        .and_then(|(k, _, _)| k.checked_mul(4)?.checked_add(1));
+                    charge_optional(Some(work), cost)?;
+                }
                 if !spline_piece_connected(c, a, b)? {
                     return Ok(None);
                 }
-                let cuts = spline_breaks(c, a, b)?;
+                let cuts = spline_breaks_observed(c, a, b, work)?;
                 let mut points: Vec<Vec3> = Vec::new();
+                let mut logical_points = 0;
                 let mut rounding = 0.0_f64;
                 for w in cuts.windows(2) {
                     let [x, y] = *w else { continue };
+                    charge_optional(work, Some(1))?;
                     let hull = if y > x {
+                        charge_span_hull(c, work)?;
                         soft(Span::of(c, 0.5 * (x + y)))?.and_then(|span| span.hull(x, y))
                     } else {
                         // a piece of no length: its point as evaluated
+                        if let Some(work) = work {
+                            charge_optional(Some(work), c.proof_native_point_work(work))?;
+                        }
+                        charge_optional(work, Some(48))?;
                         let p = c.evaluate_point(x)?;
                         let size = p.x.abs().max(p.y.abs()).max(p.z.abs());
                         let e = gamma(16 * (c.degree()? + 2)) * (1.0 + size);
@@ -316,12 +495,21 @@ impl Form<'_> {
                     let Some((pts, e)) = hull else {
                         return Ok(None);
                     };
+                    crate::curve::curve::p2::proof_vec_capacity(
+                        work,
+                        &mut points,
+                        &mut logical_points,
+                        pts.len(),
+                        24,
+                        OP,
+                    )?;
                     points.extend(pts);
                     rounding = rounding.max(e);
                 }
                 let (Some(&first), Some(&last)) = (points.first(), points.last()) else {
                     return Ok(None);
                 };
+                charge_optional(work, u64::try_from(points.len()).ok())?;
                 let reach = points
                     .iter()
                     .fold(0.0_f64, |m, &p| m.max(segment_distance(p, first, last)));
@@ -351,7 +539,7 @@ pub(crate) struct TangentCone {
 
 /// The angle between `a` and `b`, by `atan2` of the cross and the dot products.
 fn angle(a: Vec3, b: Vec3) -> f64 {
-    a.cross(b).length().atan2(a.dot(b))
+    det::atan2(a.cross(b).length(), a.dot(b))
 }
 
 impl Curve {
@@ -488,7 +676,7 @@ impl Curve {
         }
         let axis = chord / length;
         // the chord's own direction to its rounding
-        let mut half_angle = (2.0 * rounding / length).min(1.0).asin();
+        let mut half_angle = det::asin((2.0 * rounding / length).min(1.0));
         let own = half_angle;
         for (points, _) in &pieces {
             for (i, &p) in points.iter().enumerate() {
@@ -498,7 +686,7 @@ impl Curve {
                     if len.is_nan() || len <= 2.0 * rounding {
                         return Ok(None);
                     }
-                    let wide = angle(axis, d) + (2.0 * rounding / len).min(1.0).asin() + own;
+                    let wide = angle(axis, d) + det::asin((2.0 * rounding / len).min(1.0)) + own;
                     half_angle = half_angle.max(wide * (1.0 + gamma(8)));
                 }
             }
@@ -606,7 +794,7 @@ impl Curve {
                     return Ok(None);
                 };
                 // how far from `p` the window is sure to hold the curve
-                let cos = cone.half_angle.cos();
+                let cos = det::cos(cone.half_angle);
                 let mut covered = f64::INFINITY;
                 for (end, limit, bound) in [
                     (cone.ends[0], lo, domain.min()),
@@ -627,7 +815,7 @@ impl Curve {
             let acute = between.min(std::f64::consts::PI - between);
             let theta = acute * (1.0 - gamma(8)) - cone_c.half_angle - cone_e.half_angle;
             if theta > 0.0 {
-                let reach = tolerance / theta.sin() * (1.0 + gamma(8));
+                let reach = tolerance / det::sin(theta) * (1.0 + gamma(8));
                 if reach <= covered_c.min(*covered_e) {
                     return Ok(Some(reach));
                 }
@@ -705,7 +893,9 @@ impl Curve {
                     (cone.ends[1], cone.ends[0], lo, domain.min())
                 };
                 let covered = if (far_t - bound).abs() > 0.0 {
-                    ((far - p).length() - cone.rounding) * cone.half_angle.cos() * (1.0 - gamma(8))
+                    ((far - p).length() - cone.rounding)
+                        * det::cos(cone.half_angle)
+                        * (1.0 - gamma(8))
                 } else {
                     f64::INFINITY
                 };
@@ -728,7 +918,7 @@ impl Curve {
                 return Ok(None);
             }
             let off = ((near - p).length() + cone.rounding) * (1.0 + gamma(4));
-            let side = (off + (reach + off) * phi.sin()) * (1.0 + gamma(4)) + gamma(4) * reach;
+            let side = (off + (reach + off) * det::sin(phi)) * (1.0 + gamma(4)) + gamma(4) * reach;
             stray = stray.max(side);
         }
         Ok((!stray.is_nan()).then_some(stray))
@@ -752,6 +942,8 @@ impl Curve {
         radius: f64,
         ends: &[(Vec3, f64)],
     ) -> Result<bool> {
+        let work = k.context.proof_work();
+        charge_optional(work, Some(64))?;
         let (a, b) = (interval.min(), interval.max());
         let (lo, hi) = (other_interval.min(), other_interval.max());
         let finite = [a, b, lo, hi, radius].iter().all(|v| v.is_finite());
@@ -761,7 +953,24 @@ impl Curve {
         let (Some(mine), Some(theirs)) = (form(self), form(other)) else {
             return Ok(false);
         };
-        let Some(mut cuts) = soft(mine.breaks(a, b))? else {
+        let reference = if work.is_some() {
+            charge_optional(work, Some(128))?;
+            let hint = |curve: &Curve| match curve.kind() {
+                CurveKind::Ellipse(e) if e.is_circle() => {
+                    Some(crate::nurbs::circle_deviation::RefCircle {
+                        center: e.position().origin(),
+                        x_axis: e.position().x_axis(),
+                        y_axis: e.position().y_axis(),
+                        radius: e.x_radius(),
+                    })
+                }
+                _ => None,
+            };
+            hint(self).or_else(|| hint(other))
+        } else {
+            None
+        };
+        let Some(mut cuts) = soft(mine.breaks_observed(a, b, work))? else {
             return Ok(false);
         };
         // the other curve closed within the radius: this one is cut where its seam drops
@@ -770,32 +979,69 @@ impl Curve {
         if closed {
             if let Some(seam) = soft(other.evaluate_point(k, lo))? {
                 if let Some((t, _)) = foot_on(k, self, interval, seam)? {
+                    charge_optional(work, u64::try_from(cuts.len()).ok())?;
                     if a < t && t < b && !cuts.contains(&t) {
+                        let mut logical = cuts.len();
+                        crate::curve::curve::p2::proof_vec_capacity(
+                            work,
+                            &mut cuts,
+                            &mut logical,
+                            1,
+                            8,
+                            OP,
+                        )?;
                         cuts.push(t);
-                        cuts.sort_by(f64::total_cmp);
+                        if let Some(work) = work {
+                            if charged_order(&mut cuts, |n| work.charge(u64::try_from(n).ok()))
+                                .is_none()
+                            {
+                                work.disable();
+                                return Err(work.stopped(OP));
+                            }
+                        } else {
+                            cuts.sort_by(f64::total_cmp);
+                        }
                     }
                 }
             }
         }
-        let mut stack: Vec<(f64, f64, usize)> = cuts
-            .windows(2)
-            .filter_map(|w| match *w {
-                [x, y] => Some((x, y, DEPTH)),
-                _ => None,
-            })
-            .collect();
+        let windows = cuts.windows(2).filter_map(|w| match *w {
+            [x, y] => Some((x, y, DEPTH)),
+            _ => None,
+        });
+        let mut logical_stack = 0;
+        let mut stack: Vec<(f64, f64, usize)> = if work.is_some() {
+            let mut values = Vec::new();
+            crate::curve::curve::p2::proof_vec_capacity(
+                work,
+                &mut values,
+                &mut logical_stack,
+                cuts.len().saturating_sub(1),
+                24,
+                OP,
+            )?;
+            values.extend(windows);
+            values
+        } else {
+            windows.collect()
+        };
         // the foot of a point on the other curve: where to look, not part of the proof
         let foot = |p: Vec3| -> Result<Option<f64>> {
             Ok(foot_on(k, other, other_interval, p)?.map(|(t, _)| t))
         };
         let mut tried = 0_usize;
-        while let Some((x, y, depth)) = stack.pop() {
+        while let Some((x, y, depth)) = {
+            if work.is_some() && !stack.is_empty() {
+                charge_optional(work, Some(25))?;
+            }
+            stack.pop()
+        } {
             k.check_cancelled(OP)?;
             tried += 1;
             if tried > MAX_PIECES {
                 return Ok(false);
             }
-            let Some(piece) = soft(mine.tube(x, y))?.flatten() else {
+            let Some(piece) = soft(mine.tube_observed(x, y, work))?.flatten() else {
                 return Ok(false);
             };
             // in a ball: the tube's segment is no farther from the centre than its ends
@@ -804,6 +1050,7 @@ impl Curve {
                 let far = far * (1.0 + gamma(4)) + gamma(4) * centre.length();
                 (piece.rho + far) * (1.0 + gamma(1)) <= reach
             };
+            charge_optional(work, u64::try_from(ends.len()).ok())?;
             if ends.iter().any(in_ball) {
                 continue;
             }
@@ -812,11 +1059,37 @@ impl Curve {
             };
             // the bound against the other curve's piece over `[u, v]`
             let against = |u: f64, v: f64| -> Result<Option<f64>> {
-                Ok(soft(theirs.tube(u, v))?.flatten().map(|facing| {
-                    let reach = segment_distance(piece.a, facing.a, facing.b)
-                        .max(segment_distance(piece.b, facing.a, facing.b));
-                    (piece.rho + reach + facing.rho) * (1.0 + gamma(3))
-                }))
+                if let (Some(work), Some(reference), Form::Spline(a), Form::Spline(b)) =
+                    (work, reference.as_ref(), &mine, &theirs)
+                {
+                    k.check_cancelled(OP)?;
+                    if let (Some(a), Some(b)) = (a.nurb.as_ref(), b.nurb.as_ref()) {
+                        let certified =
+                            crate::nurbs::circle_deviation::hausdorff_about_circle_with_work(
+                                a,
+                                [x, y],
+                                b,
+                                [u, v],
+                                reference,
+                                work,
+                            );
+                        charge_optional(Some(work), Some(0))?;
+                        k.check_cancelled(OP)?;
+                        if let Some(Some(bound)) = soft(certified)? {
+                            if bound <= radius {
+                                return Ok(Some(bound));
+                            }
+                        }
+                    }
+                }
+                // Ineligible, unproved or loose certificates retain the old tube proof.
+                Ok(soft(theirs.tube_observed(u, v, work))?
+                    .flatten()
+                    .map(|facing| {
+                        let reach = segment_distance(piece.a, facing.a, facing.b)
+                            .max(segment_distance(piece.b, facing.a, facing.b));
+                        (piece.rho + reach + facing.rho) * (1.0 + gamma(3))
+                    }))
             };
             let (low, high) = (s.min(t), s.max(t));
             let Some(mut bound) = against(low, high)? else {
@@ -837,6 +1110,14 @@ impl Curve {
             if depth == 0 || !(x < mid && mid < y) {
                 return Ok(false);
             }
+            crate::curve::curve::p2::proof_vec_capacity(
+                work,
+                &mut stack,
+                &mut logical_stack,
+                2,
+                24,
+                OP,
+            )?;
             stack.push((mid, y, depth - 1));
             stack.push((x, mid, depth - 1));
         }
@@ -848,6 +1129,36 @@ impl Curve {
     /// ([`Curve::proved_near`] and [`Curve::proved_together`]) nothing is proved.
     pub(crate) fn can_be_proved(&self) -> bool {
         form(self).is_some()
+    }
+
+    /// The same finite proof on query-owned copies with one optional allowance.
+    /// A proof-work stop is caught here only; actual Boolean geometry is untouched.
+    pub(crate) fn proved_together_with_work(
+        &self,
+        k: &Kernel,
+        interval: &Extent1d,
+        other: (&Self, &Extent1d),
+        radius: f64,
+        ends: &[(Vec3, f64)],
+        work: &ProofWork,
+    ) -> Result<bool> {
+        let result = (|| {
+            let Some(query) = k.optional_proof_view(work) else {
+                return Ok(false);
+            };
+            let Some(mine) = self.clone_for_optional_proof(work)? else {
+                return Ok(false);
+            };
+            let Some(theirs) = other.0.clone_for_optional_proof(work)? else {
+                return Ok(false);
+            };
+            mine.proved_together(&query, interval, &theirs, other.1, radius, ends)
+        })();
+        if work.is_disabled() {
+            Ok(false)
+        } else {
+            result
+        }
     }
 
     /// Whether the two curves are proved to stay within `radius` of each other over their
@@ -1240,16 +1551,16 @@ mod tests {
     fn a_chord_and_its_arc_are_together_within_the_sagitta() {
         let k = Kernel::default();
         let circle = ellipse(&k, Point3::new(1.0, -2.0, 3.0), 4.0, 4.0);
-        let half = (0.1_f64 / 4.0).asin();
+        let half = det::asin(0.1_f64 / 4.0);
         // about the circle's top, away from its seam
-        let p = Point3::new(1.0 - 0.1, -2.0 + 4.0 * half.cos(), 3.0);
-        let q = Point3::new(1.0 + 0.1, -2.0 + 4.0 * half.cos(), 3.0);
+        let p = Point3::new(1.0 - 0.1, -2.0 + 4.0 * det::cos(half), 3.0);
+        let q = Point3::new(1.0 + 0.1, -2.0 + 4.0 * det::cos(half), 3.0);
         let line = Curve::from(Line::from_points(p, q, 3));
         let (s, t) = (at(&k, &circle, p), at(&k, &circle, q));
         let arc = Extent1d::from_min_max(s.min(t), s.max(t));
         let (s, t) = (at(&k, &line, p), at(&k, &line, q));
         let seg = Extent1d::from_min_max(s.min(t), s.max(t));
-        let sagitta = 4.0 * (1.0 - half.cos());
+        let sagitta = 4.0 * (1.0 - det::cos(half));
         assert!((sagitta - 1.25e-3).abs() < 1e-6);
         for (a, ia, b, ib) in [(&line, &seg, &circle, &arc), (&circle, &arc, &line, &seg)] {
             assert!(a.proved_near(&k, ia, b, ib, sagitta * 1.001, &[]).unwrap());
@@ -1376,13 +1687,13 @@ mod tests {
     fn a_chord_and_its_arc_run_together_only_within_the_sagitta() {
         let k = Kernel::default();
         let circle = ellipse(&k, Point3::new(0.0, 0.0, 0.0), 4.0, 4.0);
-        let half = (0.1_f64 / 4.0).asin();
-        let p = Point3::new(-0.1, 4.0 * half.cos(), 0.0);
-        let q = Point3::new(0.1, 4.0 * half.cos(), 0.0);
+        let half = det::asin(0.1_f64 / 4.0);
+        let p = Point3::new(-0.1, 4.0 * det::cos(half), 0.0);
+        let q = Point3::new(0.1, 4.0 * det::cos(half), 0.0);
         let chord = Curve::from(Line::from_points(p, q, 3));
         let (s, t) = (at(&k, &circle, p), at(&k, &circle, q));
         let arc = Extent1d::from_min_max(s.min(t), s.max(t));
-        let sagitta = 4.0 * (1.0 - half.cos());
+        let sagitta = 4.0 * (1.0 - det::cos(half));
         let seg = chord.natural_interval();
         assert!(matches!(
             chord
@@ -1411,7 +1722,7 @@ mod tests {
         let p = Point3::new(0.0, 2.0, 0.0);
         let s = at(&k, &circle, p);
         let reach = |degrees: f64| {
-            let (sin, cos) = degrees.to_radians().sin_cos();
+            let (sin, cos) = det::sin_cos(degrees.to_radians());
             let d = Vec3::new(cos, sin, 0.0);
             let line = Curve::from(Line::from_points(p - d, p + d, 3));
             let t = at(&k, &line, p);
@@ -1445,10 +1756,10 @@ mod tests {
             .unwrap()
             .unwrap();
         for a in [5e-4_f64, -5e-4, 0.999e-3, -0.999e-3] {
-            let off = 1.0 - a.cos();
+            let off = 1.0 - det::cos(a);
             assert!(stray >= off, "stray {stray:e} below {off:e} at {a}");
         }
-        assert!(stray < 4.0 * (1.0 - 1e-3_f64.cos()), "{stray:e}");
+        assert!(stray < 4.0 * (1.0 - det::cos(1e-3_f64)), "{stray:e}");
         let line = Curve::from(Line::from_points(top - Vec3::X, top + Vec3::X, 3));
         let t = at(&k, &line, top);
         let flat = line
@@ -1464,5 +1775,599 @@ mod tests {
                 None
             );
         }
+    }
+
+    fn optional_linear_spline() -> Curve {
+        use crate::nurbs::crv_basic::Curve as Nurb;
+        use crate::nurbs::math::{CPoint, NOW};
+        let points = [0.0, 5.0, 10.0]
+            .into_iter()
+            .map(|x| CPoint::new(x, 0.0, 0.0, NOW))
+            .collect();
+        let nurb = Nurb::new(points, 2, vec![7.0, 7.0, 7.0, 19.0, 19.0, 19.0]).unwrap();
+        Curve::from(BSplineCurve::from_nurb(nurb, 3, true))
+    }
+
+    fn assert_optional_pair(
+        k: &Kernel,
+        a: &Curve,
+        ia: &Extent1d,
+        b: &Curve,
+        ib: &Extent1d,
+        radius: f64,
+        expected: bool,
+    ) {
+        use crate::geom::context::ProofWork;
+        assert_eq!(
+            a.proved_together(k, ia, b, ib, radius, &[]).unwrap(),
+            expected,
+            "plain geometric control"
+        );
+        let work = ProofWork::new(crate::prism::sheet::READ_WORK);
+        assert_eq!(
+            a.proved_together_with_work(k, ia, (b, ib), radius, &[], &work)
+                .unwrap(),
+            expected,
+            "optional finite proof owner: {work:?}"
+        );
+        assert!(
+            !work.is_disabled(),
+            "a negative geometry verdict must not be quota exhaustion"
+        );
+    }
+
+    #[test]
+    fn optional_finite_proof_covers_full_reversed_and_reparameterized_domains() {
+        let k = Kernel::default();
+        let a = Curve::from(Line::from_points(
+            Point3::ZERO,
+            Point3::new(10.0, 0.0, 0.0),
+            3,
+        ));
+        let whole = a.natural_interval();
+        let forward = Curve::from(Line::from_points(
+            Point3::ZERO,
+            Point3::new(10.0, 0.0, 0.0),
+            3,
+        ));
+        let reversed = Curve::from(Line::from_points(
+            Point3::new(10.0, 0.0, 0.0),
+            Point3::ZERO,
+            3,
+        ));
+        let spline = optional_linear_spline();
+        assert_ne!(
+            whole,
+            spline.natural_interval(),
+            "the reparameterized control must use a different numeric domain"
+        );
+        for b in [&forward, &reversed, &spline] {
+            assert_optional_pair(&k, &a, &whole, b, &b.natural_interval(), 1e-4, true);
+            assert_optional_pair(&k, b, &b.natural_interval(), &a, &whole, 1e-4, true);
+        }
+    }
+
+    #[test]
+    fn optional_finite_proof_rejects_strict_subspans_and_disjoint_domains() {
+        let k = Kernel::default();
+        let a = Curve::from(Line::from_points(
+            Point3::ZERO,
+            Point3::new(10.0, 0.0, 0.0),
+            3,
+        ));
+        let b = Curve::from(Line::from_points(
+            Point3::ZERO,
+            Point3::new(10.0, 0.0, 0.0),
+            3,
+        ));
+        let whole = a.natural_interval();
+        let half = Extent1d::from_min_max(whole.min(), whole.evaluate(0.5));
+        // The missing half is five units long; a 1e-4 radius cannot cover it.
+        assert_optional_pair(&k, &a, &whole, &b, &half, 1e-4, false);
+        assert_optional_pair(&k, &b, &half, &a, &whole, 1e-4, false);
+        let offset = Curve::from(Line::from_points(
+            Point3::new(0.0, 1.0, 0.0),
+            Point3::new(10.0, 1.0, 0.0),
+            3,
+        ));
+        assert_optional_pair(
+            &k,
+            &a,
+            &whole,
+            &offset,
+            &offset.natural_interval(),
+            1e-4,
+            false,
+        );
+    }
+
+    #[test]
+    fn optional_finite_proof_handles_closed_curves_without_matching_seams() {
+        let k = Kernel::default();
+        let a = circle_along(&k, Point3::ZERO, Vec3::X, Vec3::Y, 4.0, 4.0);
+        for (x, y) in [(Vec3::Y, -Vec3::X), (Vec3::X, -Vec3::Y)] {
+            let b = circle_along(&k, Point3::ZERO, x, y, 4.0, 4.0);
+            // Both finite point sets are the same radius-four circle, despite seam/direction.
+            assert_optional_pair(
+                &k,
+                &a,
+                &a.natural_interval(),
+                &b,
+                &b.natural_interval(),
+                1e-3,
+                true,
+            );
+        }
+    }
+
+    #[test]
+    fn optional_finite_proof_exhaustion_is_shared_and_does_not_change_the_plain_query() {
+        use crate::geom::context::ProofWork;
+        let k = Kernel::default();
+        let a = Curve::from(Line::from_points(
+            Point3::ZERO,
+            Point3::new(10.0, 0.0, 0.0),
+            3,
+        ));
+        let b = Curve::from(Line::from_points(
+            Point3::new(10.0, 0.0, 0.0),
+            Point3::ZERO,
+            3,
+        ));
+        let ia = a.natural_interval();
+        let ib = b.natural_interval();
+        let work = ProofWork::new(crate::prism::sheet::READ_WORK);
+        let shared = work.clone();
+        assert!(work.same_operation(&shared));
+        assert!(a
+            .proved_together_with_work(&k, &ia, (&b, &ib), 1e-4, &[], &shared)
+            .unwrap());
+        // Exceed the whole operation allowance, without assuming the query's exact charge.
+        assert!(!work.charge(Some(crate::prism::sheet::READ_WORK as u64 + 1)));
+        assert!(shared.is_disabled());
+        assert!(!b
+            .proved_together_with_work(&k, &ib, (&a, &ia), 1e-4, &[], &shared)
+            .unwrap());
+        assert!(!a
+            .proved_together_with_work(&k, &ia, (&b, &ib), 1e-4, &[], &work)
+            .unwrap());
+        assert!(a.proved_together(&k, &ia, &b, &ib, 1e-4, &[]).unwrap());
+        let fresh = ProofWork::new(crate::prism::sheet::READ_WORK);
+        assert!(!fresh.same_operation(&work));
+        assert!(b
+            .proved_together_with_work(&k, &ib, (&a, &ia), 1e-4, &[], &fresh)
+            .unwrap());
+    }
+
+    #[test]
+    fn optional_finite_proof_budget_sweep_preserves_a_nonanalytic_spline() {
+        use crate::geom::context::ProofWork;
+        let k = Kernel::default();
+        let a = Curve::from(Line::from_points(
+            Point3::ZERO,
+            Point3::new(10.0, 0.0, 0.0),
+            3,
+        ));
+        let b = optional_linear_spline();
+        let ia = a.natural_interval();
+        let ib = b.natural_interval();
+        let allowance = crate::prism::sheet::READ_WORK;
+        let mut trace = Vec::new();
+        // These are varied headrooms, not expected implementation charges or stage names.
+        for headroom in [0, 64, 512, 4096, 32768, 262144, allowance] {
+            let work = ProofWork::new(allowance);
+            let _ = work.charge(Some((allowance - headroom) as u64));
+            let proved = a
+                .proved_together_with_work(&k, &ia, (&b, &ib), 1e-4, &[], &work)
+                .unwrap();
+            assert_eq!(
+                proved,
+                !work.is_disabled(),
+                "a matching spline either proves or runs out of optional work"
+            );
+            if headroom == 0 {
+                assert!(!proved);
+            }
+            if headroom == allowance {
+                assert!(proved);
+            }
+            assert!(a.proved_together(&k, &ia, &b, &ib, 1e-4, &[]).unwrap());
+            trace.push((headroom, proved, work.is_disabled()));
+        }
+        // A native/wasm run may compare this deterministic trace; no platform sizes enter it.
+        eprintln!("optional-finite-proof-headroom-trace: {trace:?}");
+    }
+
+    #[test]
+    fn optional_finite_proof_does_not_draw_geometry_keys() {
+        use crate::geom::context::ProofWork;
+        fn next_key(k: &mut Kernel) -> crate::geom::attribute::ObjectKey {
+            let mut marker = Curve::from(Line::from_points(Point3::ZERO, Vec3::X, 3));
+            k.context
+                .geometry_key(marker.notify_identity_slot())
+                .unwrap()
+        }
+        let mut control = Kernel::default();
+        let mut queried = Kernel::default();
+        assert_eq!(next_key(&mut control), next_key(&mut queried));
+        let a = Curve::from(Line::from_points(
+            Point3::ZERO,
+            Point3::new(10.0, 0.0, 0.0),
+            3,
+        ));
+        let b = optional_linear_spline();
+        let ia = a.natural_interval();
+        let ib = b.natural_interval();
+        assert!(a.notify_key().is_none());
+        assert!(b.notify_key().is_none());
+        let work = ProofWork::new(crate::prism::sheet::READ_WORK);
+        assert!(a
+            .proved_together_with_work(&queried, &ia, (&b, &ib), 1e-4, &[], &work)
+            .unwrap());
+        assert!(!work.charge(Some(crate::prism::sheet::READ_WORK as u64 + 1)));
+        assert!(!a
+            .proved_together_with_work(&queried, &ia, (&b, &ib), 1e-4, &[], &work)
+            .unwrap());
+        assert!(a.notify_key().is_none());
+        assert!(b.notify_key().is_none());
+        assert_eq!(
+            next_key(&mut control),
+            next_key(&mut queried),
+            "optional success/exhaustion must not advance the model's geometry-key sequence"
+        );
+    }
+
+    fn optional_point_kernel_with_headroom(headroom: usize) -> (Kernel, ProofWork) {
+        let original = Kernel::default();
+        assert!(original.cancel.is_none());
+        let allowance = crate::prism::sheet::READ_WORK;
+        let work = ProofWork::new(allowance);
+        let query = original.optional_proof_view(&work).unwrap();
+        // Owner64 + this uncancelled query view4096 are paid before headroom.
+        let setup = 64 + 4096;
+        let debit = allowance.checked_sub(setup + headroom).unwrap();
+        assert!(work.charge(Some(u64::try_from(debit).unwrap())));
+        (query, work)
+    }
+
+    #[test]
+    fn optional_native_point_on_a_clamped_circle_keeps_the_point_and_general_routes_separate() {
+        use crate::error::SolidError;
+        use crate::nurbs::crv_basic::Curve as Nurb;
+        use crate::nurbs::knots::Side;
+        use crate::nurbs::math::CPoint;
+        use crate::nurbs::nurbs_crv::crv_eval;
+
+        let knots = vec![0.0, 0.0, 0.0, 1.0, 1.0, 2.0, 2.0, 3.0, 3.0, 4.0, 4.0, 4.0];
+        // Four rational quadratic quarter circles. At the first span's midpoint,
+        // Bernstein weights1/4,1/2,1/4 give (2sqrt(2), +/-2sqrt(2), 0).
+        // Six256-byte classes separate the proved native Point credit1354 from
+        // the unchanged generic-family2250 and the unclamped derivative fallback.
+        let headroom = 6 * 256;
+        for y_sign in [1.0, -1.0] {
+            let w = 0.5_f64.sqrt();
+            let xy = [
+                (4.0, 0.0),
+                (4.0, 4.0),
+                (0.0, 4.0),
+                (-4.0, 4.0),
+                (-4.0, 0.0),
+                (-4.0, -4.0),
+                (0.0, -4.0),
+                (4.0, -4.0),
+                (4.0, 0.0),
+            ];
+            let pw = xy
+                .into_iter()
+                .enumerate()
+                .map(|(i, (x, y))| {
+                    let weight = if i % 2 == 0 { 1.0 } else { w };
+                    CPoint::new(x * weight, y_sign * y * weight, 0.0, weight)
+                })
+                .collect();
+            // Borrowed=true preserves the authored clamping, without knot fixup.
+            let curve = Curve::from(BSplineCurve::from_nurb(
+                Nurb::new(pw, 2, knots.clone()).unwrap(),
+                3,
+                true,
+            ));
+            let CurveKind::BSpline(native) = curve.kind() else {
+                panic!("raw circle fixture kind")
+            };
+            assert_eq!(native.nurb_ref().unwrap().knots(), knots.as_slice());
+            assert_eq!(native.natural_interval(), Extent1d::from_min_max(0.0, 4.0));
+            let expected = Point3::new(2.0 * 2.0_f64.sqrt(), y_sign * 2.0 * 2.0_f64.sqrt(), 0.0);
+            let ordinary = Kernel::default();
+            let plain = curve.evaluate_point(&ordinary, 0.5).unwrap();
+            assert!((plain - expected).length() < 1e-12);
+            assert_eq!(
+                crv_eval(native.nurb_ref().unwrap(), 0.5, Side::Left).unwrap(),
+                plain
+            );
+            for (t, point) in [
+                (0.0, Point3::new(4.0, 0.0, 0.0)),
+                (0.5, plain),
+                (1.0, Point3::new(0.0, y_sign * 4.0, 0.0)),
+                (4.0, Point3::new(4.0, 0.0, 0.0)),
+            ] {
+                assert_eq!(curve.evaluate_point(&ordinary, t).unwrap(), point);
+                let (query, work) = optional_point_kernel_with_headroom(headroom);
+                assert_eq!(
+                    curve.evaluate_point(&query, t).unwrap(),
+                    point,
+                    "{t}: {work:?}"
+                );
+                assert!(!work.is_disabled(), "{t}: {work:?}");
+            }
+            // Generic Evaluate(0) retains its distinct conservative family guard.
+            let (query, work) = optional_point_kernel_with_headroom(headroom);
+            assert!(matches!(
+                curve.evaluate(&query, 0.5, 0, true, false),
+                Err(SolidError::OutOfFuel { .. })
+            ));
+            assert!(work.is_disabled());
+            let (query, work) =
+                optional_point_kernel_with_headroom(crate::prism::sheet::READ_WORK - 64 - 4096);
+            assert_eq!(
+                curve.evaluate(&query, 0.5, 0, true, false).unwrap(),
+                vec![plain]
+            );
+            assert!(!work.is_disabled());
+            assert_eq!(native.nurb_ref().unwrap().knots(), knots.as_slice());
+        }
+    }
+
+    #[test]
+    fn optional_native_point_keeps_the_unclamped_inner_end_derivative_guard() {
+        use crate::error::SolidError;
+        use crate::nurbs::crv_basic::Curve as Nurb;
+        use crate::nurbs::knots::Side;
+        use crate::nurbs::math::{CPoint, NOW, NOZ};
+        use crate::nurbs::nurbs_crv::{crv_derivs_into, crv_eval};
+
+        // The unchanged existing p1 unclamped-end fixture and its hand-derived
+        // 3/4,1/4 basis weights: borrowed=true must not repair these knots.
+        let knots = vec![0.0, 0.1, 0.2, 0.5, 0.8, 0.9, 1.0];
+        let controls = [(0.1, 0.2), (0.5, 0.9), (0.9, 0.3), (0.6, 0.1)];
+        for (weights, expected) in [
+            (
+                None,
+                [Vec3::new(0.2, 0.375, 0.0), Vec3::new(0.675, 0.15, 0.0)],
+            ),
+            (
+                Some([2.0, 1.0, 3.0, 1.0]),
+                [Vec3::new(11.0 / 70.0, 0.3, 0.0), Vec3::new(0.75, 0.2, 0.0)],
+            ),
+        ] {
+            let pw = controls
+                .iter()
+                .enumerate()
+                .map(|(i, &(x, y))| match weights {
+                    Some(w) => CPoint::new(x * w[i], y * w[i], NOZ, w[i]),
+                    None => CPoint::new(x, y, NOZ, NOW),
+                })
+                .collect();
+            let curve = Curve::from(BSplineCurve::from_nurb(
+                Nurb::new(pw, 2, knots.clone()).unwrap(),
+                2,
+                true,
+            ));
+            let CurveKind::BSpline(native) = curve.kind() else {
+                panic!("unclamped fixture kind")
+            };
+            assert_eq!(native.nurb_ref().unwrap().knots(), knots.as_slice());
+            assert_eq!(native.natural_interval(), Extent1d::from_min_max(0.0, 1.0));
+            let ordinary = Kernel::default();
+            for (t, expected) in [0.2, 0.8].into_iter().zip(expected) {
+                assert!(0.0 < t && t < 1.0);
+                let raw = native.nurb_ref().unwrap();
+                assert!(
+                    raw.knots().get(2) == Some(&t) || raw.knots().iter().rev().nth(2) == Some(&t)
+                );
+                // Actual legacy Point rejects this valid inner end. The successful
+                // model Point therefore needs the real derivative fallback.
+                assert!(crv_eval(raw, t, Side::Left).is_err());
+                let plain = curve.evaluate_point(&ordinary, t).unwrap();
+                assert!((plain - expected).length() < 1e-12, "{t}: {plain:?}");
+                let mut from_derivative = [Vec3::ZERO];
+                crv_derivs_into(raw, t, Side::Left, &mut from_derivative).unwrap();
+                assert_eq!(from_derivative[0], plain);
+                let (query, work) = optional_point_kernel_with_headroom(6 * 256);
+                // This must stop at the charged heavy branch before its matrix work.
+                assert!(matches!(
+                    curve.evaluate_point(&query, t),
+                    Err(SolidError::OutOfFuel { .. })
+                ));
+                assert!(work.is_disabled());
+                let (query, work) =
+                    optional_point_kernel_with_headroom(crate::prism::sheet::READ_WORK - 64 - 4096);
+                assert_eq!(curve.evaluate_point(&query, t).unwrap(), plain);
+                assert!(!work.is_disabled());
+            }
+            assert_eq!(native.nurb_ref().unwrap().knots(), knots.as_slice());
+        }
+    }
+
+    #[test]
+    fn optional_circle_certificate_checks_the_native_base_instead_of_the_ellipse_label() {
+        use crate::nurbs::circle_deviation::{hausdorff_about_circle_with_work, RefCircle};
+
+        let k = Kernel::default();
+        let domain = Extent1d::from_min_max(0.0, 360.0);
+        let mut stale = Ellipse::new(
+            &k,
+            Point3::ZERO,
+            Vec3::X,
+            Vec3::Y,
+            domain,
+            4.0,
+            4.0,
+            &EllipseOptions::default(),
+        )
+        .unwrap();
+        let actual = Ellipse::new(
+            &k,
+            Point3::ZERO,
+            Vec3::X,
+            Vec3::Y,
+            domain,
+            5.0,
+            5.0,
+            &EllipseOptions::default(),
+        )
+        .unwrap();
+        // Keep the radius-four analytic reference and Polar table, but install
+        // the actual radius-five native curve through the existing base seam.
+        *stale.base_mut() = actual.base().clone_exact();
+        assert_eq!(stale.radius_x, 4.0);
+        let a = ellipse(&k, Point3::ZERO, 4.0, 4.0);
+        let CurveKind::Ellipse(reference) = a.kind() else {
+            panic!("ellipse fixture")
+        };
+        let whole = a.natural_interval();
+        let quarter = Extent1d::from_min_max(whole.min(), whole.evaluate(0.25));
+        assert_eq!(
+            reference.base().evaluate_point(quarter.min()).unwrap(),
+            Point3::new(4.0, 0.0, 0.0)
+        );
+        assert_eq!(
+            stale.base().evaluate_point(quarter.min()).unwrap(),
+            Point3::new(5.0, 0.0, 0.0)
+        );
+        let circle = RefCircle {
+            center: Point3::ZERO,
+            x_axis: Vec3::X,
+            y_axis: Vec3::Y,
+            radius: 4.0,
+        };
+        let work = ProofWork::new(crate::prism::sheet::READ_WORK);
+        let bound = hausdorff_about_circle_with_work(
+            reference.base().nurb_ref().unwrap(),
+            [quarter.min(), quarter.max()],
+            stale.base().nurb_ref().unwrap(),
+            [quarter.min(), quarter.max()],
+            &circle,
+            &work,
+        )
+        .unwrap()
+        .unwrap();
+        // The concentric arcs are one unit apart, regardless of the stale label.
+        assert!(bound >= 1.0);
+        assert!(!work.is_disabled());
+        let b = Curve::from(stale);
+        // These arcs are separated by the independently checked native geometry.
+        // A bounded proof may decline on work exhaustion; false does not certify
+        // separation, but these point sets must not be certified at this radius.
+        assert!(!a
+            .proved_together(&k, &quarter, &b, &quarter, 1e-3, &[])
+            .unwrap());
+        let pair_work = ProofWork::new(crate::prism::sheet::READ_WORK);
+        assert!(
+            !a.proved_together_with_work(&k, &quarter, (&b, &quarter), 1e-3, &[], &pair_work)
+                .unwrap(),
+            "a stale ellipse label must not certify its changed native base: {pair_work:?}"
+        );
+    }
+
+    #[test]
+    fn optional_circle_certificate_keeps_strict_subspans_and_disjoint_arcs_apart() {
+        use crate::nurbs::circle_deviation::{hausdorff_about_circle_with_work, RefCircle};
+
+        let k = Kernel::default();
+        let a = ellipse(&k, Point3::ZERO, 4.0, 4.0);
+        let CurveKind::Ellipse(native) = a.kind() else {
+            panic!("ellipse fixture")
+        };
+        let whole = a.natural_interval();
+        let quarter = Extent1d::from_min_max(whole.min(), whole.evaluate(0.25));
+        let half_quarter = Extent1d::from_min_max(whole.min(), whole.evaluate(0.125));
+        let opposite = Extent1d::from_min_max(whole.evaluate(0.5), whole.evaluate(0.75));
+        let circle = RefCircle {
+            center: Point3::ZERO,
+            x_axis: Vec3::X,
+            y_axis: Vec3::Y,
+            radius: 4.0,
+        };
+        let nurb = native.base().nurb_ref().unwrap();
+        let work = ProofWork::new(crate::prism::sheet::READ_WORK);
+        let bound = hausdorff_about_circle_with_work(
+            nurb,
+            [quarter.min(), quarter.max()],
+            nurb,
+            [half_quarter.min(), half_quarter.max()],
+            &circle,
+            &work,
+        )
+        .unwrap()
+        .unwrap();
+        // The 90-degree end is more than one unit from the 0..45-degree arc.
+        assert!(bound > 1.0);
+        assert_eq!(
+            hausdorff_about_circle_with_work(
+                nurb,
+                [quarter.min(), quarter.max()],
+                nurb,
+                [opposite.min(), opposite.max()],
+                &circle,
+                &work,
+            )
+            .unwrap(),
+            None,
+            "opposite arcs have no common strict half-turn chart"
+        );
+        assert!(!work.is_disabled());
+        // The closed-form arc extents establish separation; the direct bounds
+        // above exercise coefficient handling independently. The optional API's
+        // false means unproved, including exhausted work; these
+        // cases require no false positive, not a definitive separation verdict.
+        for (left, right) in [
+            (&quarter, &half_quarter),
+            (&half_quarter, &quarter),
+            (&quarter, &opposite),
+        ] {
+            assert!(!a.proved_together(&k, left, &a, right, 1e-3, &[]).unwrap());
+            let pair_work = ProofWork::new(crate::prism::sheet::READ_WORK);
+            assert!(
+                !a.proved_together_with_work(&k, left, (&a, right), 1e-3, &[], &pair_work)
+                    .unwrap(),
+                "a strict subspan or disjoint arc must not be certified: {pair_work:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn optional_circle_certificate_declines_a_whole_turn_while_the_finite_cover_still_proves_it() {
+        use crate::nurbs::circle_deviation::{hausdorff_about_circle_with_work, RefCircle};
+
+        let k = Kernel::default();
+        let a = ellipse(&k, Point3::ZERO, 4.0, 4.0);
+        let CurveKind::Ellipse(native) = a.kind() else {
+            panic!("ellipse fixture")
+        };
+        let whole = a.natural_interval();
+        let circle = RefCircle {
+            center: Point3::ZERO,
+            x_axis: Vec3::X,
+            y_axis: Vec3::Y,
+            radius: 4.0,
+        };
+        let work = ProofWork::new(crate::prism::sheet::READ_WORK);
+        assert_eq!(
+            hausdorff_about_circle_with_work(
+                native.base().nurb_ref().unwrap(),
+                [whole.min(), whole.max()],
+                native.base().nurb_ref().unwrap(),
+                [whole.min(), whole.max()],
+                &circle,
+                &work,
+            )
+            .unwrap(),
+            None,
+            "the existing coefficient certificate covers finite charts, not a whole turn"
+        );
+        assert!(!work.is_disabled());
+        // The same finite-piece path as the original unchanged seam regression
+        // remains responsible for the full curve. The total allowance stays 2M.
+        assert_optional_pair(&k, &a, &whole, &a, &whole, 1e-3, true);
     }
 }

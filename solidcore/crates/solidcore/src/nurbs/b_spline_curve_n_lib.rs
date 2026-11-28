@@ -142,6 +142,7 @@ use crate::geom::tol::{
 use crate::geom::vector2d::Vec2;
 use crate::geom::vector3d::{Point3, Vec3};
 use crate::kernel::Kernel;
+use crate::math::det;
 use crate::math::{min2, EFF_ZERO};
 use crate::nurbs::b_spline_curve::{BSplineCurve, BSplineCurveForm};
 use crate::nurbs::b_spline_surface_n_lib::p2::EvaluateFlags;
@@ -221,6 +222,26 @@ pub enum InValueType {
     Same = 1,
     /// `SM_IV_UNCONSTRAINED`: ignore the value.
     Unconstrained = 2,
+}
+
+/// Optional outcome of an actual copy's source-parameter construction.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CopySourceOutcome {
+    /// No complete unchanged source frame was certified.
+    #[default]
+    Uncertified,
+    /// The actual copied definition retained its source parameter frame.
+    Preserved,
+}
+
+/// Optional actual retained source domain of a completed physical trim.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum TrimSourceOutcome {
+    /// A plan, failure, cleanup or rewrite has no proved source-domain transport.
+    #[default]
+    Uncertified,
+    /// This source interval was retained by the actual unchanged construction.
+    Retained(Extent1d),
 }
 
 /// What [`BSplineCurve::trim`] does (upstream's tri-state `bNotify`).
@@ -682,7 +703,7 @@ pub fn approx_circ_arc(
     let rs = match arc.start {
         None => {
             let dd = as_ * (PI / 180.0);
-            translate_sum2_pts(cen, rad * dd.cos(), x, rad * dd.sin(), y)
+            translate_sum2_pts(cen, rad * det::cos(dd), x, rad * det::sin(dd), y)
         }
         Some(p) => p,
     };
@@ -692,7 +713,7 @@ pub fn approx_circ_arc(
                 rs
             } else {
                 let dd = ae * (PI / 180.0);
-                translate_sum2_pts(cen, rad * dd.cos(), x, rad * dd.sin(), y)
+                translate_sum2_pts(cen, rad * det::cos(dd), x, rad * det::sin(dd), y)
             }
         }
         Some(p) => p,
@@ -2668,11 +2689,31 @@ impl BSplineCurve {
         mode: TrimMode,
         zone_tol_3d: f64,
     ) -> Result<()> {
+        self.trim_with_zone_tol_observed(trim_interval, mode, zone_tol_3d, None)
+    }
+
+    /// The same trim; evidence follows actual construction and is invalidated by cleanup.
+    pub(crate) fn trim_with_zone_tol_observed(
+        &mut self,
+        trim_interval: &mut Extent1d,
+        mode: TrimMode,
+        zone_tol_3d: f64,
+        mut outcome: Option<&mut TrimSourceOutcome>,
+    ) -> Result<()> {
         const OP: &str = OP_TRIM;
+        if let Some(outcome) = outcome.as_deref_mut() {
+            *outcome = TrimSourceOutcome::Uncertified;
+        }
+        let mut source_proved = true;
 
         // no work - the natural interval is contained by the new interval
         let nat_ivl = self.natural_interval();
         if nat_ivl.is_contained_by(trim_interval, EFF_ZERO) {
+            if mode != TrimMode::IntervalOnly {
+                if let Some(outcome) = outcome.as_deref_mut() {
+                    *outcome = TrimSourceOutcome::Retained(nat_ivl);
+                }
+            }
             return Ok(());
         }
 
@@ -2786,6 +2827,11 @@ impl BSplineCurve {
         if (d_min - first_knot).abs() < scaled_zero_min
             && (d_max - last_knot).abs() < scaled_zero_max
         {
+            if mode != TrimMode::IntervalOnly {
+                if let Some(outcome) = outcome.as_deref_mut() {
+                    *outcome = TrimSourceOutcome::Retained(nat_ivl);
+                }
+            }
             return Ok(());
         }
 
@@ -2842,11 +2888,13 @@ impl BSplineCurve {
 
                     // when segs removed - sCur2 is allocated and set, otherwise it's untouched
                     if let Some(r) = removal {
+                        source_proved = false;
                         cur1 = copy_nurb_curve(&r.curve);
                     }
                 } else {
                     // a UV curve loses its pole end spans only: upstream's removal would
                     // also cut every other span shorter than the 3D zone tolerance
+                    source_proved = false;
                     cur1 = without_pole_end_spans(&cur1, zone_tol_3d)?;
                 }
             }
@@ -2854,6 +2902,14 @@ impl BSplineCurve {
             // save the new pCur as the BSplineCurve->m_pNurb curve
             self.nurb_is_borrowed = false;
             self.nurb = Some(cur1);
+        }
+        if mode != TrimMode::IntervalOnly && source_proved {
+            if let Some(outcome) = outcome {
+                let source = Extent1d::from_min_max(d_min, d_max);
+                if self.natural_interval() == source {
+                    *outcome = TrimSourceOutcome::Retained(source);
+                }
+            }
         }
         Ok(())
     }
@@ -3738,7 +3794,7 @@ mod tests {
         let dropped = crv_trim(original.nurb.as_ref().unwrap(), from, to).unwrap();
         let at = trimmed.evaluate_point(end).unwrap();
         for c in dropped.cpts() {
-            let gap = (c.x - at.x).hypot(c.y - at.y);
+            let gap = det::hypot(c.x - at.x, c.y - at.y);
             assert!(
                 gap <= bound,
                 "{label}: dropped control point {gap:e} from the end"
@@ -3805,7 +3861,7 @@ mod tests {
                 assert_eq!(uv.knots(), other.knots(), "{label}");
                 assert_eq!(uv.cpts().len(), other.cpts().len(), "{label}");
                 for (p, q) in uv.cpts().iter().zip(other.cpts()) {
-                    let gap = (p.x - q.x).hypot(p.y - q.y);
+                    let gap = det::hypot(p.x - q.x, p.y - q.y);
                     assert!(gap <= 8.0 * f64::EPSILON, "{label}: control point {gap:e}");
                 }
             }
@@ -3823,7 +3879,7 @@ mod tests {
                 assert_eq!(uv.knots(), other.knots(), "{label}");
                 let (mut gap, mut scale) = (0.0_f64, 0.0_f64);
                 for (p, q) in uv.cpts().iter().zip(other.cpts()) {
-                    gap = gap.max((p.x - q.x).hypot(p.y - q.y));
+                    gap = gap.max(det::hypot(p.x - q.x, p.y - q.y));
                     scale = scale.max(p.x.abs()).max(p.y.abs());
                 }
                 let bound = gap + 64.0 * f64::EPSILON * scale;
@@ -4197,5 +4253,142 @@ mod tests {
         let r = c.dampen_knot_spacing(0.5, usize::MAX);
         assert!(r.is_err());
         assert_eq!(c.knots(None).unwrap(), before);
+    }
+
+    #[test]
+    fn copy_source_evidence_observes_actual_knot_fixup() {
+        let stable = cubic();
+        let mut outcome = CopySourceOutcome::Uncertified;
+        let observed = stable.copy_with_source(Some(&mut outcome));
+        assert_eq!(outcome, CopySourceOutcome::Preserved);
+        assert!(observed.same_definition(&stable.copy()));
+
+        let mut near_knots = cubic();
+        let close = f64::from_bits(0.3_f64.to_bits() + 1);
+        near_knots.nurb.as_mut().unwrap().knots_mut()[5] = close;
+        let original_knots = near_knots.nurb.as_ref().unwrap().knots().to_vec();
+        let plain = near_knots.copy();
+        assert!(
+            !plain.same_definition(&near_knots),
+            "the source has an actual knot fix-up"
+        );
+        let observed = near_knots.copy_with_source(Some(&mut outcome));
+        assert_eq!(outcome, CopySourceOutcome::Uncertified);
+        assert!(
+            observed.same_definition(&plain),
+            "metadata leaves the actual copy unchanged"
+        );
+        assert_eq!(near_knots.nurb.as_ref().unwrap().knots(), original_knots);
+    }
+
+    #[test]
+    fn source_trim_evidence_reports_the_actual_complementary_knot_spans() {
+        let k = Kernel::default();
+        let zone = zone_tol_3d(&k, SmallTopoType::NormalSize);
+        let requested = f64::from_bits(0.3_f64.to_bits() + 1);
+        for (input, expected) in [
+            (
+                Extent1d::from_min_max(0.0, requested),
+                Extent1d::from_min_max(0.0, 0.3),
+            ),
+            (
+                Extent1d::from_min_max(requested, 1.0),
+                Extent1d::from_min_max(0.3, 1.0),
+            ),
+        ] {
+            let mut plain = cubic();
+            let mut plain_interval = input;
+            plain
+                .trim_with_zone_tol(&mut plain_interval, TrimMode::Silent, zone)
+                .unwrap();
+            let mut observed = cubic();
+            let mut interval = input;
+            let mut outcome = TrimSourceOutcome::Uncertified;
+            observed
+                .trim_with_zone_tol_observed(
+                    &mut interval,
+                    TrimMode::Silent,
+                    zone,
+                    Some(&mut outcome),
+                )
+                .unwrap();
+            assert_eq!(outcome, TrimSourceOutcome::Retained(expected));
+            assert_eq!(interval, plain_interval);
+            assert!(observed.same_definition(&plain));
+        }
+    }
+
+    #[test]
+    fn physical_cleanup_does_not_claim_a_complete_source_trim() {
+        let k = Kernel::default();
+        let input = Extent1d::from_min_max(0.5 - 3.5e-6, 0.9);
+        let zone = zone_tol_3d(&k, SmallTopoType::NormalSize);
+        let mut plain = short_span_arc(3);
+        let mut plain_interval = input;
+        plain
+            .trim_with_zone_tol(&mut plain_interval, TrimMode::Silent, zone)
+            .unwrap();
+        assert_eq!(
+            plain.knots(None).unwrap().0,
+            vec![input.min(), input.max()],
+            "the existing fixture actually removes the interior span"
+        );
+        let mut observed = short_span_arc(3);
+        let mut interval = input;
+        let mut outcome = TrimSourceOutcome::Uncertified;
+        observed
+            .trim_with_zone_tol_observed(&mut interval, TrimMode::Silent, zone, Some(&mut outcome))
+            .unwrap();
+        assert_eq!(outcome, TrimSourceOutcome::Uncertified);
+        assert_eq!(interval, plain_interval);
+        assert!(observed.same_definition(&plain));
+
+        let mut retained = short_span_arc(3);
+        let mut retained_interval = input;
+        retained
+            .trim_with_zone_tol_observed(
+                &mut retained_interval,
+                TrimMode::Silent,
+                1e-9,
+                Some(&mut outcome),
+            )
+            .unwrap();
+        assert_eq!(outcome, TrimSourceOutcome::Retained(input));
+        assert_eq!(
+            retained.knots(None).unwrap().0,
+            vec![input.min(), 0.5, input.max()]
+        );
+    }
+
+    #[test]
+    fn interval_only_is_a_plan_while_no_edit_retains_the_actual_natural_domain() {
+        let k = Kernel::default();
+        let zone = zone_tol_3d(&k, SmallTopoType::NormalSize);
+        let original = cubic();
+        let natural = original.natural_interval();
+        let mut observed = cubic();
+        let mut interval = Extent1d::from_min_max(0.1, 0.9);
+        let mut outcome = TrimSourceOutcome::Retained(natural);
+        observed
+            .trim_with_zone_tol_observed(
+                &mut interval,
+                TrimMode::IntervalOnly,
+                zone,
+                Some(&mut outcome),
+            )
+            .unwrap();
+        assert_eq!(outcome, TrimSourceOutcome::Uncertified);
+        assert!(observed.same_definition(&original));
+        let mut whole_request = Extent1d::from_min_max(-1.0, 2.0);
+        observed
+            .trim_with_zone_tol_observed(
+                &mut whole_request,
+                TrimMode::Silent,
+                zone,
+                Some(&mut outcome),
+            )
+            .unwrap();
+        assert_eq!(outcome, TrimSourceOutcome::Retained(natural));
+        assert!(observed.same_definition(&original));
     }
 }

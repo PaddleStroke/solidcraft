@@ -43,9 +43,13 @@
 
 use crate::error::nurbs::NurbsFailure;
 use crate::error::{Result, SolidError};
+use crate::geom::context::ProofWork;
+use crate::math::det;
 use crate::math::Vec3;
 use crate::nurbs::basis_basic::PTOL;
-use crate::nurbs::crv_basic::{conic_data, ConicType, Curve, CONIC_MAX_TURNS};
+use crate::nurbs::crv_basic::{
+    charge_conic_work, conic_data, conic_data_with_work, ConicType, Curve, CONIC_MAX_TURNS,
+};
 use crate::nurbs::geom::{
     dist_pt_pt, isect_line_line, normalize, project_pt_line, LinePlaneIsect, LineSeg, PI,
 };
@@ -122,8 +126,8 @@ pub enum AngleType {
 
 /// Point `C + r cos(a) X + r sin(a) Y` and unit tangent `-sin(a) X + cos(a) Y`.
 fn circle_pt(c: Vec3, x: Vec3, y: Vec3, r: f64, angle: f64) -> (Vec3, Vec3) {
-    let cosa = angle.cos();
-    let sina = angle.sin();
+    let cosa = det::cos(angle);
+    let sina = det::sin(angle);
     let alf = r * cosa;
     let bet = r * sina;
     (
@@ -153,19 +157,40 @@ pub fn quadratic_arc_tol(arc: &Arc, at: f64) -> Result<Curve> {
 ///
 /// As [`quadratic_arc_tol`].
 pub fn quadratic_arc_min_arcs(arc: &Arc, at: f64, min_arcs: usize) -> Result<Curve> {
+    quadratic_arc_min_arcs_with_work(arc, at, min_arcs, None)
+}
+
+fn quadratic_arc_min_arcs_with_work(
+    arc: &Arc,
+    at: f64,
+    min_arcs: usize,
+    work: Option<&ProofWork>,
+) -> Result<Curve> {
     const OP: &str = "nurbs::crv_common::quadratic_arc_tol";
     let c = arc.center;
     let (r, as_deg) = (arc.r, arc.start);
     let angle_tol_deg = at;
 
     // Get number of arcs.
-    let cd = conic_data(ConicType::Quadratic, as_deg, arc.end)?;
+    let cd = conic_data_with_work(ConicType::Quadratic, as_deg, arc.end, work)?;
     let narcs = (cd.n / 2).max(min_arcs.min(4));
     let (ae, n) = (cd.ae, 2 * narcs);
     let m = n + cd.p + 1;
     let theta = ae - as_deg;
     let dtheta = theta / narcs as f64;
 
+    if let Some(work) = work {
+        // Actual quadratic N<=9,K<=12. Payload/headers, initialization/writes
+        // and fixed per-segment intersection helpers are reserved before arrays.
+        let cost = u64::try_from(n)
+            .ok()
+            .and_then(|n| n.checked_add(1))
+            .and_then(|n| n.checked_mul(33))
+            .and_then(|c| c.checked_add(u64::try_from(m).ok()?.checked_add(1)?.checked_mul(10)?))
+            .and_then(|c| c.checked_add(u64::try_from(narcs).ok()?.checked_mul(16)?))
+            .and_then(|c| c.checked_add(152));
+        charge_conic_work(Some(work), cost, OP)?;
+    }
     let mut pw = vec![CPoint::default(); n + 1];
     let mut u = vec![0.0; m + 1];
 
@@ -174,7 +199,7 @@ pub fn quadratic_arc_min_arcs(arc: &Arc, at: f64, min_arcs: usize) -> Result<Cur
     let (y, _) = normalize(arc.y)?;
 
     let mut angle = (PI * dtheta) / 360.0;
-    let w1 = angle.cos();
+    let w1 = det::cos(angle);
 
     angle = (PI * as_deg) / 180.0;
     let (mut p0, mut t0) = circle_pt(c, x, y, r, angle);
@@ -267,9 +292,9 @@ pub fn quartic_arc_tol(arc: &Arc, at: f64) -> Result<Curve> {
 
     let dtheta = theta / narcs as f64;
     let mut angle = (PI * dtheta) / 180.0;
-    let x2 = angle.cos();
+    let x2 = det::cos(angle);
     angle *= 0.5;
-    let w1 = angle.cos();
+    let w1 = det::cos(angle);
 
     angle = (PI * as_deg) / 180.0;
     let (mut p0, mut t0) = circle_pt(c, x, y, r, angle);
@@ -286,7 +311,7 @@ pub fn quartic_arc_tol(arc: &Arc, at: f64) -> Result<Curve> {
         } else {
             (0.75 * PI * dtheta) / 180.0
         };
-        let cs = ang.cos();
+        let cs = det::cos(ang);
 
         let a = 1.0 - 2.0 * w1 + x2 - 2.0 * cs * (1.0 - w1); // quadratic equation
         let b = 2.0 * (w1 - 1.0) + 2.0 * cs * (1.0 - w1);
@@ -420,14 +445,14 @@ pub fn quintic_arc_tol(arc: &Arc, at: f64) -> Result<Curve> {
     let (y, _) = normalize(arc.y)?;
 
     let mut angle = (PI * as_deg) / 180.0;
-    let ps = translate_sum2_pts(c, r * angle.cos(), x, r * angle.sin(), y);
+    let ps = translate_sum2_pts(c, r * det::cos(angle), x, r * det::sin(angle), y);
 
     angle = (PI * ae) / 180.0;
-    let pe = translate_sum2_pts(c, r * angle.cos(), x, r * angle.sin(), y);
+    let pe = translate_sum2_pts(c, r * det::cos(angle), x, r * det::sin(angle), y);
 
     angle = (PI * am) / 180.0;
-    let cosa = angle.cos();
-    let sina = angle.sin();
+    let cosa = det::cos(angle);
+    let sina = det::sin(angle);
     let alf = r * cosa;
     let bet = r * sina;
 
@@ -506,6 +531,24 @@ pub fn circ_arc_tol(arc: &Arc, at: f64, ctp: ConicType) -> Result<Curve> {
     }
 }
 
+fn circ_arc_tol_with_work(
+    arc: &Arc,
+    at: f64,
+    ctp: ConicType,
+    work: Option<&ProofWork>,
+) -> Result<Curve> {
+    if let Some(work) = work {
+        // Only the actual query's quadratic fallback is priced by this companion.
+        if ctp != ConicType::Quadratic {
+            work.disable();
+            return Err(work.stopped("nurbs::crv_common::circ_arc_tol"));
+        }
+        quadratic_arc_min_arcs_with_work(arc, at, 0, Some(work))
+    } else {
+        circ_arc_tol(arc, at, ctp)
+    }
+}
+
 /// Weights `w[0..=k]` of the unit circle arc from `as_deg` to `ae_deg` degrees built
 /// by [`circ_arc`] with type `ctp` (`N_CalcCircWeights`); the highest index `k` is
 /// `len - 1`.
@@ -537,8 +580,18 @@ pub fn circ_weights(as_deg: f64, ae_deg: f64, ctp: ConicType) -> Result<Vec<f64>
 ///
 /// As [`elliptical_arc_ang_type_tol`].
 pub fn elliptical_arc_tol(e: &EllipseArc, at: f64, ctp: ConicType) -> Result<Curve> {
+    elliptical_arc_tol_with_work(e, at, ctp, None)
+}
+
+/// Optional query work, forwarded through the same normalization and construction.
+pub(crate) fn elliptical_arc_tol_with_work(
+    e: &EllipseArc,
+    at: f64,
+    ctp: ConicType,
+    work: Option<&ProofWork>,
+) -> Result<Curve> {
     let a_tol = if at <= 0.0 { DEFAULT_ANGLE_TOL } else { at };
-    elliptical_arc_ang_type_tol(e, a_tol, AngleType::Circle, ctp)
+    elliptical_arc_ang_type_tol_with_work(e, a_tol, AngleType::Circle, ctp, work)
 }
 
 /// NURBS ellipse or elliptical arc (`N_CreateEllipticalArcAngTypeTol`): the circle
@@ -557,7 +610,18 @@ pub fn elliptical_arc_ang_type_tol(
     atp: AngleType,
     ctp: ConicType,
 ) -> Result<Curve> {
+    elliptical_arc_ang_type_tol_with_work(e, at, atp, ctp, None)
+}
+
+fn elliptical_arc_ang_type_tol_with_work(
+    e: &EllipseArc,
+    at: f64,
+    atp: AngleType,
+    ctp: ConicType,
+    work: Option<&ProofWork>,
+) -> Result<Curve> {
     const OP: &str = "nurbs::crv_common::elliptical_arc_ang_type_tol";
+    charge_conic_work(work, Some(66), OP)?;
     let c = e.center;
     let (r1, r2, as_deg) = (e.r1, e.r2, e.start);
     let mut ae = e.end;
@@ -574,6 +638,7 @@ pub fn elliptical_arc_ang_type_tol(
     }
     let mut turns = 0usize;
     while ae <= as_deg {
+        charge_conic_work(work, Some(8), OP)?;
         ae += 360.0;
         turns += 1;
         if turns > CONIC_MAX_TURNS {
@@ -581,6 +646,7 @@ pub fn elliptical_arc_ang_type_tol(
         }
     }
     while (ae - as_deg) >= 360.1 {
+        charge_conic_work(work, Some(8), OP)?;
         ae -= 360.0;
         turns += 1;
         if turns > CONIC_MAX_TURNS {
@@ -598,14 +664,14 @@ pub fn elliptical_arc_ang_type_tol(
         let (alf, bet) = match atp {
             AngleType::Circle => {
                 // Point on circle at angle, projected to the ellipse.
-                (r1 * angle.cos(), r2 * angle.sin())
+                (r1 * det::cos(angle), r2 * det::sin(angle))
             }
             AngleType::Ellipse => {
                 // Point on the ellipse at polar angle: with e = tan(angle),
                 // x = a*b/sqrt(a*a*e*e + b*b) and y = b/a * sqrt(a*a - x*x).
-                let e = angle.tan();
+                let e = det::tan(angle);
                 let mut alf = r1 * r2 / (r2 * r2 + r1 * r1 * e * e).sqrt();
-                if angle.cos() < 0.0 {
+                if det::cos(angle) < 0.0 {
                     alf = -alf;
                 }
                 let mut bet = r1 * r1 - alf * alf;
@@ -614,7 +680,7 @@ pub fn elliptical_arc_ang_type_tol(
                 } else {
                     bet = (r2 / r1) * bet.sqrt();
                 }
-                if angle.sin() < 0.0 {
+                if det::sin(angle) < 0.0 {
                     bet = -bet;
                 }
                 (alf, bet)
@@ -622,7 +688,7 @@ pub fn elliptical_arc_ang_type_tol(
         };
 
         // Polar angle of the circle point.
-        let tmp_angle = (bet / r2).atan2(alf / r1);
+        let tmp_angle = det::atan2(bet / r2, alf / r1);
         let mut ap = (180.0 * tmp_angle) / PI;
 
         // Angle snapping up to NL_PTOL degrees.
@@ -645,12 +711,21 @@ pub fn elliptical_arc_ang_type_tol(
         start: ap0,
         end: ap1,
     };
-    let mut cur = circ_arc_tol(&arc, at, ctp)?;
+    let mut cur = circ_arc_tol_with_work(&arc, at, ctp, work)?;
 
     // Apply affine transformation to get ellipse control points.
     let fac = r2 / r1;
     let omf = 1.0 - fac;
 
+    if let Some(work) = work {
+        let (backing, _) = cur.storage();
+        let cost = u64::try_from(backing)
+            .ok()
+            .and_then(|n| n.checked_mul(32))
+            .and_then(|c| c.checked_add(u64::try_from(cur.cpts().len()).ok()?.checked_mul(3)?))
+            .and_then(|c| c.checked_add(40));
+        charge_conic_work(Some(work), cost, OP)?;
+    }
     for pw in cur.cpts_mut() {
         let (p, w) = pw.to_euclid_and_w();
         let q = match project_pt_line(lx, p)? {
@@ -801,7 +876,7 @@ mod tests {
                 let (u0, u1) = (cur.knots()[0], *cur.knots().last().unwrap());
                 for k in 0..=10 {
                     let p = point(&cur, u0 + (u1 - u0) * f64::from(k) / 10.0);
-                    let v = (p.x / 3.0).powi(2) + (p.y / 1.5).powi(2);
+                    let v = det::powi(p.x / 3.0, 2) + det::powi(p.y / 1.5, 2);
                     assert!((v - 1.0).abs() < 1e-9, "{atp:?} {ctp:?} {v}");
                 }
             }
@@ -820,5 +895,42 @@ mod tests {
             end: f64::INFINITY,
         };
         assert!(elliptical_arc_tol(&e, 0.0, ConicType::Quadratic).is_err());
+    }
+
+    #[test]
+    fn optional_elliptical_arc_work_preserves_exact_output_and_stops_actual_turns() {
+        let arc = EllipseArc {
+            center: Vec3::ZERO,
+            x: Vec3::X,
+            y: Vec3::Y,
+            r1: 3.0,
+            r2: 1.5,
+            start: 0.0,
+            end: 360.0,
+        };
+        let ordinary = elliptical_arc_tol(&arc, 0.01, ConicType::Quadratic).unwrap();
+        let work = ProofWork::new(2_000);
+        let observed =
+            elliptical_arc_tol_with_work(&arc, 0.01, ConicType::Quadratic, Some(&work)).unwrap();
+        assert_eq!(observed.cpts(), ordinary.cpts());
+        assert_eq!(observed.knots(), ordinary.knots());
+        assert_eq!(observed.array_sizes(), (8, 11));
+        assert!(!work.is_disabled());
+        let many_turns = EllipseArc {
+            end: 360.0 * 10_000.0,
+            ..arc
+        };
+        assert!(matches!(
+            elliptical_arc_tol_with_work(&many_turns, 0.01, ConicType::Quadratic, Some(&work)),
+            Err(SolidError::OutOfFuel { .. })
+        ));
+        assert!(work.is_disabled());
+        // No global allowance affects the original public constructor.
+        assert_eq!(
+            elliptical_arc_tol(&arc, 0.01, ConicType::Quadratic)
+                .unwrap()
+                .cpts(),
+            ordinary.cpts()
+        );
     }
 }

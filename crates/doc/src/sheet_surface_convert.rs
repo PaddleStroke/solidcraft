@@ -61,7 +61,7 @@ use solidcraft_kernel::{Body, FaceSurface, face_surface};
 use crate::sheet::FlatWork;
 
 use crate::sheet::{BendReliefShape, ReliefShape};
-use crate::sheet_surface::{Piece, entry};
+use crate::sheet_surface::{ConvertedEdge, Piece, PieceSource, Pieces, RegionOrigins, Regions, charge_sources, entry, split_sources};
 use crate::{DocError, ModelBody, Result};
 
 /// Normals closer than this (radians) meet smoothly: the sheet runs on across their edge.
@@ -174,7 +174,9 @@ pub struct SurfaceConversion {
     /// The rule's bend radius, every bend's.
     pub rule_radius: f64,
     /// The flat's pieces, cut once for both the flat and the folded solid.
-    pieces: std::sync::OnceLock<Vec<(Piece, Region2)>>,
+    pieces: std::sync::OnceLock<Pieces>,
+    origins: Vec<RegionOrigins>,
+    rip_origins: Vec<Option<ConvertedEdge>>,
 }
 
 fn err<T>(msg: impl Into<String>) -> Result<T> {
@@ -288,6 +290,9 @@ impl Shape {
 /// and their places in the face's chart, the angle round a roll unwrapped as the loop runs.
 struct UseChart {
     edge: usize,
+    /// Actual output segment slots for this use, after final loop reorientation.
+    loop_index: usize,
+    segments: Vec<usize>,
     forward: bool,
     ts: Vec<f64>,
     points: Vec<Vec3>,
@@ -341,8 +346,9 @@ fn face_chart(b: &Body, q: &Query, shape: &Shape, f: usize, sag: f64, tol: f64) 
                 }
             }
             let exact = exact_edge(b, shape, e, &chart, tol);
+            let start = segs.len();
             segs.extend(if exact.is_empty() { curve_through(&chart) } else { exact });
-            uses.push(UseChart { edge: e, forward: oe.forward, ts, points, chart });
+            uses.push(UseChart { edge: e, loop_index: 0, segments: (start..segs.len()).collect(), forward: oe.forward, ts, points, chart });
         }
         let ends = uses.first().and_then(|u| u.chart.first()).zip(uses.last().and_then(|u| u.chart.last()));
         let Some((first, last)) = ends else { continue };
@@ -360,6 +366,13 @@ fn face_chart(b: &Body, q: &Query, shape: &Shape, f: usize, sag: f64, tol: f64) 
     loops.sort_by(|x, y| area(&y.0).total_cmp(&area(&x.0)));
     let mut it = loops.into_iter();
     let Some((outer, mut uses)) = it.next() else { return Err("a face of the body has no edges".into()) };
+    for u in &mut uses {
+        if !outer.is_ccw() {
+            for k in &mut u.segments {
+                *k = outer.segs.len() - 1 - *k;
+            }
+        }
+    }
     let mut holes = Vec::new();
     for (mut hole, mut hole_uses) in it {
         if shape.angular() {
@@ -372,6 +385,14 @@ fn face_chart(b: &Body, q: &Query, shape: &Shape, f: usize, sag: f64, tol: f64) 
                     for c in &mut u.chart {
                         c.y += shift;
                     }
+                }
+            }
+        }
+        for u in &mut hole_uses {
+            u.loop_index = holes.len() + 1;
+            if hole.is_ccw() {
+                for k in &mut u.segments {
+                    *k = hole.segs.len() - 1 - *k;
                 }
             }
         }
@@ -540,7 +561,7 @@ struct BendCorner {
 /// on to the sharp where it heads out across the edge; elsewhere (it runs on along the edge's
 /// line, or is round) the end steps out square to the edge, a step the bend's setback takes up
 /// again.
-fn to_sharp(r: &Region2, (a, z): (Vec2, Vec2), by: f64, tol: f64) -> std::result::Result<Region2, String> {
+fn to_sharp(r: &Region2, source: &RegionOrigins, (a, z): (Vec2, Vec2), by: f64, tol: f64) -> std::result::Result<(Region2, RegionOrigins), String> {
     let segs = &r.outer.segs;
     let n = segs.len();
     let near = tol * 100.0;
@@ -575,12 +596,36 @@ fn to_sharp(r: &Region2, (a, z): (Vec2, Vec2), by: f64, tol: f64) -> std::result
     let (before, after) = (neighbour((k + n - 1) % n)?, neighbour((k + 1) % n)?);
     let p_out = carried(before, p, before.start()).filter(|_| p_end).unwrap_or(p + out * by);
     let q_out = carried(after, q, after.end()).filter(|_| q_end).unwrap_or(q + out * by);
-    let band = Region2 { outer: Loop2::polygon(&[p, q, q_out, p_out]).ccw(), holes: Vec::new() };
-    let joined =
-        solidcraft_kernel::planar_regions_boolean(std::slice::from_ref(r), std::slice::from_ref(&band), solidcraft_kernel::BoolOp::Union, tol)
-            .map_err(|e| e.to_string())?;
-    match <[Region2; 1]>::try_from(joined) {
-        Ok([one]) => Ok(one),
+    let band_loop = Loop2::polygon(&[p, q, q_out, p_out]);
+    // p..q may be only part of the current outline segment, especially after earlier joins.
+    // Without contributor intervals, only a singleton parent can certify either new edge.
+    let mut observer = FlatWork::new();
+    let parent = source.outer.get(k).unwrap_or(&None);
+    let tag = if matches!(parent.as_deref(), Some([_])) && charge_sources(&mut observer, std::iter::once(parent), 4, false) {
+        split_sources(parent)
+    } else {
+        None
+    };
+    let mut tags = vec![tag.clone(), None, tag, None];
+    if !band_loop.is_ccw() {
+        tags.reverse();
+    }
+    let band = Region2 { outer: band_loop.ccw(), holes: Vec::new() };
+    let band_source = RegionOrigins { outer: tags, holes: Vec::new() };
+    let joined = solidcraft_kernel::planar_regions_boolean_with_history(
+        std::slice::from_ref(r),
+        std::slice::from_ref(&band),
+        solidcraft_kernel::BoolOp::Union,
+        tol,
+    )
+    .map_err(|e| e.to_string())?;
+    let joined = crate::sheet_surface::compose_regions(joined, std::slice::from_ref(source), &[band_source], &mut observer);
+    let Regions { geometry, mut origins } = joined;
+    match <[Region2; 1]>::try_from(geometry) {
+        Ok([one]) => {
+            let source = origins.pop().unwrap_or_else(|| RegionOrigins::unknown(&one));
+            Ok((one, source))
+        }
         Err(_) => Err("run on to a modelled bend's sharp is not one piece".into()),
     }
 }
@@ -1259,6 +1304,18 @@ fn read_surfaces(
             }
         }
     }
+    let mut pair_counts = BTreeMap::new();
+    for (x, y) in edge_pair.iter().flatten() {
+        let mut pair = [*x, *y];
+        pair.sort();
+        *pair_counts.entry(pair).or_insert(0usize) += 1;
+    }
+    let source_edge = |edge: usize| -> Option<ConvertedEdge> {
+        let (x, y) = edge_pair.get(edge).copied().flatten()?;
+        let mut faces = [x, y];
+        faces.sort();
+        (x != y && pair_counts.get(&faces) == Some(&1)).then_some(ConvertedEdge { edge, faces })
+    };
     let pair = |e: usize| edge_pair.get(e).copied().flatten();
     let edges_of = |f: usize| face_edges.get(f).map(Vec::as_slice).unwrap_or(&[]);
     let touches = |g: usize, h: usize| meeting.contains(&(g, h));
@@ -2077,6 +2134,7 @@ fn read_surfaces(
     }
     let index: BTreeMap<usize, usize> = order.iter().enumerate().map(|(i, f)| (*f, i)).collect();
     let mut panels = Vec::with_capacity(order.len());
+    let mut panel_origins = Vec::with_capacity(order.len());
     let mut places = Vec::with_capacity(order.len());
     let mut uses_of: BTreeMap<usize, Vec<UseChart>> = BTreeMap::new();
     let mut recesses: Vec<crate::Recess> = Vec::new();
@@ -2086,6 +2144,17 @@ fn read_surfaces(
         places.push(shape.frame().ok_or_else(|| DocError::Invalid(format!("the face at {} has no frame", at(point))))?);
         let (mut region, uses) =
             face_chart(b, &q, shape, f, sag, tol).map_err(|e| DocError::Invalid(format!("the face at {} can't be a panel: {e}", at(point))))?;
+        let mut origins = RegionOrigins::unknown(&region);
+        for u in &uses {
+            let tags = if u.loop_index == 0 { Some(&mut origins.outer) } else { origins.holes.get_mut(u.loop_index - 1) };
+            if let Some(tags) = tags {
+                for &k in &u.segments {
+                    if let Some(tag) = tags.get_mut(k) {
+                        *tag = source_edge(u.edge).map(|e| vec![e]);
+                    }
+                }
+            }
+        }
         // Which of the region's loops a loop of the face is: the one its first edge runs on.
         let on = |l: &Loop2, edges: &[usize]| {
             let first = edges.first().and_then(|e| uses.iter().find(|u| u.edge == *e)).and_then(|u| u.chart.first().copied());
@@ -2094,7 +2163,13 @@ fn read_surfaces(
         // An engraving picked in the face: the hole it opens from is no hole of the sheet, and
         // each of its floors is a recess of the panel from the sheet's surface, as deep as it lies.
         for (edges, floors) in engravings.get(&f).into_iter().flatten() {
-            region.holes.retain(|h| !on(h, edges));
+            let mut kept = Vec::new();
+            region.holes.retain(|h| {
+                let keep = !on(h, edges);
+                kept.push(keep);
+                keep
+            });
+            origins.holes = origins.holes.into_iter().zip(kept).filter_map(|(tags, keep)| keep.then_some(tags)).collect();
             let panel = panels.len();
             recesses.extend(floors.iter().map(|(depth, r)| crate::Recess { panel, region: r.clone(), far: false, depth: *depth }));
         }
@@ -2108,7 +2183,15 @@ fn read_surfaces(
                         let at_g = face_point(&q, *g).unwrap_or_default();
                         return err(format!("the face at {} is raised at {}: not a plate of even thickness", at(point), at(at_g)));
                     }
-                    Opening::Recess(_) => region.holes.retain(|h| !on(h, edges)),
+                    Opening::Recess(_) => {
+                        let mut kept = Vec::new();
+                        region.holes.retain(|h| {
+                            let keep = !on(h, edges);
+                            kept.push(keep);
+                            keep
+                        });
+                        origins.holes = origins.holes.into_iter().zip(kept).filter_map(|(tags, keep)| keep.then_some(tags)).collect();
+                    }
                     Opening::Through | Opening::Open => {}
                 }
             }
@@ -2117,10 +2200,12 @@ fn read_surfaces(
         for (g, e, by) in modelled.iter().flat_map(|m| m.sides.iter().flat_map(|(g, es, by)| es.iter().map(move |e| (*g, *e, *by)))) {
             let Some(u) = uses.iter().find(|u| u.edge == e).filter(|_| g == f) else { continue };
             let (Some(&a), Some(&z)) = (u.chart.first(), u.chart.last()) else { continue };
-            region = to_sharp(&region, (a, z), by, tol).map_err(|e| DocError::Invalid(format!("the face at {} {e}", at(point))))?;
+            (region, origins) =
+                to_sharp(&region, &origins, (a, z), by, tol).map_err(|e| DocError::Invalid(format!("the face at {} {e}", at(point))))?;
         }
         uses_of.insert(f, uses);
         panels.push(Panel { name: format!("face {f}"), surface: shape.surface(), region });
+        panel_origins.push(origins);
     }
 
     // The joints: every edge between two faces of the sheet, `a` the face the other was reached
@@ -2128,6 +2213,7 @@ fn read_surfaces(
     // rip's plane is kept, by its ends and toward its `a` panel, and each bend's edge, for the
     // bends' ends below.
     let (mut joints, mut edges) = (Vec::new(), Vec::new());
+    let mut rip_origins = Vec::new();
     for &(e, x, y, role) in &roles {
         // A ring of smooth seams (a tube) can't lie flat: it opens where the walk closed it, at a
         // seam the walk did not cross. (A ring of bends is the user's to open: where its seam
@@ -2267,6 +2353,7 @@ fn read_surfaces(
                 lap: Lap::Miter { gap: rule.gap },
             })
         };
+        rip_origins.push(source_edge(e));
         joints.push(Joint { a: anchor_a, b: anchor_b, kind });
         edges.push(mid);
     }
@@ -2321,6 +2408,7 @@ fn read_surfaces(
             tails: (Tail::Keep, Tail::Keep),
             relief: (Relief::None, Relief::None),
         };
+        rip_origins.push(None);
         modelled_radii.push((joints.len(), m.inside));
         bend_of.push((mi, joints.len()));
         joints.push(Joint {
@@ -2406,7 +2494,9 @@ fn read_surfaces(
     let body_joints = model.joints.clone();
     for j in 0..made {
         if before.get(j).copied().flatten().is_some() {
-            crate::sheet_surface_features::close_corners_on(&mut model, &framed, rule.gap, j, Some(&body_joints), &|_, _| false)?;
+            let (_, next_origins) =
+                crate::sheet_surface_features::close_corners_on(&mut model, &panel_origins, &framed, rule.gap, j, Some(&body_joints), &|_, _| false)?;
+            panel_origins = next_origins;
         }
     }
     // A point on each new rip's edge, as each joint has.
@@ -2523,6 +2613,8 @@ fn read_surfaces(
         modelled_radii,
         rule_radius: rule.bend_radius,
         pieces: std::sync::OnceLock::new(),
+        origins: panel_origins,
+        rip_origins,
     };
     // Converting, each face takes the rule's thickness on its material's side, whatever lies
     // behind it, so two panels' material may meet (a thin block's two sides, each the rule's
@@ -3086,16 +3178,16 @@ fn face_point(q: &Query, f: usize) -> Option<Vec3> {
 impl SurfaceConversion {
     /// The flat pattern: each placed panel less its trims, and the bend zones, joined.
     pub fn flat(&self) -> Result<Vec<Region2>> {
-        crate::sheet_surface::join_pieces(self.pieces()?, &mut FlatWork::new())
+        crate::sheet_surface::join_pieces(&self.pieces()?.geometry, &mut FlatWork::new())
     }
 
     /// The flat's pieces: each placed panel less its trims, and the zones, all less the corners'
     /// reliefs. Cut the first time they are asked for.
-    fn pieces(&self) -> Result<&[(Piece, Region2)]> {
+    fn pieces(&self) -> Result<&Pieces> {
         if let Some(p) = self.pieces.get() {
             return Ok(p);
         }
-        let cut = crate::sheet_surface::pieces(&self.development, &mut FlatWork::new())?;
+        let cut = crate::sheet_surface::pieces(&self.development, &self.origins, &self.rip_origins, &mut FlatWork::new())?;
         Ok(self.pieces.get_or_init(|| cut))
     }
 
@@ -3109,7 +3201,7 @@ impl SurfaceConversion {
     /// tangent line on it (a bend turns at most half a turn), so that pair is not weighed.
     fn overlap(&self) -> Result<Overlaps> {
         let mut parts: BTreeMap<Part, Vec<(Piece, Region2)>> = BTreeMap::new();
-        for (piece, region) in self.pieces()? {
+        for (piece, region) in &self.pieces()?.geometry {
             let part = match *piece {
                 Piece::Panel(i) | Piece::Tab(_, i) => Part::Panel(i),
                 Piece::Zone(z) => match self.development.zones.get(z) {
@@ -3126,8 +3218,15 @@ impl SurfaceConversion {
         let folded = fold_onto(&self.sheet, &self.development, &placed)?;
         let mut solids = Vec::with_capacity(parts.len());
         for (part, pieces) in parts {
-            let made =
-                crate::sheet_surface_fold::solid(&self.development, &folded, self.thickness, &pieces, &[], &mut FlatWork::new(), &|_, _| None)?;
+            let made = crate::sheet_surface_fold::solid(
+                &self.development,
+                &folded,
+                self.thickness,
+                PieceSource { geometry: &pieces, origins: &[] },
+                &[],
+                &mut FlatWork::new(),
+                &|_, _| None,
+            )?;
             solids.push((part, made.0));
         }
         let own_bend = |a: Part, b: Part| match (a, b) {
@@ -3171,7 +3270,16 @@ impl SurfaceConversion {
     pub fn solid(&self) -> Result<Body> {
         let places: Vec<Option<Rigid3>> = self.places.iter().copied().map(Some).collect();
         let folded = fold_onto(&self.sheet, &self.development, &places)?;
-        Ok(crate::sheet_surface_fold::solid(&self.development, &folded, self.thickness, self.pieces()?, &[], &mut FlatWork::new(), &|_, _| None)?.0)
+        Ok(crate::sheet_surface_fold::solid(
+            &self.development,
+            &folded,
+            self.thickness,
+            self.pieces()?.source(),
+            &[],
+            &mut FlatWork::new(),
+            &|_, _| None,
+        )?
+        .0)
     }
 
     /// [`Self::solid`], with what each face was made for (see [`crate::sheet::FaceNamer`]) and
@@ -3182,25 +3290,26 @@ impl SurfaceConversion {
         let places: Vec<Option<Rigid3>> = self.places.iter().copied().map(Some).collect();
         let folded = fold_onto(&self.sheet, &self.development, &places)?;
         let pieces = self.pieces()?;
-        let namer = crate::sheet::FaceNamer::new(&sk.sheet, &self.development, pieces, &[], &sk.recipes, &[]);
+        let namer = crate::sheet::FaceNamer::new(&sk.sheet, &self.development, &pieces.geometry, &[], &sk.recipes, &[]);
         let made = std::cell::RefCell::new(Vec::new());
         let keep = |p: crate::sheet_surface::Piece, r: crate::sheet::FaceRole| {
             let mut made = made.borrow_mut();
             made.push((p, r));
             Some((made.len() - 1).to_string())
         };
-        let (body, keys) = crate::sheet_surface_fold::solid(&self.development, &folded, self.thickness, pieces, &[], &mut FlatWork::new(), &keep)?;
+        let (body, keys) =
+            crate::sheet_surface_fold::solid(&self.development, &folded, self.thickness, pieces.source(), &[], &mut FlatWork::new(), &keep)?;
         let made = made.into_inner();
-        let at = |k: &Option<String>| k.as_deref().and_then(|k| k.parse::<usize>().ok()).and_then(|k| made.get(k).copied());
+        let at = |k: &Option<String>| k.as_deref().and_then(|k| k.parse::<usize>().ok()).and_then(|k| made.get(k).cloned());
         // What each face was made for, and a panel's cap's sketch frame, carried through the cuts.
         type Made = (Option<(SheetPart, Option<f64>)>, Option<Plane>);
         let named: Vec<Option<Made>> = keys
             .iter()
             .map(|k| {
                 at(k).map(|(p, r)| {
-                    let frame = match (p, r) {
+                    let frame = match (p, &r) {
                         (crate::sheet_surface::Piece::Panel(i), crate::sheet::FaceRole::Cap { surface, .. }) => {
-                            folded.places.get(i).copied().flatten().and_then(|f| cap_frame(&self.development, f, i, surface, self.thickness))
+                            folded.places.get(i).copied().flatten().and_then(|f| cap_frame(&self.development, f, i, *surface, self.thickness))
                         }
                         _ => None,
                     };
@@ -3353,6 +3462,21 @@ pub(crate) fn fold_onto(sheet: &Sheet, dev: &Development, places: &[Option<Rigid
     Ok(folded)
 }
 
+/// A source region and complete segment origins captured together. The source payload prevents
+/// a stale sidecar from being rebound to a later, unrelated region with the same segment counts.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ConvertedBoundary {
+    pub region: Region2,
+    pub origins: RegionOrigins,
+}
+
+/// A conversion rip and its exact source edge, captured at the joint's construction event.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ConvertedRip {
+    pub joint: Joint,
+    pub source: ConvertedEdge,
+}
+
 /// A sheet metal body made from surfaces (#6748), as the model keeps it: its sheet of panels and
 /// joints, the master every later feature changes; where each panel lies in space, for the panels
 /// that the body's faces placed; and its flat pattern as last laid out, which
@@ -3466,6 +3590,12 @@ pub struct SurfaceSheet {
     /// a rim on one is made by that line (see [`RimEdge::Sketch`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sketch_curves: Vec<(String, String, Vec2, Vec2)>,
+    /// Original converted boundaries carried through explicit parent events, by panel key.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub converted_boundaries: BTreeMap<String, ConvertedBoundary>,
+    /// Rips derived from an original converted edge, by the sheet's joint index.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub converted_rips: BTreeMap<usize, ConvertedRip>,
     /// What each face of its body was made for, as it was last built (see [`SheetFace`]): what it
     /// reports to the model, which names its faces from it (#7990). Never a name.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -3513,6 +3643,8 @@ pub enum SheetPart {
 pub enum RimEdge {
     /// A line of the sketch that made the panel (its id).
     Sketch { curve: String },
+    /// A generated wall on the exact original converted boundary edge.
+    Converted { edge: usize, faces: [usize; 2] },
     /// On a panel a bend makes, the edge along the bend farthest from it.
     Far,
     /// On a panel a bend makes, an edge across the bend's ends: at the anchors' origin
@@ -3529,6 +3661,7 @@ impl RimEdge {
     pub(crate) fn role(&self) -> String {
         match self {
             RimEdge::Sketch { curve } => format!("side:{curve}"),
+            RimEdge::Converted { .. } => "side".into(),
             RimEdge::Far => "far".into(),
             RimEdge::End { at_origin } => if *at_origin { "end0" } else { "end1" }.into(),
             RimEdge::Past { at_origin } => if *at_origin { "past0" } else { "past1" }.into(),
@@ -3801,6 +3934,64 @@ pub(crate) fn free_form_contour(id: &str) -> DocError {
 }
 
 impl SurfaceSheet {
+    /// Read only the sidecar captured with this exact current source region.
+    pub(crate) fn panel_origins(&self, i: usize) -> RegionOrigins {
+        let Some(panel) = self.sheet.panels.get(i) else { return RegionOrigins::default() };
+        let Some(boundary) = self.converted_boundaries.get(&panel.name).filter(|b| b.region == panel.region) else {
+            return RegionOrigins::default();
+        };
+        if !charge_sources(&mut FlatWork::new(), boundary.origins.outer.iter().chain(boundary.origins.holes.iter().flatten()), 1, false) {
+            return RegionOrigins::default();
+        }
+        boundary.origins.clone()
+    }
+
+    /// Capture a known parent map at the same event that installs a panel's geometry.
+    pub(crate) fn remember_panel_origins(&mut self, i: usize, origins: RegionOrigins) {
+        if let Some(panel) = self.sheet.panels.get(i) {
+            let cost = (|| {
+                let mut count = 0usize;
+                for lp in std::iter::once(&panel.region.outer).chain(&panel.region.holes) {
+                    count = count.checked_add(lp.segs.len())?;
+                }
+                count.checked_mul(std::mem::size_of::<Seg2>())?.checked_add((panel.region.holes.len() + 1).checked_mul(std::mem::size_of::<Loop2>())?)
+            })();
+            let mut observer = FlatWork::new();
+            if observer.charge_history(cost) && charge_sources(&mut observer, origins.outer.iter().chain(origins.holes.iter().flatten()), 1, false) {
+                self.converted_boundaries.insert(panel.name.clone(), ConvertedBoundary { region: panel.region.clone(), origins });
+            } else {
+                self.converted_boundaries.remove(&panel.name);
+            }
+        }
+    }
+
+    pub(crate) fn set_panel_region(&mut self, i: usize, region: Region2, origins: RegionOrigins) -> Result<()> {
+        let count = self.sheet.panels.len();
+        let panel = self.sheet.panels.get_mut(i).ok_or(DocError::Missing { what: "panel", index: i, count })?;
+        panel.region = region;
+        self.remember_panel_origins(i, origins);
+        Ok(())
+    }
+
+    pub(crate) fn panel_origin_seeds(&self) -> Vec<RegionOrigins> {
+        (0..self.sheet.panels.len()).map(|i| self.panel_origins(i)).collect()
+    }
+
+    pub(crate) fn rip_origin_seeds(&self) -> Vec<Option<ConvertedEdge>> {
+        self.sheet.joints.iter().enumerate().map(|(i, joint)| self.converted_rips.get(&i).filter(|r| &r.joint == joint).map(|r| r.source)).collect()
+    }
+
+    /// Call only with source sets transported through the actual joint parent events.
+    pub(crate) fn remember_rip_origins(&mut self, origins: &[Option<ConvertedEdge>]) {
+        self.converted_rips = self
+            .sheet
+            .joints
+            .iter()
+            .enumerate()
+            .filter_map(|(i, joint)| Some((i, ConvertedRip { joint: joint.clone(), source: origins.get(i).copied().flatten()? })))
+            .collect();
+    }
+
     /// A converted body's sheet as the model keeps it, for the body `body` under the rule `rule`,
     /// and its folded solid. `feature` is the Convert: each panel's key is its and the face of the
     /// body the panel was (see [`PanelMade::Converted`]).
@@ -3847,12 +4038,18 @@ impl SurfaceSheet {
             perforation_joints: Vec::new(),
             hardware: Vec::new(),
             sketch_curves: Vec::new(),
+            converted_boundaries: BTreeMap::new(),
+            converted_rips: BTreeMap::new(),
             parts: Vec::new(),
             recipes,
             holes: Vec::new(),
             beads: Vec::new(),
         };
-        sheet.laid_out(&c.development, c.pieces()?, c.flat()?)?;
+        for (i, source) in c.origins.iter().enumerate() {
+            sheet.remember_panel_origins(i, source.clone());
+        }
+        sheet.remember_rip_origins(&c.rip_origins);
+        sheet.laid_out(&c.development, &c.pieces()?.geometry, c.flat()?)?;
         let (solid, parts, frames) = c.parted_solid(&sheet)?;
         sheet.parts = parts;
         sheet.frames = frames;
@@ -4068,6 +4265,8 @@ impl SurfaceSheet {
             perforation_joints: Vec::new(),
             hardware: Vec::new(),
             sketch_curves,
+            converted_boundaries: BTreeMap::new(),
+            converted_rips: BTreeMap::new(),
             parts: Vec::new(),
             recipes,
             holes: Vec::new(),
@@ -4291,7 +4490,7 @@ impl SurfaceSheet {
     pub fn perforation_outline(&self, plane: &Plane, regions: &[Region2]) -> Result<Vec<Region2>> {
         let dev = self.develop().map_err(|e| DocError::Invalid(e.to_string()))?;
         let frames = crate::sheet_surface_cuts::frames(self, &dev)?;
-        let pieces = crate::sheet_surface::pieces(&dev, &mut crate::sheet::FlatWork::new())?;
+        let pieces = crate::sheet_surface::pieces(&dev, &[], &[], &mut crate::sheet::FlatWork::new())?.geometry;
         let t = self.thickness;
         let mut out = Vec::new();
         let mut found = false;
@@ -4371,7 +4570,15 @@ impl SurfaceSheet {
         let unrelieved = self.unrelieved(&dev)?;
         self.notes.extend(unrelieved);
         let mut work = FlatWork::new();
-        let pieces = crate::sheet_surface::pieces(&dev, &mut work)?;
+        let keep_origins = charge_sources(
+            &mut work,
+            self.converted_boundaries.values().flat_map(|b| b.origins.outer.iter().chain(b.origins.holes.iter().flatten())),
+            1,
+            false,
+        );
+        let seeds = if keep_origins { self.panel_origin_seeds() } else { Vec::new() };
+        let pieces = crate::sheet_surface::pieces(&dev, &seeds, &self.rip_origin_seeds(), &mut work)?;
+        let Regions { geometry: pieces, origins: piece_origins } = pieces;
         let regions = crate::sheet_surface::join_pieces(&pieces, &mut work)?;
         self.check_countersinks(&dev, &pieces)?;
         self.laid_out(&dev, &pieces, regions)?;
@@ -4388,7 +4595,12 @@ impl SurfaceSheet {
             let frames = folded.places.clone();
             (Some(folded), frames)
         };
-        let solid_pieces = if self.countersinks.is_empty() { pieces } else { self.solid_pieces_for_countersinks(&dev, &pieces)? };
+        let (solid_pieces, solid_origins) = if self.countersinks.is_empty() {
+            (pieces, piece_origins)
+        } else {
+            let pieces = self.solid_pieces_for_countersinks(&dev, &pieces, &piece_origins)?;
+            (pieces.geometry, pieces.origins)
+        };
         let namer = crate::sheet::FaceNamer::new(&self.sheet, &dev, &solid_pieces, &self.sketch_curves, &self.recipes, &self.beads);
         // What the builder made each face for, in the order it makes them: each face's name from
         // the builder is its place in that order, read back below.
@@ -4401,22 +4613,37 @@ impl SurfaceSheet {
         let (mut body, keys) = match &folded {
             Some(folded) => {
                 let forms = crate::sheet_surface_bead::forms(self, &solid_pieces, folded)?;
-                crate::sheet_surface_fold::solid(&dev, folded, self.thickness, &solid_pieces, &forms, &mut work, &keep)?
+                crate::sheet_surface_fold::solid(
+                    &dev,
+                    folded,
+                    self.thickness,
+                    PieceSource { geometry: &solid_pieces, origins: &solid_origins },
+                    &forms,
+                    &mut work,
+                    &keep,
+                )?
             }
             // Laid flat in the sheet's flat: the same faces, so the flat's are the folded
             // sheet's (#7990).
-            None => crate::sheet_surface_fold::solid_flat(&dev, self.flat, self.thickness, &solid_pieces, &mut work, &keep)?,
+            None => crate::sheet_surface_fold::solid_flat(
+                &dev,
+                self.flat,
+                self.thickness,
+                PieceSource { geometry: &solid_pieces, origins: &solid_origins },
+                &mut work,
+                &keep,
+            )?,
         };
         let made = made.into_inner();
-        let at = |k: &Option<String>| k.as_deref().and_then(|k| k.parse::<usize>().ok()).and_then(|k| made.get(k).copied());
+        let at = |k: &Option<String>| k.as_deref().and_then(|k| k.parse::<usize>().ok()).and_then(|k| made.get(k).cloned());
         // What each face was made for, and a panel's cap's sketch frame (the flat pattern's).
         let mut names: Vec<Option<BuiltSheetFace>> = keys
             .iter()
             .map(|k| {
                 at(k).map(|(p, r)| {
-                    let frame = match (p, r) {
+                    let frame = match (p, &r) {
                         (crate::sheet_surface::Piece::Panel(i), crate::sheet::FaceRole::Cap { surface, .. }) => {
-                            frames.get(i).copied().flatten().and_then(|f| cap_frame(&dev, f, i, surface, self.thickness))
+                            frames.get(i).copied().flatten().and_then(|f| cap_frame(&dev, f, i, *surface, self.thickness))
                         }
                         _ => None,
                     };
@@ -4470,7 +4697,7 @@ impl SurfaceSheet {
     /// opposing-cone breakthrough opening (less non-full circular bores) so the two cones cut
     /// through solid metal cleanly without a zero-height vertical wall along their intersection.
     /// The flat pattern keeps the exact through-opening from `pieces`.
-    fn solid_pieces_for_countersinks(&self, dev: &Development, pieces: &[(Piece, Region2)]) -> Result<Vec<(Piece, Region2)>> {
+    fn solid_pieces_for_countersinks(&self, dev: &Development, pieces: &[(Piece, Region2)], origins: &[RegionOrigins]) -> Result<Pieces> {
         let t = self.thickness;
         let tol = 1e-7;
         let mut by_panel: BTreeMap<usize, Vec<&crate::Countersink>> = BTreeMap::new();
@@ -4515,7 +4742,7 @@ impl SurfaceSheet {
             }
         }
         if edits.is_empty() {
-            return Ok(pieces.to_vec());
+            return Ok(Regions { geometry: pieces.to_vec(), origins: origins.to_vec() });
         }
         let is_matching_circle = |lp: &Loop2, want_center: Vec2, want_radius: f64| -> bool {
             let Some(Seg2::Arc { sweep: first_sweep, .. }) = lp.segs.first() else { return false };
@@ -4530,41 +4757,71 @@ impl SurfaceSheet {
             (total.abs() - std::f64::consts::TAU).abs() < 1e-6
         };
         let mut out = Vec::with_capacity(pieces.len());
-        for (piece, region) in pieces {
+        let mut out_origins = Vec::new();
+        for (ri, (piece, region)) in pieces.iter().enumerate() {
+            let mut source = origins.get(ri).cloned().unwrap_or_else(|| RegionOrigins::unknown(region));
             let Piece::Panel(p) = *piece else {
                 out.push((*piece, region.clone()));
+                out_origins.push(source);
                 continue;
             };
             let Some((full, patch)) = edits.get(&p) else {
                 out.push((*piece, region.clone()));
+                out_origins.push(source);
                 continue;
             };
             let holes = if full.is_empty() {
                 region.holes.clone()
             } else {
-                region.holes.iter().filter(|h| !full.iter().any(|(c, r)| is_matching_circle(h, *c, *r))).cloned().collect()
+                let mut kept = Vec::new();
+                let holes = region
+                    .holes
+                    .iter()
+                    .filter(|h| {
+                        let keep = !full.iter().any(|(c, r)| is_matching_circle(h, *c, *r));
+                        kept.push(keep);
+                        keep
+                    })
+                    .cloned()
+                    .collect();
+                source.holes = source.holes.into_iter().zip(kept).filter_map(|(tags, keep)| keep.then_some(tags)).collect();
+                holes
             };
             let cur = Region2 { outer: region.outer.clone(), holes };
             if patch.is_empty() {
                 out.push((*piece, cur));
+                out_origins.push(source);
                 continue;
             }
             let outer_only = Region2 { outer: cur.outer.clone(), holes: Vec::new() };
+            let outer_source = RegionOrigins { outer: source.outer.clone(), holes: Vec::new() };
             let mut cur_vec = vec![cur];
+            let mut cur_origins = vec![source];
             for pr in patch {
-                let clipped = solidcraft_kernel::planar_regions_boolean(
+                let clipped = solidcraft_kernel::planar_regions_boolean_with_history(
                     std::slice::from_ref(pr),
                     std::slice::from_ref(&outer_only),
                     solidcraft_kernel::BoolOp::Intersect,
                     tol,
                 )?;
-                if !clipped.is_empty() {
-                    cur_vec = solidcraft_kernel::planar_regions_boolean(&cur_vec, &clipped, solidcraft_kernel::BoolOp::Union, tol)?;
+                let clipped = crate::sheet_surface::compose_regions(
+                    clipped,
+                    &[RegionOrigins::unknown(pr)],
+                    std::slice::from_ref(&outer_source),
+                    &mut FlatWork::new(),
+                );
+                if !clipped.geometry.is_empty() {
+                    let joined =
+                        solidcraft_kernel::planar_regions_boolean_with_history(&cur_vec, &clipped.geometry, solidcraft_kernel::BoolOp::Union, tol)?;
+                    let joined = crate::sheet_surface::compose_regions(joined, &cur_origins, &clipped.origins, &mut FlatWork::new());
+                    cur_vec = joined.geometry;
+                    cur_origins = joined.origins;
                 }
             }
             out.extend(cur_vec.into_iter().map(|r| (*piece, r)));
+            out_origins.extend(cur_origins);
         }
-        Ok(out)
+        Ok(Regions { geometry: out, origins: out_origins })
     }
 
     /// Cut each conical countersink in its panel's frame, carrying the body's face names through

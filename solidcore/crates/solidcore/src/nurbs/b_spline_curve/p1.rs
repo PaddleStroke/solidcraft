@@ -446,6 +446,195 @@ fn tessellate_by_bisection(
     )
 }
 
+// Canonical optional-proof accounting only: no curve values are computed here.
+// Native D0/D1 fit inside the verified D2 capsule; D1(nonzero) can call D2 once.
+fn proof_native_evaluation_work(
+    knots: u64,
+    degree: u64,
+    order: usize,
+    nonzero: bool,
+) -> Option<u64> {
+    if degree >= 32 || order > 3 {
+        return None;
+    }
+    let d = if order < 2 {
+        2
+    } else {
+        u64::try_from(order).ok()?
+    };
+    let w = if degree < 8 { 8_u64 } else { 32 };
+    let q = degree.checked_add(1)?;
+    let m = degree.min(d);
+    let triangular = degree.checked_mul(q)?.checked_div(2)?;
+    let rows = m
+        .checked_mul(m.checked_add(1)?)?
+        .checked_div(2)?
+        .checked_add(m.checked_mul(5)?)?
+        .checked_add(2)?
+        .checked_add(d.checked_add(1)?.checked_mul(3)?)?
+        .checked_add(d.checked_mul(d.checked_add(1)?)?.checked_div(2)?)?
+        .checked_add(d.saturating_sub(degree))?;
+    let events = knots
+        .checked_add(1)?
+        .checked_add(triangular)?
+        .checked_add(q.checked_mul(rows)?)?
+        .checked_add(1)?;
+    let storage = w
+        .checked_mul(w)?
+        .checked_mul(8)?
+        .checked_add(w.checked_mul(152)?)?
+        .checked_add(256)?
+        .checked_add(d.checked_add(1)?.checked_mul(48)?)?
+        .checked_add(24)?;
+    let one = storage.checked_add(events)?;
+    if order == 1 && nonzero {
+        one.checked_mul(2)
+    } else {
+        Some(one)
+    }
+}
+
+// These are the exact two inner-knot reads used by Point's rare derivative
+// fallback. Keep its lazy lower/upper order unchanged.
+fn point_start_knot(knots: &[f64], degree: usize) -> Option<&f64> {
+    knots.get(degree)
+}
+
+fn point_end_knot(knots: &[f64], degree: usize) -> Option<&f64> {
+    knots.iter().rev().nth(degree)
+}
+
+impl BSplineCurve {
+    /// Prepays the header classification before reserving a native Point call.
+    /// General Evaluate/Into calls retain their conservative derivative credit.
+    pub(crate) fn charge_query_point(
+        &self,
+        k: &crate::kernel::Kernel,
+        operation: &'static str,
+    ) -> Result<()> {
+        if let Some(work) = k.context.proof_work() {
+            if !work.charge(self.proof_native_point_work(work)) {
+                return Err(work.stopped(operation));
+            }
+        }
+        Ok(())
+    }
+
+    /// Debits 32 header slots FIRST, then returns only the remaining Point fee.
+    /// Aggregate no-Kernel callers must charge the returned remainder once.
+    pub(crate) fn proof_native_point_work(
+        &self,
+        work: &crate::geom::context::ProofWork,
+    ) -> Option<u64> {
+        if !work.charge(Some(32)) {
+            return None;
+        }
+        let nurb = self.nurb.as_ref()?;
+        let knots = nurb.knots();
+        let degree = nurb.degree();
+        let full = self.proof_native_work(0, false)?;
+        let clamped = degree < 32
+            && knots.first().is_some_and(|first| {
+                first.is_finite()
+                    && knots.last().is_some_and(|last| {
+                        last.is_finite()
+                            && point_start_knot(knots, degree) == Some(first)
+                            && point_end_knot(knots, degree) == Some(last)
+                    })
+            });
+        if !clamped {
+            return Some(full);
+        }
+        // The inner knot values equal the outer bounds: Point returns their
+        // endpoint controls before its derivative fallback can be selected.
+        // crv_eval owns three [f64;32] arrays and a CPoint. Retain all existing
+        // D2 event credit and the old spare/output/header allowance unchanged.
+        let width = if degree < 8 { 8_u64 } else { 32 };
+        let old_storage = width
+            .checked_mul(width)?
+            .checked_mul(8)?
+            .checked_add(width.checked_mul(152)?)?
+            .checked_add(256 + 48 * 3 + 24)?;
+        full.checked_sub(old_storage)?
+            .checked_add(3 * 32 * 8 + 32 + 256 + 48 * 3 + 24)
+    }
+
+    /// Debits native work only for a private query-owned Kernel view.
+    pub(crate) fn charge_query_native(
+        &self,
+        k: &crate::kernel::Kernel,
+        order: usize,
+        nonzero: bool,
+        operation: &'static str,
+    ) -> Result<()> {
+        if let Some(work) = k.context.proof_work() {
+            if !work.charge(self.proof_native_work(order, nonzero)) {
+                return Err(work.stopped(operation));
+            }
+        }
+        Ok(())
+    }
+
+    /// Complete existing native evaluator credit, before a query-owned call.
+    pub(crate) fn proof_native_work(&self, order: usize, nonzero: bool) -> Option<u64> {
+        let nurb = self.nurb.as_ref()?;
+        proof_native_evaluation_work(
+            u64::try_from(nurb.knots().len()).ok()?,
+            u64::try_from(nurb.degree()).ok()?,
+            order,
+            nonzero,
+        )
+    }
+
+    /// Existing natural-domain degeneracy check's polygon allocation and scan.
+    pub(crate) fn proof_degenerate_work(&self) -> Option<u64> {
+        let n = u64::try_from(self.nurb.as_ref()?.cpts().len()).ok()?;
+        n.checked_mul(24)?
+            .checked_add(24)?
+            .checked_add(256)?
+            .checked_add(n)?
+            .checked_add(n.saturating_sub(1))?
+            .checked_add(1)
+    }
+
+    /// One actual base copy, including compact copy, knot COW and fix-up arrays.
+    pub(crate) fn proof_base_copy_work(&self) -> Option<u64> {
+        let Some(nurb) = self.nurb.as_ref() else {
+            return Some(1);
+        };
+        let n = u64::try_from(nurb.cpts().len()).ok()?;
+        let k = u64::try_from(nurb.knots().len()).ok()?;
+        let growth = k.checked_mul(2)?.checked_add(8)?;
+        208_u64
+            .checked_add(n.checked_mul(32)?)?
+            .checked_add(k.checked_mul(16)?)?
+            .checked_add(growth.checked_mul(48)?)?
+            .checked_add(k.checked_mul(4)?)?
+            .checked_add(16)?
+            .checked_add(n.checked_add(k)?)?
+            .checked_add(1)
+    }
+
+    /// One compact exact base copy, with no knot fix-up or Polar table work.
+    pub(crate) fn proof_exact_copy_work(&self) -> Option<u64> {
+        let Some(nurb) = self.nurb.as_ref() else {
+            return Some(0);
+        };
+        let n = u64::try_from(nurb.cpts().len()).ok()?;
+        let k = u64::try_from(nurb.knots().len()).ok()?;
+        120_u64
+            .checked_add(n.checked_mul(32)?)?
+            .checked_add(k.checked_mul(8)?)?
+            .checked_add(n.checked_add(k)?)
+    }
+
+    /// Actual discarded derived-Clone base plus its exact replacement.
+    pub(crate) fn proof_evaluation_clone_work(&self) -> Option<u64> {
+        self.proof_base_copy_work()?
+            .checked_add(self.proof_exact_copy_work()?)
+    }
+}
+
 impl BSplineCurve {
     /// `SmBSplineCurve_TYPE` (`CURV_BASE_TYPE + 33`).
     pub const TYPE: i64 = BSPLINE_CURVE_TYPE;
@@ -548,11 +737,35 @@ impl BSplineCurve {
     /// up; the copy owns its NURB.
     #[must_use]
     pub fn copy(&self) -> Self {
+        self.copy_with_source(None)
+    }
+
+    /// The same copy, with optional source-frame evidence from its actual fix-up.
+    pub(crate) fn copy_with_source(
+        &self,
+        outcome: Option<&mut crate::nurbs::b_spline_curve_n_lib::CopySourceOutcome>,
+    ) -> Self {
+        let mut unchanged = true;
         let nurb = self.nurb.as_ref().map(|src| {
             let mut nurb = copy_nurb_curve(src);
-            fixup_knot_vector(nurb.knots_mut(), EFF_ZERO);
+            if outcome.is_some() {
+                crate::nurbs::nurbs_crv::fixup_knot_vector_observed(
+                    nurb.knots_mut(),
+                    EFF_ZERO,
+                    Some(&mut unchanged),
+                );
+            } else {
+                fixup_knot_vector(nurb.knots_mut(), EFF_ZERO);
+            }
             nurb
         });
+        if let Some(outcome) = outcome {
+            *outcome = if unchanged {
+                crate::nurbs::b_spline_curve_n_lib::CopySourceOutcome::Preserved
+            } else {
+                crate::nurbs::b_spline_curve_n_lib::CopySourceOutcome::Uncertified
+            };
+        }
         Self {
             dim: self.dim,
             nurb,
@@ -938,6 +1151,19 @@ impl BSplineCurve {
         k: &crate::kernel::Kernel,
         angle_tol: f64,
     ) -> Result<(ContinuityType, Vec<ContinuityType>)> {
+        if let Some(work) = k.context.proof_work() {
+            let cost = (|| {
+                let raw = u64::try_from(self.nurb.as_ref()?.knots().len()).ok()?;
+                // Both unique-knot query vectors, then continuity slots and writes.
+                raw.checked_mul(2)?
+                    .checked_add(8)?
+                    .checked_mul(48)?
+                    .checked_add(48)
+            })();
+            if !work.charge(cost) {
+                return Err(work.stopped(OP_CONT));
+            }
+        }
         let (knots, _) = self.knots(None)?;
         let knot_count = knots.len();
         if knot_count == 0 {
@@ -945,11 +1171,20 @@ impl BSplineCurve {
         }
 
         // init output - 1 continuity for each knot, end continuity values discontinuous
+        if let Some(work) = k.context.proof_work() {
+            let cost = u64::try_from(knot_count)
+                .ok()
+                .and_then(|n| n.checked_mul(9)?.checked_add(24));
+            if !work.charge(cost) {
+                return Err(work.stopped(OP_CONT));
+            }
+        }
         let mut continuities = vec![ContinuityType::Discontinuous; knot_count];
         let mut min_continuity = ContinuityType::CInfinity;
 
         // for every internal knot
         for (i, &knot_val) in knots.iter().enumerate().take(knot_count - 1).skip(1) {
+            crate::curve::curve::p3::charge_query_work(k, Some(512), OP_CONT)?;
             let c = evaluate_continuity(k, self, knot_val, true, self, knot_val, false, angle_tol)?;
             if let Some(slot) = continuities.get_mut(i) {
                 *slot = c;
@@ -1003,7 +1238,8 @@ impl BSplineCurve {
         // derivative evaluator already evaluates those spans exactly.
         let knots = cur.knots();
         let degree = cur.degree();
-        if knots.get(degree) == Some(&t) || knots.iter().rev().nth(degree) == Some(&t) {
+        if point_start_knot(knots, degree) == Some(&t) || point_end_knot(knots, degree) == Some(&t)
+        {
             let mut point = [Vec3::ZERO];
             crv_derivs_into(cur, t, Side::Left, &mut point)
                 .map_err(SolidError::nurbs_routine(OP_EVAL_PT))?;
@@ -2078,6 +2314,7 @@ impl crate::geom::content::Content for BSplineCurve {
 mod tests {
     use super::*;
     use crate::error::nurbs::NurbsFailure;
+    use crate::math::det;
     use crate::Kernel;
 
     fn cubic() -> BSplineCurve {
@@ -2370,7 +2607,7 @@ mod tests {
         let e = BSplineCurve::create_arc_from_points(
             Point3::ZERO,
             Point3::new(1.0, 0.0, 0.0),
-            Point3::new(t.cos(), t.sin(), 0.0),
+            Point3::new(det::cos(t), det::sin(t), 0.0),
             NurbCircleParam::Quadratic,
         )
         .unwrap_err();

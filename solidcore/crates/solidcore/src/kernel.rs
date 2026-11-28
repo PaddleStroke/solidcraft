@@ -259,6 +259,7 @@ pub struct WorkCounters {
     split_face_classifications: Cell<u64>,
     face_intersections: Cell<u64>,
     same_parameter_bisections: Cell<u64>,
+    fitted_trim_bisections: Cell<u64>,
     band_face_solves: Cell<u64>,
     band_edge_solves: Cell<u64>,
     shells: Cell<u64>,
@@ -669,6 +670,15 @@ impl WorkCounters {
         self.same_parameter_bisections.get()
     }
 
+    /// Bounds on a trim's distance from its edge as sets
+    /// (`query::curve_surface_gap::trim_image_gap_bound_within`, which the stitch's and a
+    /// move's trim covers take) that the trim's structure did not answer at once, so that
+    /// their bisection ran: the costly ones. Not the fork's.
+    #[must_use]
+    pub fn fitted_trim_bisections(&self) -> u64 {
+        self.fitted_trim_bisections.get()
+    }
+
     /// Intersections of a convex blend's section with a face of the part, run to learn whether
     /// the blend cuts the part or breaks through it
     /// (`blend::fillet_executive::session::band_cuts`). Not the fork's (#21434).
@@ -792,6 +802,7 @@ impl WorkCounters {
         self.split_face_classifications.set(0);
         self.face_intersections.set(0);
         self.same_parameter_bisections.set(0);
+        self.fitted_trim_bisections.set(0);
         self.band_face_solves.set(0);
         self.band_edge_solves.set(0);
         self.shells.set(0);
@@ -883,6 +894,12 @@ impl WorkCounters {
     pub(crate) fn add_same_parameter_bisection(&self) {
         self.same_parameter_bisections
             .set(self.same_parameter_bisections.get().saturating_add(1));
+    }
+
+    /// Counts one trim bound as sets that runs its bisection.
+    pub(crate) fn add_fitted_trim_bisection(&self) {
+        self.fitted_trim_bisections
+            .set(self.fitted_trim_bisections.get().saturating_add(1));
     }
 
     /// Counts one edge or vertex asked whether it is a seam or a pole of a face.
@@ -1279,6 +1296,8 @@ pub struct CancelToken {
     /// Not upstream: the polls counted, and the one it turns cancelled at
     /// ([`Self::after_polls`]); `None` for a token that counts nothing.
     polls: Option<Arc<PollCount>>,
+    /// Private query view; ordinary public tokens retain their old polling behavior.
+    proof_observer: Option<crate::geom::context::ProofWork>,
 }
 
 /// The polls a [`CancelToken::after_polls`] or [`CancelToken::with_fuel`] token counts.
@@ -1390,6 +1409,58 @@ impl CancelToken {
             })),
             // a poll of the joined token is a poll of self: counted, and cancelling, as self's
             polls: self.polls.clone(),
+            proof_observer: self.proof_observer.clone(),
+        }
+    }
+
+    /// A query-only view of the same real cancellation signals, without polls.
+    /// Its optional allowance is independent of actual geometry's fuel counter.
+    pub(crate) fn observation_only(&self, work: &crate::geom::context::ProofWork) -> Option<Self> {
+        if !work.charge(Some(64)) {
+            return None;
+        }
+        Some(Self {
+            flag: Arc::clone(&self.flag),
+            also: self.also.clone(),
+            polls: self.polls.clone(),
+            proof_observer: Some(work.clone()),
+        })
+    }
+
+    // Visit the original flat chain without incrementing any PollCount. Real
+    // cancellation dominates already-spent fuel, as stopped_error does normally.
+    fn observed_stop(&self, operation: &'static str) -> Option<SolidError> {
+        let work = self.proof_observer.as_ref()?;
+        let mut token = Some(self);
+        let mut fuel = None;
+        let mut counted_stop = false;
+        while let Some(current) = token {
+            if !work.charge(Some(1)) {
+                return Some(work.stopped(operation));
+            }
+            if current.flag.load(Ordering::Relaxed) {
+                return Some(SolidError::Cancelled { operation });
+            }
+            if let Some(polls) = &current.polls {
+                let made = polls.made.load(Ordering::Relaxed);
+                if made >= polls.from {
+                    if polls.fuel && fuel.is_none() {
+                        fuel = Some((made, polls.from.saturating_sub(1)));
+                    } else if !polls.fuel {
+                        counted_stop = true;
+                    }
+                }
+            }
+            token = current.also.as_deref();
+        }
+        match fuel {
+            Some((spent, limit)) => Some(SolidError::OutOfFuel {
+                operation,
+                spent,
+                limit,
+            }),
+            None if counted_stop => Some(SolidError::Cancelled { operation }),
+            None => None,
         }
     }
 
@@ -1408,6 +1479,9 @@ impl CancelToken {
     #[must_use]
     #[inline]
     pub fn is_cancelled(&self) -> bool {
+        if self.proof_observer.is_some() {
+            return self.observed_stop("kernel::optional_proof_poll").is_some();
+        }
         let counted = self.polls.as_deref().is_some_and(PollCount::poll);
         let also = self.also.as_deref().is_some_and(CancelToken::is_cancelled);
         counted || also || self.flag.load(Ordering::Relaxed)
@@ -1423,6 +1497,9 @@ impl CancelToken {
     /// [`SolidError::OutOfFuel`] when the token's fuel ran out.
     #[inline]
     pub fn check(&self, operation: &'static str) -> crate::Result<()> {
+        if self.proof_observer.is_some() {
+            return self.observed_stop(operation).map_or(Ok(()), Err);
+        }
         if self.is_cancelled() {
             return Err(stopped_error(self, operation));
         }
@@ -1495,6 +1572,12 @@ pub struct Kernel {
     /// definition is evaluated through `&Kernel`; it is never borrowed across a solve, and
     /// a hit returns what a fresh solve from the same seeds gives.
     pub blend_station_memo: RefCell<crate::blend::fillet_section::definition::StationMemo>,
+    /// Not upstream: the NURBS data of the B-spline surfaces the station solves read last
+    /// ([`crate::blend::fillet_section::station::NurbsMemo`]), so that a support's knots and
+    /// net are gathered once, not at every Newton step of every station. A hit is the data the
+    /// surface's NURB holds now (each is kept with the NURB's own cell, which an edit never
+    /// changes in place while it is shared), so it changes no answer, only the work.
+    pub station_nurbs: RefCell<crate::blend::fillet_section::station::NurbsMemo>,
     /// Not upstream: the arena-identity record map of the last stitch glue or split
     /// (`heal::stitch::p1`) and the B-rep value it was kept for (its progress tag, held
     /// weakly), kept only to reuse its allocation. An edit of another B-rep value starts
@@ -1604,6 +1687,81 @@ impl Default for Kernel {
 }
 
 impl Kernel {
+    /// The existing read-only cache snapshot, preserving caller settings/seed.
+    /// Notification records, traversal identities and owned caches are local.
+    pub(crate) fn metadata_view(&self, context: &Context) -> Self {
+        let k = self;
+        Kernel {
+            tolerances: k.tolerances,
+            seed: k.seed,
+            caches: Caches {
+                fit_gap_memo: Arc::clone(&k.caches.fit_gap_memo),
+                prove_lazy_trim_raise: k.caches.prove_lazy_trim_raise,
+                ..Caches::default()
+            },
+            context: context.metadata_copy(),
+            upstream_ub_passed: Vec::new(),
+            memoize_curve_caches: k.memoize_curve_caches,
+            fixes: k.fixes,
+            cancel: k.cancel.clone(),
+            notify_records: crate::topology::topology::NotifyRecords::new(),
+            blend_net_tolerance: Cell::new(k.blend_net_tolerance.get()),
+            blend_counts: Cell::new(k.blend_counts.get()),
+            // (the memo is the kernel's own: a copy starts empty and solves afresh)
+            blend_station_memo: RefCell::default(),
+            // (a cache of the surfaces' own data: a copy starts empty)
+            station_nurbs: RefCell::default(),
+            arena_notify_records: (
+                std::sync::Weak::new(),
+                crate::topology::topology::NotifyRecords::new(),
+            ),
+            blend_w_memo: RefCell::default(),
+            loop_area_memo: RefCell::default(),
+            check_memo: RefCell::default(),
+            // (shared with the parent: a hit returns what recertifying the same blend again
+            // returns, so the certificates the parent finished serve the copy's workers too)
+            recertify_memo: Arc::clone(&k.recertify_memo),
+            // (inside the caller's operation: a scope opened on the copy keeps its memo)
+            blend_operation_scopes: Arc::new(core::sync::atomic::AtomicU32::new(
+                k.blend_operation_scopes.load(Ordering::Relaxed),
+            )),
+            // (building cache trees does none of the counted work)
+            work_counters: WorkCounters::default(),
+            // (building cache trees makes no blend faces)
+            blend_face_log: None,
+            // (building cache trees makes no corner patches)
+            coons_tangency_log: RefCell::new(None),
+            // (the caller's profiler: the copy's scopes record into its tree)
+            #[cfg(feature = "profile")]
+            profiler: k.profiler.clone(),
+            // (the test seam is shared: the copy's drops are the operation's)
+            #[cfg(test)]
+            strip_probe: k.strip_probe.clone(),
+        }
+    }
+
+    /// A metered query snapshot observes cancellation without spending geometry fuel.
+    pub(crate) fn optional_proof_view(
+        &self,
+        work: &crate::geom::context::ProofWork,
+    ) -> Option<Self> {
+        // A fixed canonical envelope for this existing snapshot's initialized
+        // records and local Arc allocations; no input-sized cache is copied.
+        if !work.charge(Some(4096)) {
+            return None;
+        }
+        let cancel = match &self.cancel {
+            Some(token) => Some(token.observation_only(work)?),
+            None => None,
+        };
+        let mut view = self.metadata_view(&self.context);
+        view.cancel = cancel;
+        view.context.set_proof_work(Some(work.clone()));
+        Some(view)
+    }
+}
+
+impl Kernel {
     /// Creates a kernel from options.
     #[must_use]
     pub fn new(options: &KernelOptions) -> Self {
@@ -1622,6 +1780,7 @@ impl Kernel {
             blend_station_memo: RefCell::new(
                 crate::blend::fillet_section::definition::StationMemo::default(),
             ),
+            station_nurbs: RefCell::default(),
             arena_notify_records: (
                 std::sync::Weak::new(),
                 crate::topology::topology::NotifyRecords::new(),
@@ -2021,5 +2180,97 @@ mod tests {
         assert_eq!((0..5).map(|_| second.next_u64()).collect::<Vec<_>>(), drawn);
         assert_eq!(Kernel::default().seed, Rng::DEFAULT_SEED);
         assert_ne!(Kernel::default().seeded_rng().next_u64(), drawn[0]);
+    }
+    #[test]
+    fn optional_query_observes_cancellation_without_spending_geometry_fuel() {
+        let original = CancelToken::with_fuel(3);
+        let work = crate::geom::context::ProofWork::new(crate::prism::sheet::READ_WORK);
+        let query = original.observation_only(&work).unwrap();
+        for _ in 0..100 {
+            assert!(query.check("query").is_ok());
+        }
+        assert_eq!(original.polls(), Some(0));
+        assert_eq!(original.out_of_fuel(), None);
+        assert!(original.check("geometry").is_ok());
+        assert_eq!(original.polls(), Some(1));
+        assert!(query.check("query").is_ok());
+        assert_eq!(original.polls(), Some(1));
+        original.cancel();
+        assert!(query
+            .check("query")
+            .is_err_and(|e| matches!(e, SolidError::Cancelled { .. })));
+        assert_eq!(original.polls(), Some(1));
+    }
+
+    #[test]
+    fn optional_query_preserves_joined_real_stop_reasons_without_counting() {
+        let fuel = CancelToken::with_fuel(1);
+        let other = CancelToken::after_polls(2);
+        let original = fuel.either(&other);
+        let work = crate::geom::context::ProofWork::new(crate::prism::sheet::READ_WORK);
+        let query = original.observation_only(&work).unwrap();
+        assert!(query.check("query").is_ok());
+        assert_eq!(fuel.polls(), Some(0));
+        assert_eq!(other.polls(), Some(0));
+        assert!(fuel.check("geometry").is_ok());
+        assert!(fuel.check("geometry").is_err_and(|e| e.is_out_of_fuel()));
+        assert!(matches!(
+            query.check("query"),
+            Err(SolidError::OutOfFuel {
+                spent: 2,
+                limit: 1,
+                ..
+            })
+        ));
+        other.cancel();
+        assert!(query
+            .check("query")
+            .is_err_and(|e| matches!(e, SolidError::Cancelled { .. })));
+        assert_eq!(fuel.polls(), Some(2));
+        assert_eq!(other.polls(), Some(0));
+    }
+
+    #[test]
+    fn optional_query_work_stop_does_not_cancel_or_spend_original_token() {
+        let original = CancelToken::with_fuel(3);
+        let work = crate::geom::context::ProofWork::new(crate::prism::sheet::READ_WORK);
+        let query = original.observation_only(&work).unwrap();
+        assert!(!work.charge(None));
+        assert!(query
+            .check("optional proof")
+            .is_err_and(|e| e.is_out_of_fuel()));
+        assert_eq!(original.polls(), Some(0));
+        assert_eq!(original.out_of_fuel(), None);
+        assert!(original.check("geometry").is_ok());
+        assert!(original.observation_only(&work).is_none());
+    }
+    #[test]
+    fn proof_kernel_view_observes_without_spending_original_fuel() {
+        let token = CancelToken::with_fuel(3);
+        let mut original = Kernel::default();
+        original.set_cancel_token(token.clone());
+        let work = crate::geom::context::ProofWork::new(crate::prism::sheet::READ_WORK);
+        let view = original.optional_proof_view(&work).unwrap();
+        assert_eq!(view.seed, original.seed);
+        assert_eq!(view.memoize_curve_caches, original.memoize_curve_caches);
+        for _ in 0..100 {
+            assert!(view.check_cancelled("query").is_ok());
+        }
+        assert_eq!(token.polls(), Some(0));
+        token.cancel();
+        assert!(view
+            .check_cancelled("query")
+            .is_err_and(|e| matches!(e, SolidError::Cancelled { .. })));
+        assert_eq!(token.polls(), Some(0));
+    }
+
+    #[test]
+    fn extracted_ordinary_metadata_view_keeps_its_existing_polling_behavior() {
+        let token = CancelToken::with_fuel(3);
+        let mut original = Kernel::default();
+        original.set_cancel_token(token.clone());
+        let view = original.metadata_view(&original.context);
+        assert!(view.check_cancelled("ordinary cache").is_ok());
+        assert_eq!(token.polls(), Some(1));
     }
 }

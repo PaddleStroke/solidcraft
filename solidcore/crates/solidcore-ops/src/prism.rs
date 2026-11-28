@@ -16,16 +16,20 @@
 // The range tests refuse NaN by negation (`!(x > y)`), kept as written.
 #![allow(clippy::neg_cmp_op_on_partial_ord)]
 
-use solidcore::boolean::api_brep::{boolean_2d, Boolean2dOutcome};
+use solidcore::boolean::api_brep::{boolean_2d, boolean_2d_with_edge_history, Boolean2dOutcome};
+use solidcore::boolean::edge_history::{BoundaryHistory, EdgeSources};
 use solidcore::error::Reason;
 use solidcore::eval::Frame;
 use solidcore::kernel::{Kernel, Tolerances};
-use solidcore::primitive::api_trim_ops::create_planar_faces;
+use solidcore::primitive::api_trim_ops::{create_planar_faces, create_planar_faces_with_edges};
 use solidcore::primitive::primitive_creation::Boolean2d;
 use solidcore::prism::{extrude, fill, measure, profile as kp, read, sheet};
+use solidcore::topology::EdgeId;
 use solidcore::Brep;
 use solidcore_convert as convert;
-use solidcore_record::{Loop2, Plane, Region2, Seg2, Vec2, Vec3};
+use solidcore_record::{
+    BoundaryLoop, InputBoundary, Loop2, Plane, Region2, RegionWithHistory, Seg2, Vec2, Vec3,
+};
 
 pub use solidcore::error::fill::{FillFailure, FillSide};
 pub use solidcore::prism::fill::{Contour, FillNote, FillOptions};
@@ -76,27 +80,58 @@ fn op2(op: BooleanOp) -> Boolean2d {
     }
 }
 
-/// `a` op `b` (the kernel's 2D boolean); `None` when nothing is left: no result assigned, or a
-/// result with no faces (two disjoint operands intersected).
-fn combine(k: &mut Kernel, a: Brep, b: Brep, op: BooleanOp) -> solidcore::Result<Option<Brep>> {
-    Ok(match boolean_2d(k, a, b, op2(op))? {
-        Boolean2dOutcome::Result(r) if !r.face_list().is_empty() => Some(r),
+/// A temporary sheet and, when requested, complete original-boundary tokens
+/// for its actual kernel edges.
+struct WorkingSheet {
+    body: Brep,
+    sources: Option<EdgeSources>,
+}
+
+impl WorkingSheet {
+    fn plain(body: Brep) -> Self {
+        Self {
+            body,
+            sources: None,
+        }
+    }
+}
+
+/// The one 2D-boolean recipe for both tracked and geometry-only sheets.
+fn combine_working(
+    k: &mut Kernel,
+    a: WorkingSheet,
+    b: WorkingSheet,
+    op: BooleanOp,
+    history: &mut BoundaryHistory,
+) -> solidcore::Result<Option<WorkingSheet>> {
+    let (outcome, sources) = match (a.sources, b.sources) {
+        (Some(first), Some(second)) => {
+            let (outcome, sources) =
+                boolean_2d_with_edge_history(k, a.body, b.body, op2(op), &first, &second, history)?;
+            (outcome, Some(sources))
+        }
+        _ => (boolean_2d(k, a.body, b.body, op2(op))?, None),
+    };
+    Ok(match outcome {
+        Boolean2dOutcome::Result(body) if !body.face_list().is_empty() => {
+            Some(WorkingSheet { body, sources })
+        }
         Boolean2dOutcome::Result(_) | Boolean2dOutcome::Unassigned { .. } => None,
     })
 }
 
-/// `sheets` united in balanced rounds (each union of two sheets of about the same size);
-/// `None` for none.
-fn united(
+/// Sheets united in the original balanced rounds, retaining the same refusal.
+fn united_working(
     k: &mut Kernel,
-    mut sheets: Vec<Brep>,
-) -> solidcore::Result<std::result::Result<Option<Brep>, Error>> {
+    mut sheets: Vec<WorkingSheet>,
+    history: &mut BoundaryHistory,
+) -> solidcore::Result<std::result::Result<Option<WorkingSheet>, Error>> {
     while sheets.len() > 1 {
         let mut next = Vec::new();
         let mut iter = sheets.into_iter();
         while let Some(a) = iter.next() {
             next.push(match iter.next() {
-                Some(b) => match combine(k, a, b, BooleanOp::Union)? {
+                Some(b) => match combine_working(k, a, b, BooleanOp::Union, history)? {
                     Some(u) => u,
                     None => return Ok(Err(Error::Unsupported("a union of planar faces is empty"))),
                 },
@@ -108,57 +143,120 @@ fn united(
     Ok(Ok(sheets.pop()))
 }
 
-/// Each of `loops` one planar face (the kernel's curves on the regions' frame, its planar
-/// faces).
-fn faces(k: &mut Kernel, loops: &[kp::Loop2]) -> solidcore::Result<Vec<Brep>> {
+/// Every curve is bound to its actual edge by p8's construction map, not edge order.
+fn faces_working(
+    k: &mut Kernel,
+    loops: &[sheet::LoopWithData<Option<usize>>],
+    tracked: bool,
+    history: &mut BoundaryHistory,
+) -> solidcore::Result<Vec<WorkingSheet>> {
     let f = regions_frame();
     loops
         .iter()
         .map(|lp| {
             let curves = lp
+                .boundary
                 .segs
                 .iter()
                 .map(|s| kp::curve_on_frame(k, &f, 0.0, s))
                 .collect::<solidcore::Result<Vec<_>>>()?;
-            create_planar_faces(k, &curves)
+            if !tracked {
+                return create_planar_faces(k, &curves).map(WorkingSheet::plain);
+            }
+            let (body, edges) = create_planar_faces_with_edges(k, &curves)?;
+            let mut sources = EdgeSources::new();
+            for (edge, curve) in edges {
+                let value = lp
+                    .data
+                    .get(curve)
+                    .copied()
+                    .flatten()
+                    .and_then(|id| history.original(id));
+                // The constructor maps production slots. A repeated edge from distinct
+                // slots has every source, while an unknown slot remains unknown.
+                match sources.get(&edge) {
+                    Some(Some(old)) => {
+                        let merged = history.united(Some(old.clone()), value);
+                        sources.insert(edge, merged);
+                    }
+                    Some(None) => {}
+                    None => {
+                        sources.insert(edge, value);
+                    }
+                }
+            }
+            for edge in solidcore::topology::brep::p1::edges(&body, None)? {
+                sources.entry(edge).or_insert(None);
+            }
+            Ok(WorkingSheet {
+                body,
+                sources: Some(sources),
+            })
         })
         .collect()
 }
 
-/// `regions` as one sheet of planar faces on the regions' frame: each region's material united
-/// less its holes united (the kernel's simple loops of it, [`sheet::region_loops`]), the regions
-/// united. A region may lie in another's hole (an island in a ring), which the other's hole must
-/// not take: so each region is made on its own first.
-fn sheet_of(
+/// Each region's material united less its holes, then the regions united. The
+/// normalization and boolean order are shared with the geometry-only recipe.
+fn sheet_of_working(
     k: &mut Kernel,
     regions: &[kp::Region2],
     tol: f64,
-) -> solidcore::Result<std::result::Result<Brep, Error>> {
+    origins: Option<&[sheet::RegionWithData<usize>]>,
+    history: &mut BoundaryHistory,
+) -> solidcore::Result<std::result::Result<WorkingSheet, Error>> {
     let mut sheets = Vec::new();
-    for r in regions {
-        let loops = sheet::region_loops(r, tol)?;
-        let material = faces(k, &loops.material)?;
-        let Some(material) = (match united(k, material)? {
+    for (index, region) in regions.iter().enumerate() {
+        let source = origins.and_then(|all| all.get(index));
+        let outer: Vec<Option<usize>> = match source {
+            Some(source) => source.outer.iter().copied().map(Some).collect(),
+            None => region.outer.segs.iter().map(|_| None).collect(),
+        };
+        let holes: Vec<Vec<Option<usize>>> = match source {
+            Some(source) => source
+                .holes
+                .iter()
+                .map(|h| h.iter().copied().map(Some).collect())
+                .collect(),
+            None => region
+                .holes
+                .iter()
+                .map(|h| h.segs.iter().map(|_| None).collect())
+                .collect(),
+        };
+        let loops = sheet::region_loops_with_data(region, &outer, &holes, tol)?;
+        let material = faces_working(k, &loops.material, origins.is_some(), history)?;
+        let Some(material) = (match united_working(k, material, history)? {
             Ok(m) => m,
             Err(e) => return Ok(Err(e)),
         }) else {
             continue;
         };
-        let holes = faces(k, &loops.holes)?;
-        sheets.push(match united(k, holes)? {
-            Ok(Some(holes)) => match combine(k, material, holes, BooleanOp::Subtract)? {
-                Some(s) => s,
-                None => return Ok(Err(Error::Unsupported("the holes take all the material"))),
-            },
+        let holes = faces_working(k, &loops.holes, origins.is_some(), history)?;
+        sheets.push(match united_working(k, holes, history)? {
+            Ok(Some(holes)) => {
+                match combine_working(k, material, holes, BooleanOp::Subtract, history)? {
+                    Some(s) => s,
+                    None => return Ok(Err(Error::Unsupported("the holes take all the material"))),
+                }
+            }
             Ok(None) => material,
             Err(e) => return Ok(Err(e)),
         });
     }
-    Ok(match united(k, sheets)? {
+    Ok(match united_working(k, sheets, history)? {
         Ok(Some(s)) => Ok(s),
         Ok(None) => Err(Error::Empty),
         Err(e) => Err(e),
     })
+}
+
+fn sheet_of(
+    k: &mut Kernel,
+    regions: &[kp::Region2],
+    tol: f64,
+) -> solidcore::Result<std::result::Result<Brep, Error>> {
+    Ok(sheet_of_working(k, regions, tol, None, &mut BoundaryHistory::untracked())?.map(|s| s.body))
 }
 
 /// The profile check's refusal as the call's, at the zone tolerance of the session's kernel,
@@ -187,6 +285,32 @@ pub fn planar_regions_boolean(
     op: BooleanOp,
     tolerance: f64,
 ) -> Result<Vec<Region2>> {
+    planar_regions_boolean_impl(a, b, op, tolerance, false)
+        .map(|regions| regions.into_iter().map(|r| r.region).collect())
+}
+
+/// The same planar boolean and complete source-boundary sets, aligned with every
+/// output segment after canonical ordering. Indices name the exact input arrays.
+/// None means unknown; no partial set is reported as complete.
+///
+/// # Errors
+/// The same profile, tolerance and kernel errors as the geometry-only operation.
+pub fn planar_regions_boolean_with_history(
+    a: &[Region2],
+    b: &[Region2],
+    op: BooleanOp,
+    tolerance: f64,
+) -> Result<Vec<RegionWithHistory>> {
+    planar_regions_boolean_impl(a, b, op, tolerance, true)
+}
+
+fn planar_regions_boolean_impl(
+    a: &[Region2],
+    b: &[Region2],
+    op: BooleanOp,
+    tolerance: f64,
+    track_history: bool,
+) -> Result<Vec<RegionWithHistory>> {
     if !(tolerance.is_finite() && (MIN_TOLERANCE..=MAX_TOLERANCE).contains(&tolerance)) {
         return Err(Error::Argument);
     }
@@ -195,28 +319,158 @@ pub fn planar_regions_boolean(
         b.iter().map(convert::region2).collect(),
     );
     checked(ka.iter().chain(&kb), tolerance)?;
+    // Count actual segments without allocating metadata. The profile check also
+    // bounds them by MAX_SEGMENTS. If tracing cannot fit its existing read-work
+    // allowance, the same geometry operation continues with unknown history.
+    let track_history = track_history
+        && ka
+            .iter()
+            .chain(&kb)
+            .flat_map(kp::Region2::loops)
+            .try_fold(sheet::READ_WORK, |remaining, lp| {
+                remaining.checked_sub(lp.segs.len())
+            })
+            .is_some();
+    let identity = |regions: &[Region2], operand| {
+        regions
+            .iter()
+            .enumerate()
+            .map(|(region, r)| {
+                let one = |loop_kind, count| {
+                    (0..count)
+                        .map(|segment| {
+                            track_history.then(|| {
+                                vec![InputBoundary {
+                                    operand,
+                                    region,
+                                    loop_kind,
+                                    segment,
+                                    whole: true,
+                                }]
+                            })
+                        })
+                        .collect()
+                };
+                RegionWithHistory {
+                    region: r.clone(),
+                    outer: one(BoundaryLoop::Outer, r.outer.segs.len()),
+                    holes: r
+                        .holes
+                        .iter()
+                        .enumerate()
+                        .map(|(h, lp)| one(BoundaryLoop::Hole(h), lp.segs.len()))
+                        .collect(),
+                }
+            })
+            .collect()
+    };
     match (a.is_empty(), b.is_empty(), op) {
-        (true, _, BooleanOp::Union) => return Ok(b.to_vec()),
+        (true, _, BooleanOp::Union) => return Ok(identity(b, 1)),
         (true, _, _) | (false, true, BooleanOp::Intersect) => return Ok(Vec::new()),
-        (false, true, _) => return Ok(a.to_vec()),
+        (false, true, _) => return Ok(identity(a, 0)),
         _ => {}
     }
+    let mut tokens: Vec<InputBoundary> = Vec::new();
+    let mut keyed = |regions: &[kp::Region2], operand| {
+        regions
+            .iter()
+            .enumerate()
+            .map(|(region, r)| {
+                let mut one = |loop_kind, count| {
+                    (0..count)
+                        .map(|segment| {
+                            let id = tokens.len();
+                            tokens.push(InputBoundary {
+                                operand,
+                                region,
+                                loop_kind,
+                                segment,
+                                whole: true,
+                            });
+                            id
+                        })
+                        .collect()
+                };
+                sheet::RegionWithData {
+                    region: r.clone(),
+                    outer: one(BoundaryLoop::Outer, r.outer.segs.len()),
+                    holes: r
+                        .holes
+                        .iter()
+                        .enumerate()
+                        .map(|(h, lp)| one(BoundaryLoop::Hole(h), lp.segs.len()))
+                        .collect(),
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+    let oa = track_history.then(|| keyed(&ka, 0));
+    let ob = track_history.then(|| keyed(&kb, 1));
+    let mut history = if track_history {
+        BoundaryHistory::default()
+    } else {
+        BoundaryHistory::untracked()
+    };
     let out = run("planar_regions_boolean", |k| {
-        let sa = match sheet_of(k, &ka, tolerance)? {
+        let sa = match sheet_of_working(k, &ka, tolerance, oa.as_deref(), &mut history)? {
             Ok(s) => s,
             Err(e) => return Ok(Out(Err(e))),
         };
-        let sb = match sheet_of(k, &kb, tolerance)? {
+        let sb = match sheet_of_working(k, &kb, tolerance, ob.as_deref(), &mut history)? {
             Ok(s) => s,
             Err(e) => return Ok(Out(Err(e))),
         };
-        let Some(r) = combine(k, sa, sb, op)? else {
-            return Ok(Out(Ok(Vec::new())));
+        let Some(r) = combine_working(k, sa, sb, op, &mut history)? else {
+            return Ok(Out(Ok((Vec::new(), None))));
         };
-        let read = sheet::sheet_regions(k, &r, &regions_frame(), tolerance)?;
-        Ok(Out(Ok(read.regions)))
+        // Carry only actual edge IDs through loop splits and ordering. Expand
+        // source vectors once afterwards under the existing sheet read budget.
+        let read = sheet::sheet_regions_with_data(
+            k,
+            &r.body,
+            &regions_frame(),
+            tolerance,
+            |edge, whole| (edge, whole),
+        )?;
+        Ok(Out(Ok((read.regions, r.sources))))
     })?;
-    Ok(out.0?.iter().map(convert::record_region2).collect())
+    let (regions, sources) = out.0?;
+    let mut remaining = sheet::READ_WORK;
+    let mut origins = |(edge, whole): (EdgeId, bool)| -> Option<Vec<InputBoundary>> {
+        let certificate = sources.as_ref()?.get(&edge)?.as_ref()?;
+        let values = history.sources(certificate)?;
+        if !whole && values.len() != 1 {
+            return None;
+        }
+        remaining = remaining.checked_sub(values.len())?;
+        let mut values = values
+            .iter()
+            .map(|source| {
+                tokens.get(source.input).copied().map(|mut origin| {
+                    origin.whole &= source.whole && whole;
+                    origin
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        if values.is_empty() {
+            return None;
+        }
+        values.sort_unstable();
+        values.dedup();
+        Some(values)
+    };
+    Ok(regions
+        .into_iter()
+        .map(|r| RegionWithHistory {
+            region: convert::record_region2(&r.region),
+            outer: r.outer.into_iter().map(&mut origins).collect(),
+            holes: r
+                .holes
+                .into_iter()
+                .map(|h| h.into_iter().map(&mut origins).collect())
+                .collect(),
+        })
+        .collect())
 }
 
 /// Normalized planar material extruded as one body, keeping every disjoint region and its

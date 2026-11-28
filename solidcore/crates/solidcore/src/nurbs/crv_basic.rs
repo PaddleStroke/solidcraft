@@ -103,6 +103,7 @@
 use std::sync::Arc;
 
 use crate::error::{nurbs::NurbsFailure, Result, SolidError};
+use crate::geom::context::ProofWork;
 use crate::limits;
 use crate::math::Vec3;
 use crate::nurbs::basis_basic::PTOL;
@@ -1149,6 +1150,20 @@ impl ConicType {
     }
 }
 
+/// Shared optional charge for the same conic construction; None does no work.
+pub(crate) fn charge_conic_work(
+    work: Option<&ProofWork>,
+    amount: Option<u64>,
+    operation: &'static str,
+) -> Result<()> {
+    if let Some(work) = work {
+        if !work.charge(amount) {
+            return Err(work.stopped(operation));
+        }
+    }
+    Ok(())
+}
+
 /// Result of [`conic_data`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ConicData {
@@ -1173,6 +1188,17 @@ pub struct ConicData {
 /// than [`CONIC_MAX_TURNS`] turns (upstream loops forever when adding 360 no longer
 /// changes it).
 pub fn conic_data(ctp: ConicType, as_deg: f64, ae_deg: f64) -> Result<ConicData> {
+    conic_data_with_work(ctp, as_deg, ae_deg, None)
+}
+
+/// The identical construction, charging each actual normalization iteration.
+pub(crate) fn conic_data_with_work(
+    ctp: ConicType,
+    as_deg: f64,
+    ae_deg: f64,
+    work: Option<&ProofWork>,
+) -> Result<ConicData> {
+    charge_conic_work(work, Some(34), "nurbs::crv_basic::conic_data")?;
     let angle_tol_deg = CONIC_ANGLE_TOL_DEG; // Don't make this too small.
     if !as_deg.is_finite() || !ae_deg.is_finite() {
         return Err(invalid("nurbs::crv_basic::conic_data", "non-finite angle"));
@@ -1182,6 +1208,7 @@ pub fn conic_data(ctp: ConicType, as_deg: f64, ae_deg: f64) -> Result<ConicData>
     // Get number of arcs.
     let mut turns = 0usize;
     while ae < (as_deg + angle_tol_deg) {
+        charge_conic_work(work, Some(8), "nurbs::crv_basic::conic_data")?;
         ae += 360.0;
         turns += 1;
         if turns > CONIC_MAX_TURNS {
@@ -1192,6 +1219,7 @@ pub fn conic_data(ctp: ConicType, as_deg: f64, ae_deg: f64) -> Result<ConicData>
         }
     }
     while (ae - as_deg) > 360.0 - angle_tol_deg {
+        charge_conic_work(work, Some(8), "nurbs::crv_basic::conic_data")?;
         ae -= 360.0;
         turns += 1;
         if turns > CONIC_MAX_TURNS {
@@ -1642,5 +1670,33 @@ mod tests {
         let mut c = arc();
         let mut d = line2();
         assert!(!curves_are_coincident(&mut c, &mut d, 1e-6).unwrap());
+    }
+
+    #[test]
+    fn optional_conic_work_prices_actual_turns_without_a_maximum_turn_reservation() {
+        use crate::geom::context::ProofWork;
+        let work = ProofWork::new(128);
+        let got = conic_data_with_work(ConicType::Quadratic, 0.0, 360.0, Some(&work)).unwrap();
+        assert_eq!(
+            got,
+            ConicData {
+                ae: 360.0,
+                n: 8,
+                p: 2,
+                m: 11
+            }
+        );
+        assert!(!work.is_disabled());
+        let short = ProofWork::new(128);
+        assert!(matches!(
+            conic_data_with_work(ConicType::Quadratic, 0.0, 360.0 * 10_000.0, Some(&short)),
+            Err(SolidError::OutOfFuel { .. })
+        ));
+        assert!(short.is_disabled());
+        assert!(matches!(
+            conic_data_with_work(ConicType::Quadratic, 0.0, 90.0, Some(&short)),
+            Err(SolidError::OutOfFuel { .. })
+        ));
+        assert_eq!(conic_data(ConicType::Quadratic, 0.0, 360.0).unwrap(), got);
     }
 }

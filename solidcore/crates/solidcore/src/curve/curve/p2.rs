@@ -382,16 +382,18 @@ impl CurveEvaluate for BSplineCurve {
 
     fn evaluate(
         &self,
-        _k: &Kernel,
+        k: &Kernel,
         t: f64,
         num_derivs: usize,
         from_left: bool,
         non_zero_tangents: bool,
     ) -> Result<Vec<Vec3>> {
+        self.charge_query_native(k, num_derivs, non_zero_tangents, OP_EVAL)?;
         Self::evaluate(self, t, num_derivs, from_left, non_zero_tangents)
     }
 
-    fn evaluate_point(&self, _k: &Kernel, t: f64) -> Result<Point3> {
+    fn evaluate_point(&self, k: &Kernel, t: f64) -> Result<Point3> {
+        self.charge_query_point(k, OP_EVAL)?;
         Self::evaluate_point(self, t)
     }
 }
@@ -805,6 +807,56 @@ pub struct LineIntersection {
     pub needs_more_intersections: bool,
 }
 
+/// Reserves a query-only vector's logical growth before allocation or moves.
+/// Logical capacity is independent of allocator/pointer width; None is unchanged.
+pub(crate) fn proof_vec_capacity<T>(
+    work: Option<&crate::geom::context::ProofWork>,
+    values: &mut Vec<T>,
+    logical_capacity: &mut usize,
+    additional: usize,
+    cell_bytes: u64,
+    operation: &'static str,
+) -> Result<()> {
+    let Some(work) = work else {
+        return Ok(());
+    };
+    let need = values.len().checked_add(additional);
+    let Some(need) = need else {
+        work.disable();
+        return Err(work.stopped(operation));
+    };
+    if need > *logical_capacity {
+        let grown = logical_capacity.checked_mul(2).map(|n| n.max(need).max(4));
+        let storage = grown
+            .and_then(|n| u64::try_from(n).ok())
+            .and_then(|n| n.checked_mul(cell_bytes))
+            .and_then(|n| n.checked_add(u64::try_from(values.len()).ok()?.checked_mul(cell_bytes)?))
+            .and_then(|n| n.checked_add(24));
+        if !work.charge(storage) {
+            return Err(work.stopped(operation));
+        }
+        let Some(grown) = grown else {
+            return Err(work.stopped(operation));
+        };
+        let Some(extra) = grown.checked_sub(values.len()) else {
+            work.disable();
+            return Err(work.stopped(operation));
+        };
+        if values.try_reserve_exact(extra).is_err() {
+            work.disable();
+            return Err(work.stopped(operation));
+        }
+        *logical_capacity = grown;
+    }
+    let writes = u64::try_from(additional)
+        .ok()
+        .and_then(|n| n.checked_mul(cell_bytes.checked_add(1)?));
+    if !work.charge(writes) {
+        return Err(work.stopped(operation));
+    }
+    Ok(())
+}
+
 impl Curve {
     /// A temporary evaluation copy retaining owners, concrete kinds and exact
     /// NURBS data, without copy-constructor knot fix-up. Notification identity is
@@ -814,7 +866,55 @@ impl Curve {
     }
 
     /// Copy every owned geometry branch within Surface's shared `MAX_GEOMETRY_NESTING` (32) bound.
+    /// A supported query-owned copy with a fresh memo from its construction.
+    /// Actual source Polar lengths are charged before derived Clone runs.
+    pub(crate) fn clone_for_optional_proof(
+        &self,
+        work: &crate::geom::context::ProofWork,
+    ) -> Result<Option<Self>> {
+        let (base, polar) = match &self.kind {
+            CurveKind::BSpline(c) => (c, Some(0_u64)),
+            CurveKind::Line(c) => (c.base(), Some(0)),
+            CurveKind::Ellipse(c) => {
+                let source = c.polar_converter();
+                let count = u64::try_from(source.natural_knots.len())
+                    .ok()
+                    .and_then(|n| n.checked_add(u64::try_from(source.angles.len()).ok()?))
+                    .and_then(|n| {
+                        n.checked_add(u64::try_from(source.exact_conversion.len()).ok()?)
+                    });
+                (
+                    c.base(),
+                    count.and_then(|n| n.checked_mul(8)?.checked_add(72)),
+                )
+            }
+            CurveKind::Hyperbola(c) => (c.base(), Some(0)),
+            CurveKind::Parabola(c) => (c.base(), Some(0)),
+            _ => return Ok(None),
+        };
+        // Four fixed supported-leaf record envelopes include temporary base,
+        // exact replacement, kind construction and the final Curve move. NURB
+        // and source Polar payloads are independent, input-sized charges.
+        let cost = base
+            .proof_evaluation_clone_work()
+            .and_then(|n| n.checked_add(polar?))
+            .and_then(|n| n.checked_add(4 * 512));
+        if !work.charge(cost) {
+            return Err(work.stopped("curve::clone_for_optional_proof"));
+        }
+        self.clone_for_evaluation_depth_observed(0, Some(work))
+            .map(Some)
+    }
+
     pub(crate) fn clone_for_evaluation_depth(&self, depth: usize) -> Result<Self> {
+        self.clone_for_evaluation_depth_observed(depth, None)
+    }
+
+    fn clone_for_evaluation_depth_observed(
+        &self,
+        depth: usize,
+        work: Option<&crate::geom::context::ProofWork>,
+    ) -> Result<Self> {
         Surface::check_curve_evaluation_copy_depth(self, depth)?;
         let kind = match &self.kind {
             CurveKind::BSpline(c) => CurveKind::BSpline(c.clone_exact()),
@@ -858,7 +958,11 @@ impl Curve {
             kind,
             owner: self.owner,
             notify_identity: IdentitySlot::new(),
-            memo: self.memo.share(),
+            memo: if work.is_some() {
+                CurveMemo::new()
+            } else {
+                self.memo.share()
+            },
             owner_zone_tol_3d: self.owner_zone_tol_3d,
         })
     }
@@ -1458,6 +1562,96 @@ impl Curve {
 
     // ---- evaluation -----------------------------------------------------------------
 
+    fn charge_query_knots(&self, k: &Kernel) -> Result<()> {
+        let Some(work) = k.context.proof_work() else {
+            return Ok(());
+        };
+        let base = match &self.kind {
+            CurveKind::BSpline(c) => Some(c),
+            CurveKind::Ellipse(c) => Some(c.base()),
+            CurveKind::Hyperbola(c) => Some(c.base()),
+            CurveKind::Parabola(c) => Some(c.base()),
+            CurveKind::Line(c) => Some(c.base()),
+            _ => None,
+        };
+        let cost = base
+            .and_then(|c| c.gw_nurb())
+            .and_then(|c| u64::try_from(c.knots().len()).ok())
+            .and_then(|n| n.checked_mul(2)?.checked_add(8))
+            .and_then(|n| n.checked_mul(48)?.checked_add(48));
+        if !work.charge(cost) {
+            return Err(work.stopped(OP_BASE));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn clone_detached_for_optional_proof(
+        &self,
+        work: &crate::geom::context::ProofWork,
+    ) -> Result<Option<Self>> {
+        let Some(mut copy) = self.clone_for_optional_proof(work)? else {
+            return Ok(None);
+        };
+        copy.owner = None;
+        copy.owner_zone_tol_3d = None;
+        Ok(Some(copy))
+    }
+
+    // Only optional_proof_view attaches work to a modeling Kernel. The real
+    // Boolean Kernel and ordinary cache snapshots keep this attachment absent.
+    fn charge_query_evaluation(&self, k: &Kernel, order: usize, nonzero: bool) -> Result<()> {
+        let Some(work) = k.context.proof_work() else {
+            return Ok(());
+        };
+        if let CurveKind::Line(_) = &self.kind {
+            let cost = u64::try_from(order)
+                .ok()
+                .and_then(|n| n.checked_add(1))
+                .and_then(|n| n.checked_mul(50))
+                .and_then(|n| n.checked_add(25));
+            if order <= 3 && work.charge(cost) {
+                return Ok(());
+            }
+            work.disable();
+            return Err(work.stopped(OP_EVAL));
+        }
+        let base = match &self.kind {
+            CurveKind::BSpline(c) => Some(c),
+            CurveKind::Ellipse(c) => Some(c.base()),
+            CurveKind::Hyperbola(c) => Some(c.base()),
+            CurveKind::Parabola(c) => Some(c.base()),
+            _ => None,
+        };
+        let Some(base) = base else {
+            work.disable();
+            return Err(work.stopped(OP_EVAL));
+        };
+        base.charge_query_native(k, order, nonzero, OP_EVAL)
+    }
+
+    // Point's actual native family differs from Evaluate(order=0). Analytic
+    // Line keeps its existing fixed fee; unsupported query kinds stay unknown.
+    fn charge_query_point(&self, k: &Kernel) -> Result<()> {
+        let Some(work) = k.context.proof_work() else {
+            return Ok(());
+        };
+        if let CurveKind::Line(_) = &self.kind {
+            return self.charge_query_evaluation(k, 0, false);
+        }
+        let base = match &self.kind {
+            CurveKind::BSpline(c) => Some(c),
+            CurveKind::Ellipse(c) => Some(c.base()),
+            CurveKind::Hyperbola(c) => Some(c.base()),
+            CurveKind::Parabola(c) => Some(c.base()),
+            _ => None,
+        };
+        let Some(base) = base else {
+            work.disable();
+            return Err(work.stopped(OP_EVAL));
+        };
+        base.charge_query_point(k, OP_EVAL)
+    }
+
     /// Position and derivatives `0..=num_derivs` at `t` (`Evaluate`).
     ///
     /// # Errors
@@ -1472,6 +1666,7 @@ impl Curve {
         from_left: bool,
         non_zero_tangents: bool,
     ) -> Result<Vec<Vec3>> {
+        self.charge_query_evaluation(k, num_derivs, non_zero_tangents)?;
         match &self.kind {
             CurveKind::Composite(_) => Err(SolidError::curve(
                 OP_BASE,
@@ -1543,6 +1738,7 @@ impl Curve {
             | CurveKind::Line(_) => None,
         };
         if let Some(b) = base {
+            self.charge_query_evaluation(k, out.len().saturating_sub(1), non_zero_tangents)?;
             return b.evaluate_into(t, from_left, non_zero_tangents, out);
         }
         let num_derivs = out
@@ -1562,6 +1758,7 @@ impl Curve {
     ///
     /// Those of the kind's evaluator.
     pub fn evaluate_point(&self, k: &Kernel, t: f64) -> Result<Point3> {
+        self.charge_query_point(k)?;
         match &self.kind {
             CurveKind::Composite(_) => Err(SolidError::curve(
                 OP_BASE,
@@ -1645,6 +1842,7 @@ impl Curve {
     ///
     /// `SM_ERR` for a B-spline without NURB.
     pub fn knots(&self, k: &Kernel, interval: Option<&Extent1d>) -> Result<(Vec<f64>, Vec<usize>)> {
+        self.charge_query_knots(k)?;
         match &self.kind {
             CurveKind::Composite(c) => c.knots(k, interval),
             CurveKind::BSpline(c) => c.knots(interval),
@@ -2082,11 +2280,46 @@ impl Curve {
         mode: TrimMode,
         zone_tol_3d: f64,
     ) -> Result<()> {
+        self.trim_with_zone_tol_observed(k, trim_interval, mode, zone_tol_3d, None)
+    }
+
+    /// The same physical trim with optional actual source-domain evidence.
+    pub(crate) fn trim_with_source(
+        &mut self,
+        k: &Kernel,
+        trim_interval: &mut Extent1d,
+        mode: TrimMode,
+        outcome: Option<&mut crate::nurbs::b_spline_curve_n_lib::TrimSourceOutcome>,
+    ) -> Result<()> {
+        self.trim_with_zone_tol_observed(
+            k,
+            trim_interval,
+            mode,
+            crate::geom::tol::zone_tol_3d(k, crate::geom::tol::SmallTopoType::NormalSize),
+            outcome,
+        )
+    }
+
+    fn trim_with_zone_tol_observed(
+        &mut self,
+        k: &Kernel,
+        trim_interval: &mut Extent1d,
+        mode: TrimMode,
+        zone_tol_3d: f64,
+        mut outcome: Option<&mut crate::nurbs::b_spline_curve_n_lib::TrimSourceOutcome>,
+    ) -> Result<()> {
+        if let Some(outcome) = outcome.as_deref_mut() {
+            *outcome = crate::nurbs::b_spline_curve_n_lib::TrimSourceOutcome::Uncertified;
+        }
         self.memo = CurveMemo::new();
         match &mut self.kind {
-            CurveKind::BSpline(c) => c.trim_with_zone_tol(trim_interval, mode, zone_tol_3d),
+            CurveKind::BSpline(c) => {
+                c.trim_with_zone_tol_observed(trim_interval, mode, zone_tol_3d, outcome)
+            }
             CurveKind::Hyperbola(c) => c.base.trim_with_zone_tol(trim_interval, mode, zone_tol_3d),
-            CurveKind::Ellipse(c) => c.trim_with_zone_tol(k, trim_interval, mode, zone_tol_3d),
+            CurveKind::Ellipse(c) => {
+                c.trim_with_zone_tol_observed(k, trim_interval, mode, zone_tol_3d, outcome)
+            }
             CurveKind::Parabola(c) => {
                 c.base_mut()
                     .trim_with_zone_tol(trim_interval, mode, zone_tol_3d)
@@ -2103,7 +2336,7 @@ impl Curve {
                 c.base_mut()
                     .trim_with_zone_tol(k, trim_interval, mode, zone_tol_3d)
             }
-            CurveKind::Line(c) => c.trim_owned(self.owner, trim_interval, mode),
+            CurveKind::Line(c) => c.trim_owned_observed(self.owner, trim_interval, mode, outcome),
         }
     }
 
@@ -2122,16 +2355,47 @@ impl Curve {
         Ok(true)
     }
 
+    /// Canonical optional output/comparison work; reads lengths, never scans data.
+    pub(crate) fn source_domain_observation_work(&self) -> Option<usize> {
+        let base = match self.kind() {
+            CurveKind::BSpline(c) => c,
+            CurveKind::Line(c) => c.base(),
+            CurveKind::Ellipse(c) => c.base(),
+            _ => return None,
+        };
+        // At most two actual knot-write comparisons per knot; twelve u64
+        // words cover the three tagged ranges and copy/status output state.
+        base.gw_nurb().map_or(Some(12 * 8), |n| {
+            n.knots()
+                .len()
+                .checked_mul(2)
+                .and_then(|n| n.checked_add(12 * 8))
+        })
+    }
+
     /// `Copy` (base: `SM_ERR`): an exact copy without owner.
     ///
     /// # Errors
     ///
     /// `SM_ERR` for kinds without `Copy` (Hermite curves).
     pub fn copy(&self, k: &Kernel) -> Result<Self> {
+        self.copy_with_source(k, None)
+    }
+
+    /// The same copy, with optional evidence from its actual native construction.
+    pub(crate) fn copy_with_source(
+        &self,
+        k: &Kernel,
+        mut outcome: Option<&mut crate::nurbs::b_spline_curve_n_lib::CopySourceOutcome>,
+    ) -> Result<Self> {
+        if let Some(outcome) = outcome.as_deref_mut() {
+            *outcome = crate::nurbs::b_spline_curve_n_lib::CopySourceOutcome::Uncertified;
+        }
+
         match &self.kind {
             CurveKind::Composite(c) => c.copy(k).map(Self::from),
-            CurveKind::BSpline(c) => Ok(Self::from(c.copy())),
-            CurveKind::Ellipse(c) => c.copy(k).map(Self::from),
+            CurveKind::BSpline(c) => Ok(Self::from(c.copy_with_source(outcome))),
+            CurveKind::Ellipse(c) => c.copy_with_source(k, outcome).map(Self::from),
             CurveKind::Hyperbola(c) => Ok(Self::from(c.copy())),
             CurveKind::Parabola(c) => Ok(Self::from(c.copy())),
             CurveKind::Hermite(_) | CurveKind::Conic(_) | CurveKind::Iso(_) => {
@@ -2143,7 +2407,7 @@ impl Curve {
             CurveKind::CrvOnSurf(c) => c.copy(k).map(Self::from),
             // SmCrvOnSurf::Copy (not overridden): `new SmCrvOnSurf(*this)`, the base only
             CurveKind::TangentField(c) => c.base().copy(k).map(Self::from),
-            CurveKind::Line(c) => Ok(Self::from(c.copy())),
+            CurveKind::Line(c) => Ok(Self::from(c.copy_with_source(outcome))),
         }
     }
 

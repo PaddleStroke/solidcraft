@@ -119,6 +119,7 @@
 use crate::curve::crv_on_surf::CrvOnSurf;
 use crate::error::geom::GeomFailure;
 use crate::error::{Result, SolidError};
+use crate::geom::context::ProofWork;
 use crate::geom::extent3d::Extent3d;
 use crate::geom::geom_utility::p1::{line_closest_point, point_project_to_plane};
 use crate::geom::solution_array::{
@@ -461,12 +462,14 @@ pub fn resolve_object_zone_tol_3d<O>(
 }
 
 /// The state of a global solve (`SmGlobalSolver`'s data members).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct GlobalSolver<'t, O> {
     /// Opt-in upstream corrections, copied from the operation's kernel.
     pub fixes: crate::kernel::UpstreamFixes,
     /// Cooperative cancellation token copied from the operation's kernel.
     pub cancel: Option<crate::kernel::CancelToken>,
+    /// Transient private query observer; never serialized or a geometry fuel source.
+    pub(crate) proof_work: Option<ProofWork>,
     /// `m_eSolverOperation`: behaviour of the local solves.
     pub operation: SolverOperation,
     /// `m_eOperationCategory`: summary of [`GlobalSolver::operation`], set by
@@ -505,6 +508,31 @@ pub struct GlobalSolver<'t, O> {
     pub branches_visited: u64,
 }
 
+// The transient observer is deliberately omitted, including in ordinary None flows.
+impl<O: std::fmt::Debug> std::fmt::Debug for GlobalSolver<'_, O> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GlobalSolver")
+            .field("fixes", &self.fixes)
+            .field("cancel", &self.cancel)
+            .field("operation", &self.operation)
+            .field("category", &self.category)
+            .field("projected_operation", &self.projected_operation)
+            .field("solution_requested", &self.solution_requested)
+            .field("num_trees", &self.num_trees)
+            .field("num_variables", &self.num_variables)
+            .field("trees", &self.trees)
+            .field("tolerance_3d", &self.tolerance_3d)
+            .field("best_answer_so_far_sq", &self.best_answer_so_far_sq)
+            .field("at_distance", &self.at_distance)
+            .field("at_distance_sq", &self.at_distance_sq)
+            .field("opt_vectors", &self.opt_vectors)
+            .field("solutions", &self.solutions)
+            .field("solve_depth", &self.solve_depth)
+            .field("branches_visited", &self.branches_visited)
+            .finish()
+    }
+}
+
 /// Height of the subtree of `tree` below `top` along the child links (a leaf
 /// is 0), with an explicit stack; `InvalidInput` when the links are cyclic.
 /// Each node is measured once, so shared children cost nothing extra.
@@ -512,13 +540,38 @@ fn subtree_height<O: Copy + PartialEq>(
     tree: &Tree<O>,
     top: NodeId,
     operation: &'static str,
+    work: Option<&ProofWork>,
 ) -> Result<usize> {
     const OPEN: u8 = 1;
     const DONE: u8 = 2;
     let n = tree.nodes().len();
+    let stack_capacity = if let Some(work) = work {
+        let capacity = n.checked_mul(4).and_then(|n| n.checked_add(4));
+        // State n + canonical heights8n + DFS slots16(4n+4) + headers72;
+        // <=9n+1 initialization/pop/child visits, even with shared DAG children.
+        let cost = u64::try_from(n)
+            .ok()
+            .and_then(|n| n.checked_mul(82))
+            .and_then(|n| n.checked_add(137))
+            .filter(|_| capacity.is_some());
+        if !work.charge(cost) {
+            return Err(work.stopped(operation));
+        }
+        capacity
+    } else {
+        None
+    };
     let mut state = vec![0u8; n];
     let mut height = vec![0usize; n];
-    let mut stack = vec![(top, false)];
+    let mut stack = match stack_capacity {
+        Some(capacity) => {
+            // Some-only exact reserve avoids hidden stack-growth allocations.
+            let mut stack = Vec::with_capacity(capacity);
+            stack.push((top, false));
+            stack
+        }
+        None => vec![(top, false)],
+    };
     let slot = |id: NodeId| {
         (id.0 < n).then_some(id.0).ok_or(SolidError::InvalidInput {
             operation,
@@ -582,6 +635,7 @@ impl<'t, O: SolutionObject> GlobalSolver<'t, O> {
         Self {
             fixes: crate::kernel::UpstreamFixes::default(),
             cancel: None,
+            proof_work: None,
             operation: SolverOperation::Intersect,
             category: OperationCategory::Other,
             projected_operation: false,
@@ -598,6 +652,90 @@ impl<'t, O: SolutionObject> GlobalSolver<'t, O> {
             solve_depth: 0,
             branches_visited: 0,
         }
+    }
+
+    /// Attaches only the private query's shared owner, before its solve setup.
+    /// Native branch-counter resets never replace this owner.
+    pub(crate) fn set_proof_work(&mut self, work: Option<&ProofWork>) -> Result<()> {
+        const OP: &str = "geom::global_solver::GlobalSolver::set_proof_work";
+        if let Some(previous) = &self.proof_work {
+            if !work.is_some_and(|next| previous.same_operation(next)) {
+                previous.disable();
+                if let Some(next) = work {
+                    next.disable();
+                }
+                return Err(previous.stopped(OP));
+            }
+        }
+        if let Some(work) = work {
+            // Optional owner/tag storage, one shared clone and fixed attachment.
+            if !work.charge(Some(32)) {
+                return Err(work.stopped(OP));
+            }
+        }
+        self.proof_work = work.cloned();
+        Ok(())
+    }
+
+    fn charge_proof(&self, amount: Option<u64>, operation: &'static str) -> Result<()> {
+        if let Some(work) = &self.proof_work {
+            if !work.charge(amount) {
+                return Err(work.stopped(operation));
+            }
+        }
+        Ok(())
+    }
+
+    fn reserve_proof_setup(
+        &self,
+        operation: SolverOperation,
+        requested: SolutionRequested,
+        vectors: usize,
+        existing_solutions: usize,
+    ) -> Result<()> {
+        const OP: &str = "geom::global_solver::GlobalSolve::solve_it";
+        let Some(work) = &self.proof_work else {
+            return Ok(());
+        };
+        // Only the actual private point/curve query attaches an owner. These are
+        // its proved bounds, not a new restriction on ordinary geometry solvers.
+        if operation != SolverOperation::Minimize
+            || requested != SolutionRequested::Single
+            || self.num_trees != 2
+            || self.num_variables != 1
+            || vectors != 0
+            || existing_solutions > 1
+        {
+            work.disable();
+            return Err(work.stopped(OP));
+        }
+        let cost = u64::try_from(vectors)
+            .ok()
+            .and_then(|n| n.checked_mul(25))
+            .and_then(|n| n.checked_add(24 + 256));
+        self.charge_proof(cost, OP)
+    }
+
+    fn reserve_proof_single_add(&self, solution: &Solution<O>) -> Result<()> {
+        const OP: &str = "geom::global_solver::GlobalSolve::add_sorted_solution";
+        let Some(work) = &self.proof_work else {
+            return Ok(());
+        };
+        if self.operation != SolverOperation::Minimize
+            || self.solution_requested != SolutionRequested::Single
+            || self.num_variables != 1
+            || self.solutions.len() > 1
+            || solution.num_variables > 1
+            || solution.num_objects > 1
+        {
+            work.disable();
+            return Err(work.stopped(OP));
+        }
+        // S=512 canonical cells: primary capacity <=4S, split_off's separate
+        // tail <=S+24, <=8S initialized/copied solution records, headers/scalars.
+        // Reserve the WHOLE add before any best-value/sort mutation. The primary
+        // length stays <=1, temporarily <=2, so combining has at most two passes.
+        self.charge_proof(Some(13 * 512 + 256), OP)
     }
 
     /// A solver over one tree (`SmGlobalSolver(SmTree*, ULONG)`), zero
@@ -751,7 +889,12 @@ impl<'t, O: SolutionObject> GlobalSolver<'t, O> {
         let mut total = 0usize;
         for (i, slot) in branch.iter().enumerate() {
             if let Some(top) = *slot {
-                total = total.saturating_add(subtree_height(self.tree(i)?, top, OP)?);
+                total = total.saturating_add(subtree_height(
+                    self.tree(i)?,
+                    top,
+                    OP,
+                    self.proof_work.as_ref(),
+                )?);
             }
         }
         if total > MAX_SOLVE_DEPTH {
@@ -1654,10 +1797,13 @@ fn combine_min_max<O: SolutionObject>(
 ) -> Result<Option<Solution<O>>> {
     // (not upstream) the contact of a range the two make, or one takes the other into
     let both = min.contact.absorbed(max.contact);
+    // (and a limit root either holds leaves its mark on what the two make)
+    let limit_root = min.limit_root || max.limit_root;
     let ranged = |s: Solution<O>| Solution {
         contact: both,
         unique: None,
         shared_contact: None,
+        limit_root,
         ..s
     };
     // when 1st solution is rangeOfValues
@@ -1696,12 +1842,14 @@ fn combine_min_max<O: SolutionObject>(
                     max.contact = both;
                     max.unique = None;
                     max.shared_contact = None;
+                    max.limit_root = limit_root;
 
                     // change min solution into a range that stops at the point solution
                     min.end = max.start;
                     min.contact = both;
                     min.unique = None;
                     min.shared_contact = None;
+                    min.limit_root = limit_root;
                     return Ok(None);
                 }
                 // combine point into range
@@ -1775,6 +1923,11 @@ where
     O: SolutionObject + 't,
     S: GlobalSolve<'t, O> + ?Sized,
 {
+    // Actual visits, not node counts: a DAG may revisit a shared subtree.
+    // Branch records256 + bounded cull/readiness/ranking/copy/dispatch slots64.
+    solver
+        .solver()
+        .charge_proof(Some(320), "geom::global_solver::solve_branch")?;
     let depth = solver.solver().solve_depth;
     if depth > MAX_SOLVE_DEPTH {
         return Err(SolidError::invalid_input(
@@ -1925,6 +2078,12 @@ pub trait GlobalSolve<'t, O: SolutionObject + 't> {
             opt_vectors,
         } = *request;
         let s = self.solver_mut();
+        s.reserve_proof_setup(
+            operation,
+            solution_requested,
+            opt_vectors.len(),
+            solutions.len(),
+        )?;
 
         // m_bProjectedOperation value from eSolverOperation
         s.projected_operation = matches!(
@@ -2007,10 +2166,15 @@ pub trait GlobalSolve<'t, O: SolutionObject + 't> {
         sort_key: SortKey,
         combine_contiguous_ranges: bool,
     ) -> Result<()> {
+        self.solver().charge_proof(
+            Some(1),
+            "geom::global_solver::GlobalSolve::add_sorted_solution",
+        )?;
         // skip BigSolutions
         if solution.start.solution_value == BIG_DOUBLE {
             return Ok(());
         }
+        self.solver().reserve_proof_single_add(solution)?;
 
         let s = self.solver_mut();
         let op = s.operation;
@@ -2097,6 +2261,7 @@ pub trait GlobalSolve<'t, O: SolutionObject + 't> {
                 // (not upstream) the solution kept carries both contacts
                 let mut kept = if keep { *solution } else { *test };
                 kept.contact = test.contact.merged(solution.contact);
+                kept.limit_root = test.limit_root || solution.limit_root;
                 kept.shared_contact = None;
                 // (a unique box is a crossing's, by the root it carries: a merged solution
                 // that is not a crossing carries none, whichever of the two was kept)
@@ -2735,6 +2900,44 @@ mod tests {
         }
     }
 
+    /// A limit root (`Solution::limit_root`) the solver's combination takes in leaves its
+    /// mark on what it makes: a range absorbing a point, a range taking in a range, and both
+    /// ranges a tight point splits a range into; a point that is no limit root leaves none.
+    #[test]
+    fn a_combination_keeps_a_limit_root_mark() {
+        for marked in [true, false] {
+            let mark = |mut s: Solution<Obj>, on: bool| {
+                s.limit_root = on;
+                s
+            };
+            // a loose point inside a range, absorbed; a range inside a range
+            for inner in [single(1e-3, 1.0), range(0.0, 0.5, 0.0, 1.5)] {
+                let mut solver: GlobalSolver<'_, Obj> = GlobalSolver::new();
+                solver.set_solver_operation(SolverOperation::Find);
+                solver.set_3d_tolerance(1e-6);
+                for s in [range(0.0, 0.0, 0.0, 2.0), mark(inner, marked)] {
+                    solver
+                        .add_sorted_solution(&s, SortKey::ByFirstParameter, true)
+                        .unwrap();
+                }
+                assert_eq!(solver.solutions.len(), 1);
+                assert_eq!(solver.solutions.get(0).unwrap().limit_root, marked);
+            }
+            // a tight point splitting a range: both ranges carry the mark
+            let mut solver: GlobalSolver<'_, Obj> = GlobalSolver::new();
+            solver.set_3d_tolerance(1e-6);
+            for s in [range(1e-3, 0.0, 1e-3, 2.0), mark(single(1e-9, 1.0), marked)] {
+                solver
+                    .add_sorted_solution(&s, SortKey::ByFirstParameter, true)
+                    .unwrap();
+            }
+            assert_eq!(solver.solutions.len(), 2);
+            for s in solver.solutions.as_slice() {
+                assert_eq!(s.limit_root, marked);
+            }
+        }
+    }
+
     /// A duplicate `add_sorted_solution` drops leaves the solution it keeps with the
     /// merged contact of both, whichever of the two it keeps.
     #[test]
@@ -3047,5 +3250,140 @@ mod tests {
                 (SolutionPairType::Identical, Some(PreferredSolution::First)),
             );
         }
+    }
+
+    #[test]
+    fn optional_proof_validation_prices_shared_dag_storage_before_arrays() {
+        let mut tree = split_tree(0.0);
+        let root = tree.top_node().unwrap();
+        let child = tree.node(root).unwrap().child1.unwrap();
+        tree.node_mut(root).unwrap().child2 = Some(child);
+        let before = subtree_height(&tree, root, "test DAG", None).unwrap();
+        let ample = ProofWork::new(16_000);
+        assert_eq!(
+            subtree_height(&tree, root, "test DAG", Some(&ample)).unwrap(),
+            before
+        );
+        let short = ProofWork::new(100);
+        assert!(matches!(
+            subtree_height(&tree, root, "test DAG", Some(&short)),
+            Err(SolidError::OutOfFuel { .. })
+        ));
+        assert!(short.is_disabled());
+        assert_eq!(
+            subtree_height(&tree, root, "test DAG", None).unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn optional_proof_branches_spend_shared_work_without_counter_resets() {
+        struct Repeated {
+            base: GlobalSolver<'static, Obj>,
+        }
+        impl GlobalSolve<'static, Obj> for Repeated {
+            fn solver(&self) -> &GlobalSolver<'static, Obj> {
+                &self.base
+            }
+            fn solver_mut(&mut self) -> &mut GlobalSolver<'static, Obj> {
+                &mut self.base
+            }
+            fn branch_may_contain_answers(&mut self, _: &Branch) -> Result<bool> {
+                Ok(true)
+            }
+            fn are_ready_for_local_solve(&self, _: &Branch) -> Result<bool> {
+                Ok(false)
+            }
+            fn subdivide(&mut self, branch: &Branch) -> Result<(Branch, Branch)> {
+                // Deliberately revisit the same logical subtree; node count is
+                // not a bound on the number of actual solver visits.
+                Ok((*branch, *branch))
+            }
+        }
+        let work = ProofWork::new(1_000);
+        let mut solver = Repeated {
+            base: GlobalSolver::new(),
+        };
+        solver.base.set_proof_work(Some(&work)).unwrap();
+        let branch = [None; MAX_SOLVER_TREES];
+        assert!(matches!(
+            solver.solve_branch(&branch),
+            Err(SolidError::OutOfFuel { .. })
+        ));
+        assert!(solver.base.branches_visited > 0);
+        assert!(solver.base.branches_visited < MAX_SOLVE_BRANCHES);
+        assert_eq!(solver.base.solve_depth, 0);
+        assert!(work.is_disabled());
+        solver.base.branches_visited = 0;
+        assert!(matches!(
+            solver.solve_branch(&branch),
+            Err(SolidError::OutOfFuel { .. })
+        ));
+        assert_eq!(solver.base.branches_visited, 0);
+        assert_eq!(solver.base.solve_depth, 0);
+        let replacement = ProofWork::new(16_000);
+        assert!(solver.base.set_proof_work(Some(&replacement)).is_err());
+        assert!(
+            replacement.is_disabled(),
+            "a fresh allowance cannot replace the spent owner"
+        );
+    }
+
+    fn proof_single_solver() -> GlobalSolver<'static, Obj> {
+        let mut solver = GlobalSolver::new();
+        solver.operation = SolverOperation::Minimize;
+        solver.category = OperationCategory::Minimize;
+        solver.solution_requested = SolutionRequested::Single;
+        solver.num_variables = 1;
+        solver.tolerance_3d = 1.0e-8;
+        solver.best_answer_so_far_sq = BIG_DOUBLE;
+        solver
+    }
+
+    #[test]
+    fn optional_proof_single_insertion_retains_exact_sort_and_opaque_debug() {
+        let mut ordinary = proof_single_solver();
+        let mut observed = proof_single_solver();
+        let work = ProofWork::new(32_000);
+        observed.set_proof_work(Some(&work)).unwrap();
+        for value in [single(2.0, 0.2), single(1.0, 0.1)] {
+            // The second insertion is before the existing item, exercising
+            // insert_at's hidden split_off tail despite spare primary capacity.
+            ordinary
+                .add_sorted_solution(&value, SortKey::BySolutionValue, true)
+                .unwrap();
+            observed
+                .add_sorted_solution(&value, SortKey::BySolutionValue, true)
+                .unwrap();
+        }
+        assert_eq!(ordinary.solutions.len(), 1);
+        assert_eq!(
+            observed.solutions.get_at(0).unwrap().start.solution_value,
+            1.0
+        );
+        assert_eq!(format!("{ordinary:?}"), format!("{observed:?}"));
+        assert!(!format!("{observed:?}").contains("proof_work"));
+        assert!(!work.is_disabled());
+    }
+
+    #[test]
+    fn optional_proof_declines_before_consuming_or_mutating_the_single_sort() {
+        let mut solver = proof_single_solver();
+        solver
+            .add_sorted_solution(&single(2.0, 0.2), SortKey::BySolutionValue, true)
+            .unwrap();
+        let work = ProofWork::new(1_000);
+        solver.set_proof_work(Some(&work)).unwrap();
+        let before = format!("{solver:?}");
+        assert!(matches!(
+            solver.add_sorted_solution(&single(1.0, 0.1), SortKey::BySolutionValue, true),
+            Err(SolidError::OutOfFuel { .. })
+        ));
+        assert_eq!(format!("{solver:?}"), before);
+        assert!(work.is_disabled());
+        assert_eq!(
+            solver.solutions.get_at(0).unwrap().start.solution_value,
+            2.0
+        );
     }
 }

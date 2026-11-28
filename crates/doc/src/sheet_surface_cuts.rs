@@ -1580,7 +1580,7 @@ pub struct Loose {
 /// What [`left`] leaves of a panel's region.
 enum Left {
     /// The piece that holds the panel's joints, and the pieces parted from it, which hold none.
-    Kept(Region2, Vec<Region2>),
+    Kept(Region2, crate::sheet_surface::RegionOrigins, Vec<Region2>),
     /// Pieces that each hold some of the panel's joints, or nothing at all: the panel stays whole
     /// and the cut is a cut of the sheet's, so that each piece folds and lies flat where the panel
     /// does, and a panel cut away keeps its record, its joints and its place.
@@ -1591,7 +1591,13 @@ enum Left {
 /// panel's joints (the points `holders` on them; the largest piece where it has none), and the
 /// pieces parted from it; or none, where pieces each hold some of them or nothing is left. What
 /// goes through clear of the region's outline and holes is a hole of it as it is, its curves kept.
-fn left(region: &Region2, through: &[Region2], holders: &[Vec2], tol: f64) -> std::result::Result<Left, String> {
+fn left(
+    region: &Region2,
+    origins: crate::sheet_surface::RegionOrigins,
+    through: &[Region2],
+    holders: &[Vec2],
+    tol: f64,
+) -> std::result::Result<Left, String> {
     let outline = |t: &Region2| Region2 { outer: t.outer.clone(), holes: Vec::new() };
     if !through.is_empty() && through.iter().all(|t| holds_clear(region, &outline(t))) {
         let mut out = region.clone();
@@ -1611,11 +1617,34 @@ fn left(region: &Region2, through: &[Region2], holders: &[Vec2], tol: f64) -> st
                 Region2 { outer, holes }
             })
             .collect();
-        return Ok(Left::Kept(out, parted));
+        let mut origins = origins;
+        let mut history_work = crate::sheet::FlatWork::new();
+        for t in through {
+            if history_work.charge_history(
+                t.outer
+                    .segs
+                    .len()
+                    .checked_mul(std::mem::size_of::<Option<Vec<crate::sheet_surface::ConvertedEdge>>>())
+                    .and_then(|n| n.checked_add(std::mem::size_of::<Vec<Option<Vec<crate::sheet_surface::ConvertedEdge>>>>())),
+            ) {
+                origins.holes.push(vec![None; t.outer.segs.len()]);
+            } else {
+                origins = crate::sheet_surface::RegionOrigins::default();
+                break;
+            }
+        }
+        return Ok(Left::Kept(out, origins, parted));
     }
-    let mut left = planar_regions_boolean(std::slice::from_ref(region), through, BoolOp::Cut, tol).map_err(|e| e.to_string())?;
+    let result = crate::sheet_surface::compose_regions(
+        solidcraft_kernel::planar_regions_boolean_with_history(std::slice::from_ref(region), through, BoolOp::Cut, tol).map_err(|e| e.to_string())?,
+        &[origins],
+        &[],
+        &mut crate::sheet::FlatWork::new(),
+    );
+    let mut left = result.geometry;
+    let mut origins = result.origins;
     if left.len() <= 1 {
-        return Ok(left.pop().map_or(Left::Apart, |one| Left::Kept(one, Vec::new())));
+        return Ok(left.pop().zip(origins.pop()).map_or(Left::Apart, |(one, origin)| Left::Kept(one, origin, Vec::new())));
     }
     // The piece nearest each joint's point holds it.
     let gap = |r: &Region2, p: Vec2| {
@@ -1636,17 +1665,23 @@ fn left(region: &Region2, through: &[Region2], holders: &[Vec2], tol: f64) -> st
         _ => return Ok(Left::Apart),
     };
     let kept = left.swap_remove(keep);
-    Ok(Left::Kept(kept, left))
+    let origin = origins.swap_remove(keep);
+    Ok(Left::Kept(kept, origin, left))
 }
 
 /// What is left of panel `p` of `sk` without `through` (in the panel's chart): the piece that
 /// holds its joints, and the pieces parted from it, as [`left`] reads them. Pieces that each hold
 /// some of its joints, or nothing left, are an error here: the body's cut keeps that panel whole
 /// (see [`Left::Apart`]).
-pub(crate) fn left_of_panel(sk: &SurfaceSheet, p: usize, through: &[Region2], tol: f64) -> std::result::Result<(Region2, Vec<Region2>), String> {
+pub(crate) fn left_of_panel(
+    sk: &SurfaceSheet,
+    p: usize,
+    through: &[Region2],
+    tol: f64,
+) -> std::result::Result<(Region2, crate::sheet_surface::RegionOrigins, Vec<Region2>), String> {
     let panel = sk.sheet.panels.get(p).ok_or_else(|| format!("the sheet has no panel {p}"))?;
-    match left(&panel.region, through, &holders(sk, p), tol)? {
-        Left::Kept(kept, parted) => Ok((kept, parted)),
+    match left(&panel.region, sk.panel_origins(p), through, &holders(sk, p), tol)? {
+        Left::Kept(kept, origins, parted) => Ok((kept, origins, parted)),
         Left::Apart => Err(format!("cuts {} apart into pieces that each hold a joint, or leaves nothing of it", panel.name)),
     }
 }
@@ -1724,7 +1759,7 @@ fn onto_panels(
     if let Some(walls) = walls.filter(|w| !w.is_empty()) {
         let fold =
             if sk.unfolded { None } else { Some(crate::sheet_surface_convert::fold_onto(&sk.sheet, &dev, &sk.places).map_err(|e| e.to_string())?) };
-        let pieces = crate::sheet_surface::pieces(&dev, &mut FlatWork::new()).map_err(|e| e.to_string())?;
+        let pieces = crate::sheet_surface::pieces(&dev, &[], &[], &mut FlatWork::new()).map_err(|e| e.to_string())?.geometry;
         let flat = if sk.unfolded { flat_gone(sk, (was, &qa), (now, &qb), walls, tol)? } else { None };
         if let Some(gone) = &flat {
             for g in gone {
@@ -1785,18 +1820,18 @@ fn onto_panels(
             .unwrap_or_default();
         // What the feature gave back to the panel within its holes (a round in an inside corner
         // of a cut-out) is the panel's own: its region grows by it, and its walls are read there.
-        let (region, here) = match rest.as_deref() {
+        let (region, origins, here) = match rest.as_deref() {
             Some(w) if plane => {
                 let others: Vec<usize> = w.iter().copied().filter(|f| !here.contains(f)).collect();
                 match given_back(sk, p, now, &qb, &slab, frame, &others, tol, sag)? {
-                    Some(grown) => {
+                    Some((grown, origins)) => {
                         let here = within(&qb, &slab, &grown, w, tol * 100.0, sag).map_err(|e| e.to_string())?;
-                        (grown, here)
+                        (grown, origins, here)
                     }
-                    None => (panel.region.clone(), here),
+                    None => (panel.region.clone(), sk.panel_origins(p), here),
                 }
             }
-            _ => (panel.region.clone(), here),
+            _ => (panel.region.clone(), sk.panel_origins(p), here),
         };
         taken.claimed.extend(here.iter().copied());
         if !plane {
@@ -1806,15 +1841,13 @@ fn onto_panels(
             }
             let through = shadow(now, &qb, &slab, &here, &panel.name, around(&panel.region), tol, sag)?;
             taken.shadowed = true;
-            let Left::Kept(kept, parted) = left(&panel.region, &through, &holders(sk, p), tol)? else {
+            let Left::Kept(kept, origins, parted) = left(&panel.region, sk.panel_origins(p), &through, &holders(sk, p), tol)? else {
                 return Err(format!("cuts {} apart: not supported yet on a roll", panel.name));
             };
             if !parted.is_empty() {
                 return Err(format!("cuts {} apart: not supported yet on a roll", panel.name));
             }
-            if let Some(x) = out.sheet.panels.get_mut(p) {
-                x.region = kept;
-            }
+            out.set_panel_region(p, kept, origins).map_err(|e| e.to_string())?;
             continue;
         }
         // A bore lying in the panel takes its shadow, read in closed form (see [`lying`]); the
@@ -1937,10 +1970,8 @@ fn onto_panels(
             taken.shadowed = true;
             union(through.into_iter().chain(bands.iter().cloned()).collect(), tol).map_err(|e| e.to_string())?
         };
-        if region != panel.region
-            && let Some(x) = out.sheet.panels.get_mut(p)
-        {
-            x.region = region.clone();
+        if region != panel.region {
+            out.set_panel_region(p, region.clone(), origins.clone()).map_err(|e| e.to_string())?;
         }
         // These regions are the material the cut removed. The slack for comparing whole faces
         // above can exceed a real corner round on a large panel.
@@ -1961,11 +1992,9 @@ fn onto_panels(
             for g in through {
                 own.push(across_laps(sk, p, g, &rips, tol)?);
             }
-            match left(&region, &own, &holders(sk, p), tol)? {
-                Left::Kept(kept, parted) => {
-                    if let Some(x) = out.sheet.panels.get_mut(p) {
-                        x.region = kept;
-                    }
+            match left(&region, origins, &own, &holders(sk, p), tol)? {
+                Left::Kept(kept, origins, parted) => {
+                    out.set_panel_region(p, kept, origins).map_err(|e| e.to_string())?;
                     out.loose.extend(parted.into_iter().map(|region| Loose { panel: p, region }));
                 }
                 Left::Apart => {
@@ -2051,7 +2080,7 @@ fn given_back(
     others: &[usize],
     tol: f64,
     sag: f64,
-) -> std::result::Result<Option<Region2>, String> {
+) -> std::result::Result<Option<(Region2, crate::sheet_surface::RegionOrigins)>, String> {
     let Some(panel) = sk.sheet.panels.get(p) else { return Ok(None) };
     if others.is_empty() || panel.region.holes.is_empty() {
         return Ok(None);
@@ -2075,8 +2104,14 @@ fn given_back(
         return Ok(None);
     }
     // Not [`union`]: what was given back lies in a hole's box, which that reads as apart.
-    let grown = planar_regions_boolean(std::slice::from_ref(&panel.region), &o.near, BoolOp::Union, tol).map_err(|e| e.to_string())?;
-    Ok(match <[Region2; 1]>::try_from(grown) {
+    let grown = crate::sheet_surface::compose_regions(
+        solidcraft_kernel::planar_regions_boolean_with_history(std::slice::from_ref(&panel.region), &o.near, BoolOp::Union, tol)
+            .map_err(|e| e.to_string())?,
+        &[sk.panel_origins(p)],
+        &[],
+        &mut crate::sheet::FlatWork::new(),
+    );
+    Ok(match <[(Region2, crate::sheet_surface::RegionOrigins); 1]>::try_from(grown.geometry.into_iter().zip(grown.origins).collect::<Vec<_>>()) {
         Ok([one]) => Some(one),
         Err(_) => None,
     })

@@ -5,6 +5,67 @@ use super::refusal::CornerTailRefusal;
 use crate::math::Vec2;
 use crate::prism::profile::{Loop2, Region2, Seg2};
 
+/// One original outer segment consumed by a contour edit. `whole` is false when
+/// the complete input is not certified retained. These are construction indices, not matches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CornerTailParent {
+    /// Index in the original input contour's outer loop.
+    pub segment: usize,
+    /// Whether this output certifies that the complete original parent remains.
+    pub whole: bool,
+}
+
+/// Geometry and optional complete parent sets for its actual outer segments.
+/// The current construction consumes at most three original contour segments when
+/// removing a previous step; splitting that result adds no parents. New bridges
+/// and any set that cannot fit those three slots are explicitly unknown.
+#[derive(Clone, Debug)]
+pub struct CornerTailWithHistory {
+    /// The same edited geometry returned by the geometry-only entrypoint.
+    pub region: Region2,
+    /// Complete original-input parents per output segment; missing or None is unknown.
+    pub outer: Vec<Option<[Option<CornerTailParent>; 3]>>,
+}
+
+fn identity(segment: usize) -> [Option<CornerTailParent>; 3] {
+    [
+        Some(CornerTailParent {
+            segment,
+            whole: true,
+        }),
+        None,
+        None,
+    ]
+}
+
+fn compose(
+    input: &[Option<[Option<CornerTailParent>; 3]>],
+    parents: Option<[Option<CornerTailParent>; 3]>,
+) -> Option<[Option<CornerTailParent>; 3]> {
+    let mut result: [Option<CornerTailParent>; 3] = [None; 3];
+    for parent in parents?.into_iter().flatten() {
+        for mut source in input
+            .get(parent.segment)
+            .copied()
+            .flatten()?
+            .into_iter()
+            .flatten()
+        {
+            source.whole &= parent.whole;
+            if let Some(existing) = result
+                .iter_mut()
+                .flatten()
+                .find(|p| p.segment == source.segment)
+            {
+                existing.whole &= source.whole;
+            } else {
+                *result.iter_mut().find(|p| p.is_none())? = Some(source);
+            }
+        }
+    }
+    Some(result)
+}
+
 /// Sets a straight side back, preserving holes in `region`.
 ///
 /// `from` is the side's base in the panel chart, `m` its unit direction,
@@ -23,6 +84,32 @@ pub fn set_back_past(
     into: Vec2,
     by: f64,
 ) -> Option<Region2> {
+    set_back_past_impl(region, from, m, rise, h, into, by, false).map(|out| out.region)
+}
+
+/// The same contour edit with complete construction parents for its outer segments.
+pub fn set_back_past_with_history(
+    region: &Region2,
+    from: Vec2,
+    m: Vec2,
+    rise: f64,
+    h: f64,
+    into: Vec2,
+    by: f64,
+) -> Option<CornerTailWithHistory> {
+    set_back_past_impl(region, from, m, rise, h, into, by, true)
+}
+
+fn set_back_past_impl(
+    region: &Region2,
+    from: Vec2,
+    m: Vec2,
+    rise: f64,
+    h: f64,
+    into: Vec2,
+    by: f64,
+    trace: bool,
+) -> Option<CornerTailWithHistory> {
     let segs = &region.outer.segs;
     let n = segs.len();
     let top = from + m * rise;
@@ -72,6 +159,53 @@ pub fn set_back_past(
             Some(Seg2::Line { a: *a, b: *b })
         })
         .collect();
+    let mut parents = if trace {
+        (0..n)
+            .map(|segment| Some(identity(segment)))
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    if let Some(source) = parents.get_mut(past_at) {
+        *source = Some([
+            Some(CornerTailParent {
+                segment: past_at,
+                whole: false,
+            }),
+            None,
+            None,
+        ]);
+    }
+    let mut side_parents = if trace {
+        vec![None; side.len()]
+    } else {
+        Vec::new()
+    };
+    if let Some(first) = side_parents.first_mut() {
+        *first = Some([
+            Some(CornerTailParent {
+                segment: k,
+                whole: false,
+            }),
+            None,
+            None,
+        ]);
+    }
+    if pts.len() == 4 {
+        if let Some(last) = side_parents.last_mut() {
+            *last = Some([
+                Some(CornerTailParent {
+                    segment: k,
+                    whole: false,
+                }),
+                None,
+                None,
+            ]);
+        }
+    }
+    if !up {
+        side_parents.reverse();
+    }
     let mut out = segs.clone();
     *out.get_mut(past_at)? = if up {
         Seg2::Line { a: end, b: pb }
@@ -79,9 +213,15 @@ pub fn set_back_past(
         Seg2::Line { a: pa, b: end }
     };
     out.splice(k..=k, side);
-    Some(Region2 {
-        outer: Loop2 { segs: out },
-        holes: region.holes.clone(),
+    if trace {
+        parents.splice(k..=k, side_parents);
+    }
+    Some(CornerTailWithHistory {
+        region: Region2 {
+            outer: Loop2 { segs: out },
+            holes: region.holes.clone(),
+        },
+        outer: parents,
     })
 }
 
@@ -107,6 +247,51 @@ pub fn retarget_corner_tail(
     old_cut: f64,
     new_cut: f64,
 ) -> Result<Region2, CornerTailRefusal> {
+    retarget_corner_tail_impl(
+        region,
+        edge,
+        anchor_origin,
+        anchor_direction,
+        bend_length,
+        old_cut,
+        new_cut,
+        false,
+    )
+    .map(|out| out.region)
+}
+
+/// The same contour edit with complete construction parents for its outer segments.
+pub fn retarget_corner_tail_with_history(
+    region: &Region2,
+    edge: [Vec2; 2],
+    anchor_origin: Vec2,
+    anchor_direction: Vec2,
+    bend_length: f64,
+    old_cut: f64,
+    new_cut: f64,
+) -> Result<CornerTailWithHistory, CornerTailRefusal> {
+    retarget_corner_tail_impl(
+        region,
+        edge,
+        anchor_origin,
+        anchor_direction,
+        bend_length,
+        old_cut,
+        new_cut,
+        true,
+    )
+}
+
+fn retarget_corner_tail_impl(
+    region: &Region2,
+    edge: [Vec2; 2],
+    anchor_origin: Vec2,
+    anchor_direction: Vec2,
+    bend_length: f64,
+    old_cut: f64,
+    new_cut: f64,
+    trace: bool,
+) -> Result<CornerTailWithHistory, CornerTailRefusal> {
     let [start, end] = edge;
     let distance = |point: Vec2| anchor_direction.cross(point - anchor_origin).abs();
     let (from, end) = if distance(start) <= distance(end) {
@@ -130,7 +315,7 @@ pub fn retarget_corner_tail(
     } else {
         -along.perp()
     };
-    replace_setback(region, from, end, into, rise_axis, old_cut, new_cut)
+    replace_setback(region, from, end, into, rise_axis, old_cut, new_cut, trace)
 }
 
 fn replace_setback(
@@ -141,7 +326,8 @@ fn replace_setback(
     rise_axis: Vec2,
     old_cut: f64,
     new_cut: f64,
-) -> Result<Region2, CornerTailRefusal> {
+    trace: bool,
+) -> Result<CornerTailWithHistory, CornerTailRefusal> {
     let height = from.dist(end);
     let direction = (end - from)
         .normalized()
@@ -150,6 +336,13 @@ fn replace_setback(
     let same = |first: Vec2, second: Vec2| first.dist(second) <= tolerance;
     let old_end = end + into * old_cut;
     let mut restored = region.clone();
+    let mut origins = if trace {
+        (0..region.outer.segs.len())
+            .map(|segment| Some(identity(segment)))
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     if old_cut.abs() > 1e-12 {
         let mut steps = region
             .outer
@@ -236,6 +429,23 @@ fn replace_setback(
                     }
                 };
             }
+            if trace {
+                origins = origins
+                    .iter()
+                    .cycle()
+                    .skip(start)
+                    .take(count)
+                    .copied()
+                    .collect();
+                if let Some(source) = origins.get_mut(past) {
+                    *source = source.map(|mut ps| {
+                        for p in ps.iter_mut().flatten() {
+                            p.whole = false;
+                        }
+                        ps
+                    });
+                }
+            }
             let side = if forward {
                 Seg2::Line {
                     a: from,
@@ -248,6 +458,24 @@ fn replace_setback(
                 }
             };
             segments.splice(0..3, [side]);
+            if trace {
+                let consumed = Some([
+                    Some(CornerTailParent {
+                        segment: 0,
+                        whole: true,
+                    }),
+                    Some(CornerTailParent {
+                        segment: 1,
+                        whole: true,
+                    }),
+                    Some(CornerTailParent {
+                        segment: 2,
+                        whole: true,
+                    }),
+                ]);
+                let replacement = compose(&origins, consumed);
+                origins.splice(0..3, [replacement]);
+            }
             restored.outer.segs = segments;
         }
     }
@@ -277,16 +505,32 @@ fn replace_setback(
         }) {
             return Err(CornerTailRefusal::ModifiedSide);
         }
-        return Ok(restored);
+        return Ok(CornerTailWithHistory {
+            region: restored,
+            outer: origins,
+        });
     };
     if sides.next().is_some() {
         return Err(CornerTailRefusal::AmbiguousSide);
     }
     if new_cut.abs() <= 1e-12 {
-        return Ok(restored);
+        return Ok(CornerTailWithHistory {
+            region: restored,
+            outer: origins,
+        });
     }
-    set_back_past(&restored, from, direction, rise, height, into, new_cut)
-        .ok_or(CornerTailRefusal::CannotSetBack)
+    let mut result = set_back_past_impl(
+        &restored, from, direction, rise, height, into, new_cut, trace,
+    )
+    .ok_or(CornerTailRefusal::CannotSetBack)?;
+    if trace {
+        result.outer = result
+            .outer
+            .into_iter()
+            .map(|p| compose(&origins, p))
+            .collect();
+    }
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -344,5 +588,136 @@ mod tests {
                 refused.then_some(CornerTailRefusal::ModifiedSide)
             );
         }
+    }
+    #[test]
+    fn a_corner_setback_reports_retained_trimmed_and_new_boundary_runs() {
+        let input = region(&[[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]]);
+        let out = set_back_past_with_history(
+            &input,
+            Vec2::new(0.0, 0.0),
+            Vec2::new(0.0, 1.0),
+            10.0,
+            4.0,
+            Vec2::new(1.0, 0.0),
+            1.0,
+        )
+        .unwrap();
+        let child = |segment| {
+            Some([
+                Some(CornerTailParent {
+                    segment,
+                    whole: false,
+                }),
+                None,
+                None,
+            ])
+        };
+        assert_eq!(
+            out.outer,
+            vec![
+                Some(identity(0)),
+                Some(identity(1)),
+                child(2),
+                child(3),
+                None,
+                child(3)
+            ]
+        );
+        assert_eq!(out.region.outer.segs.len(), 6);
+        assert_eq!(out.region.holes, input.holes);
+    }
+
+    #[test]
+    fn restoring_a_corner_step_records_every_consumed_original_boundary() {
+        let input = region(&[[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]]);
+        let stepped = set_back_past(
+            &input,
+            Vec2::new(0.0, 0.0),
+            Vec2::new(0.0, 1.0),
+            10.0,
+            4.0,
+            Vec2::new(1.0, 0.0),
+            1.0,
+        )
+        .unwrap();
+        let out = retarget_corner_tail_with_history(
+            &stepped,
+            [Vec2::new(0.0, 0.0), Vec2::new(0.0, 4.0)],
+            Vec2::new(0.0, 0.0),
+            Vec2::new(1.0, 0.0),
+            10.0,
+            1.0,
+            0.0,
+        )
+        .unwrap();
+        assert_eq!(
+            out.outer[0],
+            Some([
+                Some(CornerTailParent {
+                    segment: 3,
+                    whole: true
+                }),
+                Some(CornerTailParent {
+                    segment: 4,
+                    whole: true
+                }),
+                Some(CornerTailParent {
+                    segment: 5,
+                    whole: true
+                }),
+            ])
+        );
+        assert_eq!(out.outer[1], Some(identity(0)));
+        assert_eq!(out.outer[2], Some(identity(1)));
+        assert_eq!(
+            out.outer[3],
+            Some([
+                Some(CornerTailParent {
+                    segment: 2,
+                    whole: false
+                }),
+                None,
+                None
+            ])
+        );
+        assert_eq!(out.region.outer.segs.len(), 4);
+    }
+    #[test]
+    fn a_three_point_setback_reverses_the_new_bridge_parent_slot_with_its_contour() {
+        let input = region(&[[0.0, 0.0], [0.0, 10.0], [10.0, 0.0]]);
+        let child = |segment| {
+            Some([
+                Some(CornerTailParent {
+                    segment,
+                    whole: false,
+                }),
+                None,
+                None,
+            ])
+        };
+        let edit = |input: &Region2| {
+            set_back_past_with_history(
+                input,
+                Vec2::new(0.0, 0.0),
+                Vec2::new(0.0, 1.0),
+                10.0,
+                4.0,
+                Vec2::new(1.0, 0.0),
+                8.0,
+            )
+            .unwrap()
+        };
+        let forward = edit(&input);
+        assert_eq!(
+            forward.outer,
+            vec![child(0), None, child(1), Some(identity(2))]
+        );
+        let mut reversed = input;
+        reversed.outer = reversed.outer.reversed();
+        let reverse = edit(&reversed);
+        assert_eq!(
+            reverse.outer,
+            vec![Some(identity(0)), child(1), None, child(2)]
+        );
     }
 }

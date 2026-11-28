@@ -371,6 +371,7 @@ fn make_circle(
     dim: u64,
     curve: &BSplineCurve,
 ) -> Result<AnalyticCurve> {
+    crate::curve::curve::p3::charge_query_work(k, Some(512), OP_ANALYTIC)?;
     let c = Ellipse::new_circle(
         k,
         frame.origin(),
@@ -731,6 +732,8 @@ impl BSplineCurve {
         interval: &Extent1d,
     ) -> Result<Option<AnalyticCurve>> {
         // use midPoint to set dScaledZero
+        crate::curve::curve::p3::charge_query_work(k, Some(512), OP_ANALYTIC)?;
+        self.charge_query_point(k, OP_ANALYTIC)?;
         let mid_pnt = self.evaluate_point(interval.evaluate(0.456789))?;
         let scaled_zero = EFF_ZERO * (1.0 + mid_pnt.max_dimension());
 
@@ -739,6 +742,16 @@ impl BSplineCurve {
         // check for a line bspline (degree = 1; controlPointCount == 2)
         if self.degree()? == 1 && self.number_control_points()? == 2 {
             // the IsLine check will always pass because of the previous definition check
+            if let Some(work) = k.context.proof_work() {
+                // is_line has no Kernel: reserve its at most nine native D1
+                // samples before entering the unchanged helper.
+                let cost = self
+                    .proof_native_work(1, false)
+                    .and_then(|n| n.checked_mul(9)?.checked_add(512 + 10));
+                if !work.charge(cost) {
+                    return Err(work.stopped(OP_ANALYTIC));
+                }
+            }
             if let Some((line_pnt, line_vec)) = self.is_line(10, scaled_zero)? {
                 // lineVec = EndPoint - StartPoint and if lineVec=0 IsLine=FALSE
                 let line_origin = line_pnt - interval.min() * (line_vec / interval.length());
@@ -764,7 +777,9 @@ impl BSplineCurve {
                 //      compute analytic interval for given interval
                 if !nurb_ivl.is_contained_by(interval, 0.0) {
                     // evaluate endPoints and endVecs (statuses ignored upstream)
+                    self.charge_query_point(k, OP_ANALYTIC)?;
                     let start_point = self.evaluate_point(interval.min())?;
+                    self.charge_query_point(k, OP_ANALYTIC)?;
                     let end_point = self.evaluate_point(interval.max())?;
                     let start_vec = start_point - frame.origin();
                     let end_vec = end_point - frame.origin();
@@ -797,10 +812,32 @@ impl BSplineCurve {
                 // SMLib rule: circles are represented as degree 2 rational BSplines with
                 // all internal knots doubled.
                 let mut crv: Option<Self> = None;
+                if let Some(work) = k.context.proof_work() {
+                    let cost = self
+                        .gw_nurb()
+                        .and_then(|n| u64::try_from(n.knots().len()).ok())
+                        .and_then(|n| {
+                            n.checked_mul(2)?
+                                .checked_add(8)?
+                                .checked_mul(48)?
+                                .checked_add(48)
+                        });
+                    if !work.charge(cost) {
+                        return Err(work.stopped(OP_ANALYTIC));
+                    }
+                }
                 let (knots, multiplicities) = self.knots(None)?;
                 for i in 1..multiplicities.len().saturating_sub(1) {
+                    crate::curve::curve::p3::charge_query_work(k, Some(1), OP_ANALYTIC)?;
                     // copy the BSplineCurve and make its knots double
                     if multiplicities.get(i).copied() != Some(2) {
+                        if crv.is_none() {
+                            if let Some(work) = k.context.proof_work() {
+                                if !work.charge(self.proof_base_copy_work()) {
+                                    return Err(work.stopped(OP_ANALYTIC));
+                                }
+                            }
+                        }
                         let c = crv.get_or_insert_with(|| self.copy());
                         let knot = knots
                             .get(i)
@@ -808,6 +845,29 @@ impl BSplineCurve {
                             .ok_or_else(|| invalid(OP_ANALYTIC, "knot index out of range"))?;
                         // (status ignored upstream; passed on as the fork,
                         // tangency-labs/smlib 8843967)
+                        if let Some(work) = k.context.proof_work() {
+                            let cost = (|| {
+                                let nurb = c.gw_nurb()?;
+                                let n = u64::try_from(nurb.cpts().len()).ok()?;
+                                let raw_k = u64::try_from(nurb.knots().len()).ok()?;
+                                let q = u64::try_from(nurb.degree()).ok()?.checked_add(1)?;
+                                // Complete r=1 insertion and the actual swap-in
+                                // copy/fixup; includes the additional COW Arc.
+                                232_u64
+                                    .checked_add(n.checked_add(1)?.checked_mul(32)?)?
+                                    .checked_add(raw_k.checked_add(1)?.checked_mul(32)?)?
+                                    .checked_add(q.checked_mul(32)?)?
+                                    .checked_add(
+                                        n.checked_add(raw_k)?.checked_add(q)?.checked_mul(4)?,
+                                    )?
+                                    .checked_add(32)?
+                                    .checked_add(raw_k.checked_add(1)?.checked_mul(4)?)?
+                                    .checked_add(16)
+                            })();
+                            if !work.charge(cost) {
+                                return Err(work.stopped(OP_ANALYTIC));
+                            }
+                        }
                         c.insert_one_knot(knot, 1)?;
                     }
                 }
@@ -831,7 +891,17 @@ impl BSplineCurve {
         };
 
         // if original and analytic given interval begin endpoints are too far apart
+        self.charge_query_point(k, OP_ANALYTIC)?;
         let or_pnt = self.evaluate_point(interval.min())?;
+        if let Some(work) = k.context.proof_work() {
+            let cost = match &a {
+                AnalyticCurve::Line(_) => Some(125),
+                AnalyticCurve::Circle(c) => c.base().proof_native_point_work(work),
+            };
+            if !work.charge(cost) {
+                return Err(work.stopped(OP_ANALYTIC));
+            }
+        }
         let an_pnt = a.evaluate_point(interval.min())?;
         if or_pnt.distance(an_pnt) > scaled_zero {
             // don't return the analytic object
@@ -839,7 +909,17 @@ impl BSplineCurve {
         }
 
         // if original and analytic end given interval endpoints are too far apart
+        self.charge_query_point(k, OP_ANALYTIC)?;
         let or_pnt = self.evaluate_point(interval.max())?;
+        if let Some(work) = k.context.proof_work() {
+            let cost = match &a {
+                AnalyticCurve::Line(_) => Some(125),
+                AnalyticCurve::Circle(c) => c.base().proof_native_point_work(work),
+            };
+            if !work.charge(cost) {
+                return Err(work.stopped(OP_ANALYTIC));
+            }
+        }
         let an_pnt = a.evaluate_point(interval.max())?;
         if or_pnt.distance(an_pnt) > scaled_zero {
             // don't return the analytic object
@@ -1481,6 +1561,11 @@ impl BSplineCurve {
         };
 
         // pass the call along
+        if let Some(work) = k.context.proof_work() {
+            if !work.charge(self.proof_degenerate_work()) {
+                return Err(work.stopped("b_spline_curve::is_degenerate"));
+            }
+        }
         is_ncrv_degenerate(cur, tol3d)
     }
 

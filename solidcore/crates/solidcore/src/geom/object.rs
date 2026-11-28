@@ -116,6 +116,98 @@ pub struct ObjectRef {
     pub key: ObjectKey,
 }
 
+/// Producer-only boundary coverage evidence. Generic notifications retain their
+/// existing meaning and do not certify finite-edge containment by themselves.
+#[derive(Clone, Copy, Debug)]
+pub enum BoundaryEdit {
+    /// Starts the existing successful-split construction before either child changes.
+    BeginSplit {
+        /// Original current edge.
+        parent: ObjectRef,
+        /// Child over the lower source interval.
+        lower: ObjectRef,
+        /// Child over the upper source interval.
+        upper: ObjectRef,
+        /// Existing original interval endpoints.
+        bounds: [f64; 2],
+        /// Existing source split parameter.
+        at: f64,
+    },
+    /// Commits the same producer's two actual child intervals after all edits succeed.
+    CommitSplit {
+        /// Original current edge.
+        parent: ObjectRef,
+        /// Actual copy outcome proving a common source parameter frame.
+        copy_source: crate::nurbs::b_spline_curve_n_lib::CopySourceOutcome,
+        /// Actual retained lower source span, after physical trim and cleanup.
+        lower_source: crate::nurbs::b_spline_curve_n_lib::TrimSourceOutcome,
+        /// Actual retained upper source span, after physical trim and cleanup.
+        upper_source: crate::nurbs::b_spline_curve_n_lib::TrimSourceOutcome,
+    },
+    /// Starts the existing whole-current-edge join before its geometry notifications.
+    BeginJoin {
+        /// Surviving edge.
+        survivor: ObjectRef,
+        /// Complete current edge consumed by the join.
+        removed: ObjectRef,
+    },
+    /// Both complete current-edge operands were consumed by the successful join.
+    CommitJoin {
+        /// Surviving edge.
+        survivor: ObjectRef,
+        /// Complete current edge consumed by the join.
+        removed: ObjectRef,
+    },
+    /// The actual constructor allocated a new, curve-less edge. This admits
+    /// only pending birth metadata, never a `KnownEmpty` source certificate.
+    FreshAllocated {
+        /// Actual newly allocated edge before its first curve installation.
+        target: ObjectRef,
+    },
+    /// A successful fresh Face/Edge constructor created target from the
+    /// opposite actual current edge. This is a deferred dependency, not coverage.
+    FreshDependency {
+        /// Actual newly allocated target, never a reused or original edge.
+        target: ObjectRef,
+        /// Exact opposite current edge, still requiring whole-current pair proof.
+        opposite: ObjectRef,
+    },
+    /// Snapshots optional alias state on delivery, before the two original Copies.
+    BeginAlias {
+        /// Exact first current member of the already-proved finite pair.
+        first: ObjectRef,
+        /// Exact second current member of the same pair.
+        second: ObjectRef,
+    },
+    /// Both original alias Copies succeeded; no other contribution is repaired.
+    CommitAlias {
+        /// Exact first member matching the delivered `BeginAlias`.
+        first: ObjectRef,
+        /// Exact second member matching the delivered `BeginAlias`.
+        second: ObjectRef,
+    },
+    /// An actual producer proved both complete finite current edges are aliases.
+    Aliased {
+        /// First exact current-edge identity.
+        first: ObjectRef,
+        /// Second exact current-edge identity.
+        second: ObjectRef,
+    },
+    /// An actual current edge domain changed without a construction witness.
+    /// Old whole-boundary evidence must not survive an extension or shortening.
+    UncertifiedExtentChanged {
+        /// The actual edited current edge in its caller notification domain.
+        edge: ObjectRef,
+    },
+    /// The actual complete current-edge copying constructor succeeded.
+    Copied {
+        /// Exact source identity in its notification domain.
+        source: ObjectRef,
+        /// Actual new current-edge identity.
+        target: ObjectRef,
+    },
+}
+
 /// The kind of change a notification reports (`SmNotifyOperation`). The
 /// discriminants are the upstream values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -245,6 +337,43 @@ pub fn report_owner_link(
         return;
     };
     context.notify_observers(CallbackEvent::OwnerLink(object, owner));
+}
+
+/// Canonical work/storage charge, identical on native and wasm: at most ten
+/// u64 words for `BoundaryEdit`, thirteen for its retained `CallbackEvent` slot,
+/// and one dispatch/ownership word. No quota depends on host pointer width.
+pub(crate) const BOUNDARY_EVENT_WORK: usize = 24 * 8;
+
+/// Reserves optional actual-source recording before any extra comparison/record.
+pub(crate) fn reserve_boundary_source_work(context: Option<&mut Context>, work: usize) -> bool {
+    let Some(context) = context else { return false };
+    let user = context
+        .user_notify_callback_mut()
+        .is_some_and(|c| c.reserve_boundary_edit(work));
+    let system = context
+        .sys_notify_callback_mut()
+        .is_some_and(|c| c.reserve_boundary_edit(work));
+    let relay = context.reserve_relay_boundary_edit(work);
+    user || system || relay
+}
+
+/// Reports only an actual producer's coverage witness. Old observers opt out,
+/// so geometry-only callers allocate no new diagnostic/metadata queue entries.
+pub fn report_boundary_edit(context: Option<&mut Context>, event: BoundaryEdit) {
+    let Some(context) = context else { return };
+    let storage = BOUNDARY_EVENT_WORK;
+    let user = context
+        .user_notify_callback_mut()
+        .is_some_and(|c| c.reserve_boundary_edit(storage));
+    let system = context
+        .sys_notify_callback_mut()
+        .is_some_and(|c| c.reserve_boundary_edit(storage));
+    let relay = context.reserve_relay_boundary_edit(storage);
+    if user || system {
+        context.notify_observers(CallbackEvent::BoundaryEdit(Box::new(event)));
+    } else if relay {
+        context.notify_relay_boundary_edit(event);
+    }
 }
 
 /// A scoped change of a value (`SmTemporaryChangeValue<TYPE>`): sets the value on

@@ -24,7 +24,7 @@ use crate::boolean::merge::p4::{
 use crate::error::primitive::PrimitiveFailure;
 use crate::error::{EntityRef, Result, SolidError};
 use crate::geom::attribute::AttributeStore;
-use crate::geom::context::{Context, MarkLock};
+use crate::geom::context::{Context, MarkLock, MetadataRelay};
 use crate::geom::object::ObjectRef;
 use crate::heal::stitch::p1::BorrowedStitchEdits;
 use crate::kernel::Kernel;
@@ -102,6 +102,7 @@ pub(super) fn finish(
             context,
             key_of,
             other_key_of,
+            alias_radius: tolerance / 2.0,
             curve: &curve,
         };
         finish_with(k, a, b, first, operation, result, marks, session)
@@ -123,6 +124,8 @@ struct Session<'s, 'k, 'c> {
     context: &'s mut Option<&'c mut Context>,
     key_of: &'s dyn Fn(EntityRef) -> ObjectRef,
     other_key_of: &'s dyn Fn(EntityRef) -> ObjectRef,
+    /// The exact original intersection radius, before any IIR tolerance growth.
+    alias_radius: f64,
     /// The primary operand's edge curve identities (for the stitch's split curves).
     curve: &'s dyn Fn(EdgeId, i64) -> Result<ObjectRef>,
 }
@@ -138,6 +141,82 @@ impl Session<'_, '_, '_> {
     }
 }
 
+/// A bounded witness for one already-selected pair, without geometry recovery.
+fn proved_full_current_pair(
+    k: &Kernel,
+    a: &Brep,
+    b: &Brep,
+    pair: (EdgeId, EdgeId),
+    session: &Session<'_, '_, '_>,
+) -> bool {
+    let Some(work) = session.context.as_deref().and_then(Context::proof_work) else {
+        return false;
+    };
+    if !work.charge(Some(16)) {
+        return false;
+    }
+    let proof = || -> Result<bool> {
+        let (Some(ca), Some(cb)) = (edge::curve(a, pair.0)?, edge::curve(b, pair.1)?) else {
+            return Ok(false);
+        };
+        ca.proved_together_with_work(
+            k,
+            &edge::interval(a, pair.0)?,
+            (cb, &edge::interval(b, pair.1)?),
+            session.alias_radius,
+            &[],
+            work,
+        )
+    };
+    proof().unwrap_or(false)
+}
+
+/// Optional proof of the already selected complete current pair, never a search.
+fn proved_current_alias(
+    k: &Kernel,
+    a: &Brep,
+    b: &Brep,
+    pair: (EdgeId, EdgeId),
+    session: &Session<'_, '_, '_>,
+) -> bool {
+    let Some(work) = session.context.as_deref().and_then(Context::proof_work) else {
+        return false;
+    };
+    // Bound the two actual map lookups by the actual mate-map length.
+    let cost = session
+        .ti
+        .merge
+        .intersector
+        .vertices
+        .primary_to_other()
+        .len()
+        .checked_add(1)
+        .and_then(|n| n.checked_mul(4))
+        .and_then(|n| n.checked_add(24));
+    if !work.charge(cost.and_then(|n| u64::try_from(n).ok())) {
+        return false;
+    }
+    let proof = || -> Result<bool> {
+        let (Some(a0), Some(a1)) = edge::start_end_vertices(a, pair.0)? else {
+            return Ok(false);
+        };
+        let (Some(b0), Some(b1)) = edge::start_end_vertices(b, pair.1)? else {
+            return Ok(false);
+        };
+        let mates = &session.ti.merge.intersector.vertices;
+        let (Some(m0), Some(m1)) = (mates.other(a0), mates.other(a1)) else {
+            return Ok(false);
+        };
+        if !((m0 == b0 && m1 == b1) || (m0 == b1 && m1 == b0)) {
+            return Ok(false);
+        }
+        Ok(proved_full_current_pair(k, a, b, pair, session))
+    };
+    // Query errors only decline this optional witness; original geometry and
+    // both existing Copy status/error paths below remain unchanged.
+    proof().unwrap_or(false)
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn finish_with(
     k: &mut Kernel,
@@ -151,15 +230,26 @@ fn finish_with(
 ) -> Result<()> {
     // fork c8f6a31 (WR-662): Boolean2D's Relate and DeleteFaces are SER.
     // intersect, merge, and relate the intersection geometry between the two topology graphs
-    session.ti.intersect_insert_relate(
-        &mut BooleanKernels {
-            primary: k,
-            other: None,
-        },
-        a,
-        b,
-        session.attributes,
-    )?;
+    let relay = session
+        .context
+        .as_deref()
+        .and_then(Context::proof_work)
+        .cloned()
+        .and_then(MetadataRelay::new);
+    Context::with_metadata_relay(k, relay.clone(), |k| {
+        session.ti.intersect_insert_relate(
+            &mut BooleanKernels {
+                primary: k,
+                other: None,
+            },
+            a,
+            b,
+            session.attributes,
+        )
+    })?;
+    if let (Some(relay), Some(context)) = (&relay, session.context.as_deref_mut()) {
+        relay.drain_into(context);
+    }
     let mut lock = MarkLock::new_pair(core::slice::from_mut(&mut k.context), 0, 0)?;
     let mark_a = lock.mark_type1();
     let mark_b = lock.mark_type2();
@@ -168,6 +258,22 @@ fn finish_with(
         // get coincident edges, then coincident vertices
         let (edges, other_edges) = session.ti.common_edges(a, b)?;
         for (primary, other) in edges.iter().zip(&other_edges) {
+            let alias = proved_current_alias(k, a, b, (*primary, *other), &session);
+            let alias_pair = alias.then(|| {
+                (
+                    (session.key_of)(EntityRef::Edge(*primary)),
+                    (session.other_key_of)(EntityRef::Edge(*other)),
+                )
+            });
+            if let Some((alias_first, alias_second)) = alias_pair {
+                crate::geom::object::report_boundary_edit(
+                    session.context.as_deref_mut(),
+                    crate::geom::object::BoundaryEdit::BeginAlias {
+                        first: alias_first,
+                        second: alias_second,
+                    },
+                );
+            }
             let source_key = session.other_key_of;
             let target = (session.key_of)(EntityRef::Edge(*primary));
             let mut env = session.env();
@@ -190,6 +296,15 @@ fn finish_with(
                 crate::geom::object::NotifyOperation::Copy,
                 [Some(target_other), None, None],
             )?;
+            if let Some((alias_first, alias_second)) = alias_pair {
+                crate::geom::object::report_boundary_edit(
+                    session.context.as_deref_mut(),
+                    crate::geom::object::BoundaryEdit::CommitAlias {
+                        first: alias_first,
+                        second: alias_second,
+                    },
+                );
+            }
             marks_a.mark(k, Entity::Edge(*primary), mark_a);
             marks_b.mark(k, Entity::Edge(*other), mark_b);
         }
@@ -314,6 +429,9 @@ fn finish_with(
                     .zip(owners)
                     .filter_map(|(source, target)| target.map(|target| (source, target)))
                 {
+                    // A newly owned slot is not by itself a whole-source
+                    // certificate: copy/trim may have changed its native curve.
+                    let copied = proved_full_current_pair(k, a, b, (target, source), &session);
                     let source_key = session.other_key_of;
                     let target = (session.key_of)(EntityRef::Edge(target));
                     let mut env = session.env();
@@ -326,20 +444,36 @@ fn finish_with(
                         crate::geom::object::NotifyOperation::Copy,
                         [Some(target), None, None],
                     )?;
+                    // Both the actual new owner and the bounded complete-current
+                    // pair witness are required. Generic Copy remains unchanged.
+                    if copied {
+                        crate::geom::object::report_boundary_edit(
+                            env.context.as_deref_mut(),
+                            crate::geom::object::BoundaryEdit::Copied {
+                                source: source_key(EntityRef::Edge(source)),
+                                target,
+                            },
+                        );
+                    }
                 }
             }
         }
         // sTI.DeleteFaces(sDelFaces), its status unchecked
-        session.ti.delete_faces(
-            &mut BooleanKernels {
-                primary: k,
-                other: None,
-            },
-            a,
-            session.attributes,
-            &delete,
-            None,
-        )?;
+        Context::with_metadata_relay(k, relay.clone(), |k| {
+            session.ti.delete_faces(
+                &mut BooleanKernels {
+                    primary: k,
+                    other: None,
+                },
+                a,
+                session.attributes,
+                &delete,
+                None,
+            )
+        })?;
+        if let (Some(relay), Some(context)) = (&relay, session.context.as_deref_mut()) {
+            relay.drain_into(context);
+        }
         if operation != Boolean2d::Merge {
             // pBrepA->StitchFaces(pBrepA->GetTolerance()): its glues notify A's own
             // objects, so it runs on the caller's notification state

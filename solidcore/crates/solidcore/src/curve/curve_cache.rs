@@ -166,6 +166,84 @@ fn evaluate_ignored(
     Ok(())
 }
 
+// Canonical query-only reservations. Ordinary cache construction does not inspect
+// these headers or allocate observer data. Native calls with a Kernel are metered
+// at dispatch; the no-Kernel leaf helpers below are reserved here instead.
+fn query_charge(k: &Kernel, amount: Option<u64>) -> Result<()> {
+    crate::curve::curve::p3::charge_query_work(k, amount, OP_TESS)
+}
+
+fn query_nurb_copy(k: &Kernel, n: &Nurb) -> Result<()> {
+    if k.context.proof_work().is_none() {
+        return Ok(());
+    }
+    query_charge(
+        k,
+        (|| {
+            let points = u64::try_from(n.cpts().len()).ok()?;
+            let knots = u64::try_from(n.knots().len()).ok()?;
+            // Compact copy, possible knot COW and both fix-up scratch vectors.
+            224_u64
+                .checked_add(points.checked_mul(33)?)?
+                .checked_add(knots.checked_mul(21)?)?
+                .checked_add(knots.checked_mul(2)?.checked_add(8)?.checked_mul(48)?)
+        })(),
+    )
+}
+
+fn query_nurb_partition(k: &Kernel, n: &Nurb, splitting: bool) -> Result<()> {
+    if k.context.proof_work().is_none() {
+        return Ok(());
+    }
+    query_charge(
+        k,
+        (|| {
+            let points = u64::try_from(n.cpts().len()).ok()?;
+            let knots = u64::try_from(n.knots().len()).ok()?;
+            let p = u64::try_from(n.degree()).ok()?;
+            let q = p.checked_add(1)?;
+            let out_points = if splitting {
+                points.checked_add(q)?
+            } else {
+                points.checked_add(p.checked_mul(2)?)?
+            };
+            let out_knots = knots.checked_add(q.checked_mul(2)?)?;
+            let triangle = p.checked_mul(q)?.checked_div(2)?;
+            1264_u64
+                .checked_add(out_points.checked_mul(32)?)?
+                .checked_add(out_knots.checked_mul(8)?)?
+                .checked_add(points.checked_add(knots)?.checked_mul(2)?)?
+                .checked_add(q.checked_mul(8)?)?
+                .checked_add(triangle.checked_mul(if splitting { 1 } else { 2 })?)
+        })(),
+    )
+}
+
+fn query_output_space<O: Copy + PartialEq>(
+    k: &Kernel,
+    cache: &mut CurveCache<O>,
+    span_capacity: &mut usize,
+    leaves: &mut Vec<Nurb>,
+    leaf_capacity: &mut usize,
+    n: &Nurb,
+    copying: bool,
+) -> Result<()> {
+    let work = k.context.proof_work();
+    crate::curve::curve::p2::proof_vec_capacity(
+        work,
+        &mut cache.spans,
+        span_capacity,
+        1,
+        264,
+        OP_TESS,
+    )?;
+    crate::curve::curve::p2::proof_vec_capacity(work, leaves, leaf_capacity, 1, 120, OP_TESS)?;
+    if copying {
+        query_nurb_copy(k, n)?;
+    }
+    query_charge(k, Some(512))
+}
+
 // ---- span data ------------------------------------------------------------------
 
 /// The data of one node of a curve decomposition (`SmBezierAux1d`): for a leaf
@@ -588,6 +666,19 @@ impl<O: Copy + PartialEq> CurveCache<O> {
     /// evaluation queries;
     /// [`SolidError::Unported`] for unported callees.
     pub fn tessellate(&mut self, k: &Kernel) -> Result<()> {
+        if let Some(work) = k.context.proof_work() {
+            // The finite proof requests a full native decomposition. No sampled
+            // approximation or simplified parent-polygon path is metered here.
+            if !self.opts.make_full_tree {
+                work.disable();
+                return Err(work.stopped(OP_TESS));
+            }
+            if !work.charge(Some(512)) {
+                return Err(work.stopped(OP_TESS));
+            }
+        }
+        let mut span_capacity = 0usize;
+        let mut leaf_capacity = 0usize;
         // check state: need at least one stored tessellation parameter
         if is_zero(self.opts.chord_height_tolerance) && is_zero(self.opts.angle_tol_deg) {
             return Err(invalid(OP_TESS, "no chord height or angle tolerance"));
@@ -653,6 +744,14 @@ impl<O: Copy + PartialEq> CurveCache<O> {
         // When not simplifying the decomposition-tree
         if self.opts.make_full_tree {
             let (_, conts) = self.curve.calculate_continuities(k, CONTINUITY_ANGLE)?;
+            if k.context.proof_work().is_some() {
+                query_charge(
+                    k,
+                    u64::try_from(conts.len())
+                        .ok()
+                        .and_then(|n| n.checked_mul(9)?.checked_add(24)),
+                )?;
+            }
             self.continuities.extend(conts);
         }
 
@@ -688,6 +787,7 @@ impl<O: Copy + PartialEq> CurveCache<O> {
         // 2. for every unique curve parameter span
         for (i, seg) in beziers.iter().enumerate() {
             k.check_cancelled(OP_TESS)?;
+            query_charge(k, Some(128))?;
             let mut bez = seg.clone();
             let mut span_ivl = Extent1d::from_min_max(
                 bez.knots().first().copied().unwrap_or(0.0),
@@ -709,11 +809,13 @@ impl<O: Copy + PartialEq> CurveCache<O> {
                     continue;
                 }
 
+                query_nurb_partition(k, &bez, false)?;
                 bez = crv_trim(&bez, span_ivl.min(), span_ivl.max())
                     .map_err(SolidError::nurbs_routine(OP_TESS))?;
             }
 
             // control-polygon properties while checking all tolerances
+            query_nurb_copy(k, &bez)?;
             let tmp = Curve::from(BSplineCurve::from_nurb(bez.clone(), dim, true));
             let c = compute_constants(
                 k,
@@ -758,6 +860,15 @@ impl<O: Copy + PartialEq> CurveCache<O> {
                 } else {
                     (ContinuityType::C1C2, ContinuityType::C1C2)
                 };
+                query_output_space(
+                    k,
+                    self,
+                    &mut span_capacity,
+                    &mut leaf_beziers,
+                    &mut leaf_capacity,
+                    &bez,
+                    false,
+                )?;
                 let leaf = self.output_segment(
                     &bez,
                     false,
@@ -773,6 +884,16 @@ impl<O: Copy + PartialEq> CurveCache<O> {
 
             // split pBez into two equal halves: the stack holds [max, min]
             let mut stack: Vec<Nurb> = Vec::new();
+            let mut stack_capacity = 0usize;
+            crate::curve::curve::p2::proof_vec_capacity(
+                k.context.proof_work(),
+                &mut stack,
+                &mut stack_capacity,
+                2,
+                120,
+                OP_TESS,
+            )?;
+            query_nurb_partition(k, &bez, true)?;
             let (bez_min, bez_max) = if is_bspline {
                 crv_split(&bez, span_ivl.mid()).map_err(SolidError::nurbs_routine(OP_TESS))?
             } else {
@@ -783,6 +904,7 @@ impl<O: Copy + PartialEq> CurveCache<O> {
 
             let mut first_in_seg = true;
             while let Some(top) = stack.pop() {
+                query_charge(k, Some(128))?;
                 splits += 1;
                 if (splits & 15) == 1 {
                     k.check_cancelled(OP_TESS)?;
@@ -793,6 +915,7 @@ impl<O: Copy + PartialEq> CurveCache<O> {
                         "tessellation needs more than MAX_TESS_SPLITS splits",
                     ));
                 }
+                query_nurb_copy(k, &top)?;
                 let bsp = Curve::from(BSplineCurve::from_nurb(top.clone(), dim, true));
                 let ivl = bsp.natural_interval();
 
@@ -841,6 +964,15 @@ impl<O: Copy + PartialEq> CurveCache<O> {
                     } else {
                         ContinuityType::C1C2
                     };
+                    query_output_space(
+                        k,
+                        self,
+                        &mut span_capacity,
+                        &mut leaf_beziers,
+                        &mut leaf_capacity,
+                        &top,
+                        true,
+                    )?;
                     let leaf = self.output_segment(
                         &top,
                         true,
@@ -855,6 +987,15 @@ impl<O: Copy + PartialEq> CurveCache<O> {
                 }
 
                 // split the current span in half, children onto the stack
+                query_nurb_partition(k, &top, true)?;
+                crate::curve::curve::p2::proof_vec_capacity(
+                    k.context.proof_work(),
+                    &mut stack,
+                    &mut stack_capacity,
+                    2,
+                    120,
+                    OP_TESS,
+                )?;
                 let (bez_min, bez_max) = if is_bspline {
                     crv_split(&top, ivl.mid()).map_err(SolidError::nurbs_routine(OP_TESS))?
                 } else {
@@ -920,6 +1061,28 @@ impl<O: Copy + PartialEq> CurveCache<O> {
     /// `InvalidInput` for fewer Beziers than spans; [`SolidError::Unported`] from
     /// the box and evaluation callees.
     pub fn build_tree(&mut self, k: &Kernel, leaf_beziers: &[Nurb]) -> Result<()> {
+        if k.context.proof_work().is_some() {
+            query_charge(
+                k,
+                (|| {
+                    let l = u64::try_from(self.spans.len()).ok()?;
+                    let nodes = l.checked_mul(2)?.checked_sub(1)?;
+                    let height = u64::from(u64::BITS - l.max(1).saturating_sub(1).leading_zeros());
+                    let growth = nodes.checked_mul(2)?.checked_add(8)?;
+                    232_u64
+                        .checked_add(
+                            growth
+                                .checked_mul(3)?
+                                .checked_add(nodes)?
+                                .checked_mul(208)?,
+                        )?
+                        .checked_add(nodes.checked_add(height)?.checked_mul(9)?)?
+                        .checked_add(height.checked_add(1)?.checked_mul(24)?)?
+                        .checked_add(l.checked_mul(121)?)?
+                        .checked_add(nodes.checked_mul(512)?)
+                })(),
+            )?;
+        }
         let mut tree: Tree<O> = Tree::new(Some(TreeOwner::CurveCache));
         let dim = self.curve.dim();
 
@@ -942,7 +1105,24 @@ impl<O: Copy + PartialEq> CurveCache<O> {
             let bez = leaf_beziers
                 .get(i)
                 .ok_or_else(|| invalid(OP_TREE, "fewer leaf Beziers than spans"))?;
+            query_nurb_copy(k, bez)?;
             let bsp = BSplineCurve::from_nurb(bez.clone(), dim, true);
+            if let Some(work) = k.context.proof_work() {
+                let cost = (|| {
+                    let q = u64::try_from(bez.cpts().len()).ok()?;
+                    // No-Kernel bbox leaf: three sampled D1 checks, two point
+                    // calls, bounded triangle search, polygon and refined slots.
+                    bsp.proof_native_work(1, false)?
+                        .checked_mul(3)?
+                        .checked_add(bsp.proof_native_point_work(work)?)?
+                        .checked_add(bsp.proof_native_point_work(work)?)?
+                        .checked_add(q.checked_mul(2)?)?
+                        .checked_add(35 + 192 + 512)
+                })();
+                if !work.charge(cost) {
+                    return Err(work.stopped(OP_TREE));
+                }
+            }
             let req = BoundingBoxRequest {
                 normal: true,
                 pseudo: true,
@@ -1273,6 +1453,19 @@ pub fn compute_constants(
     let CurveKind::BSpline(bsp) = bez.kind() else {
         return Err(SolidError::curve(OP_CONST, CurveFailure::SpanNotBSpline));
     };
+    if let Some(work) = k.context.proof_work() {
+        if !exact_span {
+            work.disable();
+            return Err(work.stopped(OP_CONST));
+        }
+        let cost = bsp
+            .gw_nurb()
+            .and_then(|n| u64::try_from(n.cpts().len()).ok())
+            .and_then(|n| n.checked_mul(27)?.checked_add(24 + 512));
+        if !work.charge(cost) {
+            return Err(work.stopped(OP_CONST));
+        }
+    }
     let polygon = bsp.polygon(&bsp.natural_interval())?;
     let poly_size = polygon.len();
     let (Some(&line_pnt), Some(&last_point)) = (polygon.first(), polygon.last()) else {
@@ -1529,9 +1722,37 @@ pub fn create_bezier_segment_block(
     curve: &Curve,
 ) -> Result<Vec<Nurb>> {
     if let Some(n) = nurb {
+        if k.context.proof_work().is_some() {
+            query_charge(
+                k,
+                u64::try_from(n.knots().len())
+                    .ok()
+                    .and_then(|x| x.checked_add(1)),
+            )?;
+        }
         let span_count = n.knot_vector().map_or(0, |k| k.span_count(n.degree()));
         if span_count < 1 {
             return Err(SolidError::curve(OP_BLOCK, CurveFailure::NoSpans));
+        }
+        if k.context.proof_work().is_some() {
+            query_charge(
+                k,
+                (|| {
+                    let count = u64::try_from(span_count).ok()?;
+                    let knots = u64::try_from(n.knots().len()).ok()?;
+                    let p = u64::try_from(n.degree()).ok()?;
+                    let q = p.checked_add(1)?;
+                    let per_span = q
+                        .checked_mul(48)?
+                        .checked_add(120)?
+                        .checked_add(p.checked_mul(q)?.checked_div(2)?)?
+                        .checked_add(q.checked_mul(5)?)?;
+                    536_u64
+                        .checked_add(knots.checked_mul(3)?)?
+                        .checked_add(count.checked_mul(per_span)?)?
+                        .checked_add(count.checked_mul(2)?.checked_add(8)?.checked_mul(120)?)
+                })(),
+            )?;
         }
         create_bez_segments(n).map_err(SolidError::nurbs_routine(OP_BLOCK))
     } else {
@@ -1834,5 +2055,49 @@ mod tests {
             crate::error::upstream_status(&err),
             Some(crate::error::SM_ERR)
         );
+    }
+    #[test]
+    fn query_cache_preserves_native_decomposition_and_stops_only_optional_work() {
+        use crate::geom::context::ProofWork;
+        use crate::prism::sheet::READ_WORK;
+
+        let ordinary = Kernel::default();
+        let options = CurveCacheOptions {
+            chord_height_tolerance: 0.01,
+            angle_tol_deg: 10.0,
+            make_full_tree: true,
+            compute_aux_tree_data: true,
+            ..CurveCacheOptions::default()
+        };
+        let make_cache = || -> CurveCache<u32> {
+            CurveCache::new(cubic(), Extent1d::from_min_max(0.0, 1.0), options)
+        };
+        let mut plain = make_cache();
+        plain.tessellate(&ordinary).unwrap();
+
+        let work = ProofWork::new(READ_WORK);
+        let query = ordinary.optional_proof_view(&work).unwrap();
+        let mut observed = make_cache();
+        observed.tessellate(&query).unwrap();
+        assert!(!work.is_disabled());
+        assert_eq!(observed.spans(), plain.spans());
+        assert_eq!(observed.parents(), plain.parents());
+        assert_eq!(observed.continuities(), plain.continuities());
+        assert_eq!(
+            format!("{:?}", observed.tree()),
+            format!("{:?}", plain.tree())
+        );
+
+        let exhausted = ProofWork::new(READ_WORK);
+        let stopped_query = ordinary.optional_proof_view(&exhausted).unwrap();
+        exhausted.disable();
+        assert!(matches!(
+            make_cache().tessellate(&stopped_query),
+            Err(SolidError::OutOfFuel { .. })
+        ));
+        let mut after_stop = make_cache();
+        after_stop.tessellate(&ordinary).unwrap();
+        assert_eq!(after_stop.spans(), plain.spans());
+        assert_eq!(after_stop.parents(), plain.parents());
     }
 }

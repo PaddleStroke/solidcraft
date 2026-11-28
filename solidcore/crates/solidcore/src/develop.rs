@@ -85,7 +85,10 @@ pub use bead::{
     MIN_BEND_RISE,
 };
 pub use contour::{offset_closed_contour, offset_contour, ContourRefusal};
-pub use corner_tail::{retarget_corner_tail, set_back_past};
+pub use corner_tail::{
+    retarget_corner_tail, retarget_corner_tail_with_history, set_back_past,
+    set_back_past_with_history, CornerTailParent, CornerTailWithHistory,
+};
 pub use flat::{Development, EdgeFrom, FlatPanel, Mismatch, Trim, Zone};
 pub use fold::{fold, Bent, Fold};
 pub use holes::{note_beside, same_circle, Circle};

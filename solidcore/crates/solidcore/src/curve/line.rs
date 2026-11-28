@@ -488,7 +488,22 @@ impl Line {
     /// fixed up.
     #[must_use]
     pub fn copy(&self) -> Self {
-        self.clone()
+        self.copy_with_source(None)
+    }
+
+    /// The same copy, with evidence from its actual B-spline fix-up.
+    pub(crate) fn copy_with_source(
+        &self,
+        outcome: Option<&mut crate::nurbs::b_spline_curve_n_lib::CopySourceOutcome>,
+    ) -> Self {
+        Self {
+            base: self.base.copy_with_source(outcome),
+            point: self.point,
+            vector: self.vector,
+            anal_domain: self.anal_domain,
+            scale: self.scale,
+            inside_out: self.inside_out,
+        }
     }
 
     /// Not upstream: the same line by definition, exactly (IEEE `==`; a NaN refuses):
@@ -2230,9 +2245,29 @@ impl Line {
         trim_interval: &Extent1d,
         mode: TrimMode,
     ) -> Result<()> {
+        self.trim_owned_observed(owner, trim_interval, mode, None)
+    }
+
+    /// The same trim, recording only successful source-frame transport.
+    pub(crate) fn trim_owned_observed(
+        &mut self,
+        owner: Option<ObjectRef>,
+        trim_interval: &Extent1d,
+        mode: TrimMode,
+        mut outcome: Option<&mut crate::nurbs::b_spline_curve_n_lib::TrimSourceOutcome>,
+    ) -> Result<()> {
+        if let Some(outcome) = outcome.as_deref_mut() {
+            *outcome = crate::nurbs::b_spline_curve_n_lib::TrimSourceOutcome::Uncertified;
+        }
         // no work - current natural interval is a subSet of targetInterval
         let nat_ivl = self.natural_interval();
         if nat_ivl.is_contained_by(trim_interval, EFF_ZERO) {
+            if mode != TrimMode::IntervalOnly {
+                if let Some(outcome) = outcome.as_deref_mut() {
+                    *outcome =
+                        crate::nurbs::b_spline_curve_n_lib::TrimSourceOutcome::Retained(nat_ivl);
+                }
+            }
             return Ok(());
         }
 
@@ -2244,17 +2279,29 @@ impl Line {
         // trim the analytic interval
         let step_min = self.convert_t_from_nurbs_to_step(trim_interval.min());
         let step_max = self.convert_t_from_nurbs_to_step(trim_interval.max());
-        let _ = if self.inside_out {
+        let domain_status = if self.inside_out {
             self.anal_domain.set_min_max(step_max, step_min)
         } else {
             self.anal_domain.set_min_max(step_min, step_max)
         };
 
         // to avoid tolerances - just rebuild the nurbCurve
-        ignore_status(self.make_nurb_owned(owner))?;
+        let rebuild_status = self.make_nurb_owned(owner);
+        let rebuilt = rebuild_status.is_ok();
+        ignore_status(rebuild_status)?;
 
         // Set Nurb Parameterization
-        let _ = self.base.edit_parameterization(trim_interval);
+        let parameter_status = self.base.edit_parameterization(trim_interval);
+        if let Some(outcome) = outcome {
+            if domain_status.is_ok()
+                && rebuilt
+                && parameter_status.is_ok()
+                && self.natural_interval() == *trim_interval
+            {
+                *outcome =
+                    crate::nurbs::b_spline_curve_n_lib::TrimSourceOutcome::Retained(*trim_interval);
+            }
+        }
         Ok(())
     }
 
@@ -2574,6 +2621,7 @@ impl crate::geom::content::Content for Line {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::math::det;
 
     /// `segments_apart` says "apart" only where `intersect_with_line` finds nothing, on
     /// segments of every relative placement: crossing, touching, overlapping, within
@@ -2914,7 +2962,7 @@ mod tests {
             },
         );
         assert_eq!(l.natural_interval(), domain);
-        let t = 2f64.powi(-54);
+        let t = det::powi(2f64, -54);
         assert_eq!(l.convert_t_from_nurbs_to_step(t), 0.0);
         let [lo, hi] = l
             .segment_over(&Extent1d::from_min_max(0.0, t))

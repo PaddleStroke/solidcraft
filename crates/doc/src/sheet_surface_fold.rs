@@ -20,7 +20,7 @@ use solidcraft_kernel::{self as kernel, Body, EdgeSpec, FaceSpec, SurfSpec};
 use crate::sheet::FaceRole;
 
 use crate::sheet::FlatWork;
-use crate::sheet_surface::Piece;
+use crate::sheet_surface::{ConvertedEdge, Piece, PieceSource, RegionOrigins, charge_sources, split_sources, union_sources};
 use crate::{DocError, Result};
 
 /// How many times along a folded edge it is sampled, to tell a line or an arc.
@@ -53,25 +53,42 @@ type Run = Vec<Seg2>;
 
 /// A loop's runs (see [`Run`]), none wrapping round where the loop starts. A loop that is all
 /// one smooth curve is two.
-fn runs(segs: &[Seg2]) -> Vec<Run> {
+fn runs(segs: &[Seg2], source: &[Option<Vec<ConvertedEdge>>], work: &mut FlatWork) -> Vec<(Run, Option<Vec<ConvertedEdge>>)> {
+    let source = if charge_sources(work, source, 2, false) { source } else { &[] };
     let free = |s: &Seg2| !matches!(s, Seg2::Line { .. } | Seg2::Arc { .. });
     let smooth = |a: &Seg2, b: &Seg2| free(a) && free(b) && a.end_tangent().dot(b.start_tangent()) > 1.0 - 1e-9;
     let n = segs.len();
     let joins = |i: usize| segs.get((i + n - 1) % n).zip(segs.get(i)).is_some_and(|(a, b)| smooth(a, b));
     let Some(first) = (0..n).find(|i| !joins(*i)) else {
         let (head, tail) = segs.split_at(n / 2);
-        return [head, tail].into_iter().filter(|r| !r.is_empty()).map(<[Seg2]>::to_vec).collect();
+        return [(head, 0), (tail, n / 2)]
+            .into_iter()
+            .filter(|(r, _)| !r.is_empty())
+            .map(|(r, start)| {
+                let tags = (start..start + r.len()).map(|k| source.get(k).cloned().flatten()).collect::<Vec<_>>();
+                (r.to_vec(), union_sources(&tags, work))
+            })
+            .collect();
     };
     let mut out: Vec<Run> = Vec::new();
+    let mut tags: Vec<Vec<Option<Vec<ConvertedEdge>>>> = Vec::new();
     for k in 0..n {
         let i = (first + k) % n;
         let Some(seg) = segs.get(i) else { continue };
         match out.last_mut() {
-            Some(run) if k > 0 && joins(i) => run.push(*seg),
-            _ => out.push(vec![*seg]),
+            Some(run) if k > 0 && joins(i) => {
+                run.push(*seg);
+                if let Some(row) = tags.last_mut() {
+                    row.push(source.get(i).cloned().flatten());
+                }
+            }
+            _ => {
+                out.push(vec![*seg]);
+                tags.push(vec![source.get(i).cloned().flatten()]);
+            }
         }
     }
-    out
+    out.into_iter().zip(tags).map(|(run, tags)| (run, union_sources(&tags, work))).collect()
 }
 
 /// The point of a run `s` along it, from its start (0) to its end (1), each of its segments an
@@ -91,6 +108,7 @@ struct Cell {
     /// Loops its faces leave open with no wall: a bead's footprint, closed by the bead's own
     /// faces.
     open: Vec<Vec<Seg2>>,
+    origins: RegionOrigins,
 }
 
 impl Cell {
@@ -116,7 +134,7 @@ pub(crate) fn solid(
     dev: &Development,
     fold: &Fold,
     t: f64,
-    pieces: &[(Piece, Region2)],
+    pieces: PieceSource<'_>,
     forms: &[crate::sheet_surface_bead::Form],
     work: &mut FlatWork,
     name: &dyn Fn(Piece, FaceRole) -> Option<String>,
@@ -133,7 +151,7 @@ pub(crate) fn solid_flat(
     dev: &Development,
     flat: Rigid3,
     t: f64,
-    pieces: &[(Piece, Region2)],
+    pieces: PieceSource<'_>,
     work: &mut FlatWork,
     name: &dyn Fn(Piece, FaceRole) -> Option<String>,
 ) -> Result<(Body, Vec<Option<String>>)> {
@@ -143,13 +161,13 @@ pub(crate) fn solid_flat(
 /// The solid of `pieces` where `f` carries them, with `forms` (see [`solid`]).
 fn solid_of(
     f: &Folded<'_>,
-    pieces: &[(Piece, Region2)],
+    pieces: PieceSource<'_>,
     forms: &[crate::sheet_surface_bead::Form],
     work: &mut FlatWork,
     name: &dyn Fn(Piece, FaceRole) -> Option<String>,
 ) -> Result<(Body, Vec<Option<String>>)> {
     let t = f.t;
-    let mut cells = cells(pieces.to_vec(), work)?;
+    let mut cells = cells(pieces.geometry.to_vec(), pieces.origins, work)?;
     for form in forms {
         let centre = form.centre;
         let mine = |c: &Cell| {
@@ -161,12 +179,17 @@ fn solid_of(
         cell.open.push(form.open.clone());
     }
     for c in &mut cells {
-        c.outer = f.split_wide_roll_segs(c.piece, &c.outer);
-        for h in &mut c.holes {
-            *h = f.split_wide_roll_segs(c.piece, h);
+        (c.outer, c.origins.outer) = f.split_wide_roll_segs(c.piece, &c.outer, &c.origins.outer, work);
+        for (hi, h) in c.holes.iter_mut().enumerate() {
+            let tags = c.origins.holes.get(hi).cloned().unwrap_or_default();
+            let (geometry, tags) = f.split_wide_roll_segs(c.piece, h, &tags, work);
+            *h = geometry;
+            if let Some(slot) = c.origins.holes.get_mut(hi) {
+                *slot = tags;
+            }
         }
         for o in &mut c.open {
-            *o = f.split_wide_roll_segs(c.piece, o);
+            *o = f.split_wide_roll_segs(c.piece, o, &[], work).0;
         }
     }
     let near = |p: Vec2, q: Vec2| p.dist(q) < 1e-6;
@@ -191,9 +214,10 @@ fn solid_of(
     let mut names = Vec::new();
     for (ci, c) in cells.iter().enumerate() {
         // Each run at both depths, once.
-        let runs: Vec<Vec<Run>> = c.loops().map(|l| runs(l)).collect();
+        let runs: Vec<Vec<(Run, Option<Vec<ConvertedEdge>>)>> =
+            c.loops().enumerate().map(|(li, l)| runs(l, c.origins.loop_at(li).unwrap_or(&[]), work)).collect();
         let edges: Vec<Vec<[EdgeSpec; 2]>> =
-            runs.iter().map(|l| l.iter().map(|r| f.edges(c.piece, r)).collect::<Result<_>>()).collect::<Result<_>>()?;
+            runs.iter().map(|l| l.iter().map(|(r, _)| f.edges(c.piece, r)).collect::<Result<_>>()).collect::<Result<_>>()?;
         let samples: Vec<Vec2> = c.loops().flatten().flat_map(|e| (0..SAMPLES).map(|k| e.point_at(k as f64 / SAMPLES as f64))).collect();
         let curved = c.loops().flatten().any(|e| !matches!(e, Seg2::Line { .. }));
         let center = c.outer.iter().map(Seg2::start).fold(Vec2::ZERO, |a, b| a + b) * (1.0 / c.outer.len().max(1) as f64);
@@ -214,7 +238,7 @@ fn solid_of(
         }
         // Walls along runs no other cell shares; none round an open loop.
         let walled = 1 + c.holes.len();
-        for (run, [bottom, top]) in runs.iter().take(walled).flatten().zip(edges.iter().take(walled).flatten()) {
+        for ((run, source), [bottom, top]) in runs.iter().take(walled).flatten().zip(edges.iter().take(walled).flatten()) {
             if let [e] = run.as_slice()
                 && shared(ci, c, e)?
             {
@@ -231,7 +255,7 @@ fn solid_of(
             let within = mid - Vec2::new(along.y, -along.x).normalized().unwrap_or_default() * 1e-3;
             let outward = pm - f.at(c.piece, within, t / 2.0)?;
             faces.push(FaceSpec { loops: vec![vec![bottom.clone(), up_b, top.reversed(), down_a]], surface, probe: Some((pm, outward)) });
-            names.push(name(c.piece, FaceRole::Wall { a, b, mid }));
+            names.push(name(c.piece, FaceRole::Wall { a, b, mid, source: source.clone() }));
         }
     }
     for form in forms {
@@ -259,28 +283,54 @@ fn solid_of(
 /// Until the kernel (solidcore, #1597) sews edges that share only part of their length: keep
 /// every edge whole. That split is the kernel's limit, not the sheet's: it makes one edge of the
 /// flat two edges of the solid.
-fn cells(pieces: Vec<(Piece, Region2)>, work: &mut FlatWork) -> Result<Vec<Cell>> {
-    let clean = |l: Loop2| -> Vec<Seg2> { l.segs.into_iter().filter(|e| e.length() >= LINEAR_TOL).collect() };
+fn cells(pieces: Vec<(Piece, Region2)>, origins: &[RegionOrigins], work: &mut FlatWork) -> Result<Vec<Cell>> {
+    let origins =
+        if charge_sources(work, origins.iter().flat_map(|r| r.outer.iter().chain(r.holes.iter().flatten())), 3, false) { origins } else { &[] };
+    let clean = |l: Loop2, tags: &[Option<Vec<ConvertedEdge>>]| {
+        let mut source = Vec::new();
+        let geometry = l
+            .segs
+            .into_iter()
+            .enumerate()
+            .filter(|(_, e)| e.length() >= LINEAR_TOL)
+            .map(|(k, e)| {
+                source.push(tags.get(k).cloned().flatten());
+                e
+            })
+            .collect::<Vec<_>>();
+        (geometry, source)
+    };
     let raw: Vec<Cell> = pieces
         .into_iter()
-        .filter_map(|(piece, r)| {
-            let outer = clean(r.outer);
-            (!outer.is_empty()).then(|| Cell {
-                piece,
-                outer,
-                holes: r.holes.into_iter().map(clean).filter(|h| !h.is_empty()).collect(),
-                open: Vec::new(),
-            })
+        .enumerate()
+        .filter_map(|(ri, (piece, r))| {
+            let source = origins.get(ri).cloned().unwrap_or_else(|| RegionOrigins::unknown(&r));
+            let (outer, outer_tags) = clean(r.outer, &source.outer);
+            (!outer.is_empty())
+                .then(|| Cell { piece, outer, holes: Vec::new(), open: Vec::new(), origins: RegionOrigins { outer: outer_tags, holes: Vec::new() } })
+                .map(|mut cell| {
+                    for (hi, h) in r.holes.into_iter().enumerate() {
+                        let (h, tags) = clean(h, source.holes.get(hi).map(Vec::as_slice).unwrap_or(&[]));
+                        if !h.is_empty() {
+                            cell.holes.push(h);
+                            cell.origins.holes.push(tags);
+                        }
+                    }
+                    cell
+                })
         })
         .collect();
     let edges = raw.iter().map(|c| c.loops().map(Vec::len).sum::<usize>()).sum::<usize>();
     work.charge(edges.saturating_mul(edges).saturating_mul(4))?;
     let corners: Vec<Vec2> = raw.iter().flat_map(|c| c.loops().flatten().map(Seg2::start)).collect();
-    let split = |segs: &[Seg2]| -> Vec<Seg2> {
+    let mut split = |segs: &[Seg2], source: &[Option<Vec<ConvertedEdge>>]| {
         let mut v = Vec::with_capacity(segs.len());
-        for e in segs {
+        let mut tags = Vec::new();
+        for (k, e) in segs.iter().enumerate() {
+            let mut tag = source.get(k).cloned().flatten();
             let Seg2::Line { a, b } = *e else {
                 v.push(*e);
+                tags.push(tag);
                 continue;
             };
             let d = b - a;
@@ -295,19 +345,29 @@ fn cells(pieces: Vec<(Piece, Region2)>, work: &mut FlatWork) -> Result<Vec<Cell>
                 .collect();
             ts.sort_by(|x, y| x.total_cmp(y));
             ts.dedup_by(|x, y| (*x - *y).abs() * l < LINEAR_TOL);
+            if !ts.is_empty() {
+                tag = split_sources(&tag);
+            }
             let mut prev = a;
             for t in ts {
                 let q = a + d * t;
                 v.push(Seg2::Line { a: prev, b: q });
+                tags.push(if charge_sources(work, std::iter::once(&tag), 1, false) { tag.clone() } else { None });
                 prev = q;
             }
             v.push(Seg2::Line { a: prev, b });
+            tags.push(tag);
         }
-        v
+        (v, tags)
     };
     Ok(raw
         .iter()
-        .map(|c| Cell { piece: c.piece, outer: split(&c.outer), holes: c.holes.iter().map(|h| split(h)).collect(), open: Vec::new() })
+        .map(|c| {
+            let (outer, outer_tags) = split(&c.outer, &c.origins.outer);
+            let (holes, hole_tags) =
+                c.holes.iter().enumerate().map(|(hi, h)| split(h, c.origins.holes.get(hi).map(Vec::as_slice).unwrap_or(&[]))).unzip();
+            Cell { piece: c.piece, outer, holes, open: Vec::new(), origins: RegionOrigins { outer: outer_tags, holes: hole_tags } }
+        })
         .collect())
 }
 
@@ -316,11 +376,22 @@ impl Folded<'_> {
     /// turn (`3π/2`) in half, so that its folded 3D arc keeps its ends well apart for three-point
     /// circle fitting (#21829; on a cone a 360° rim unfolds to less than 270° in the flat and is
     /// not caught by `sheet_surface::halved`).
-    fn split_wide_roll_segs(&self, piece: Piece, segs: &[Seg2]) -> Vec<Seg2> {
-        let Some(fold) = self.fold.filter(|_| self.flat.is_none()) else { return segs.to_vec() };
-        let (Piece::Panel(i) | Piece::Tab(_, i)) = piece else { return segs.to_vec() };
+    fn split_wide_roll_segs(
+        &self,
+        piece: Piece,
+        segs: &[Seg2],
+        source: &[Option<Vec<ConvertedEdge>>],
+        work: &mut FlatWork,
+    ) -> (Vec<Seg2>, Vec<Option<Vec<ConvertedEdge>>>) {
+        let source = if charge_sources(work, source, 3, false) { source } else { &[] };
+        let Some(fold) = self.fold.filter(|_| self.flat.is_none()) else {
+            return (segs.to_vec(), (0..segs.len()).map(|k| source.get(k).cloned().flatten()).collect());
+        };
+        let (Piece::Panel(i) | Piece::Tab(_, i)) = piece else {
+            return (segs.to_vec(), (0..segs.len()).map(|k| source.get(k).cloned().flatten()).collect());
+        };
         if fold.axis(i).is_none() {
-            return segs.to_vec();
+            return (segs.to_vec(), (0..segs.len()).map(|k| source.get(k).cloned().flatten()).collect());
         }
         let wide = |seg: &Seg2| -> bool {
             let mut prev: Option<f64> = None;
@@ -337,27 +408,34 @@ impl Folded<'_> {
             total.abs() > 1.5 * std::f64::consts::PI + 1e-6
         };
         let mut out = Vec::with_capacity(segs.len());
-        for &seg in segs {
+        let mut tags = Vec::new();
+        for (k, &seg) in segs.iter().enumerate() {
+            let tag = source.get(k).cloned().flatten();
             if wide(&seg) {
                 match seg {
                     Seg2::Arc { center, radius, start, sweep } => {
                         let half = sweep / 2.0;
                         out.push(Seg2::Arc { center, radius, start, sweep: half });
                         out.push(Seg2::Arc { center, radius, start: start + half, sweep: half });
+                        let tag = split_sources(&tag);
+                        tags.extend([tag.clone(), tag]);
                         continue;
                     }
                     Seg2::Line { a, b } => {
                         let mid = a.lerp(b, 0.5);
                         out.push(Seg2::Line { a, b: mid });
                         out.push(Seg2::Line { a: mid, b });
+                        let tag = split_sources(&tag);
+                        tags.extend([tag.clone(), tag]);
                         continue;
                     }
                     _ => {}
                 }
             }
             out.push(seg);
+            tags.push(tag);
         }
-        out
+        (out, tags)
     }
 
     fn bent(&self, zone: usize) -> Option<&Bent> {

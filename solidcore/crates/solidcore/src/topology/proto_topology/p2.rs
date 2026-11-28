@@ -450,6 +450,10 @@ pub trait ProtoBrep<O>: ProtoGeometry<O> + ProtoTopology<O> {
         orientation: OrientType,
         tolerance: f64,
     ) -> Result<(Option<O>, Option<O>, Option<O>)>;
+    /// Optional metadata only, after a complete successful fresh Face/Edge
+    /// imprint. The actual owner maps these handles into its notification domain.
+    /// The default does nothing and does not change the edit's result.
+    fn report_constructed_edge_dependency(&mut self, _target: O, _opposite: O) {}
     /// `SmEdgeuse::EvaluateBinormal(dParam, FALSE, rPt, rBinormal)` of the edge use
     /// `edgeuse` (read by `UpdateFaces`): the owner of real B-reps runs
     /// [`evaluate_binormal`](crate::topology::edgeuse::p3::evaluate_binormal) on the
@@ -1569,6 +1573,7 @@ impl<O: ClassObject> ProtoTopologyManager<O> {
         let mut new_e1 = None;
         let mut new_f1 = None;
         let mut old_f1 = None;
+        let mut constructed_target = None;
 
         // Not upstream (docs/booleans.md, "One edge or two"): an edge Brep1's face already
         // has between the two vertices that is proved to be the curve is this edge there.
@@ -1642,6 +1647,11 @@ impl<O: ClassObject> ProtoTopologyManager<O> {
                 }
             }
             self.ed_mut(ed)?.set_final_edge(1, new_e1);
+            if type2 == PointClassType::Edge {
+                if let Some(target) = new_e1 {
+                    constructed_target = Some((1, target));
+                }
+            }
         } else if type1 == PointClassType::Edge {
             let e = as_kind(d.src_topo(1), ClassObjectKind::Edge);
             self.ed_mut(ed)?.set_final_edge(1, e);
@@ -1747,6 +1757,11 @@ impl<O: ClassObject> ProtoTopologyManager<O> {
                 }
             };
             self.ed_mut(ed)?.set_final_edge(2, new_e2);
+            if type1 == PointClassType::Edge {
+                if let Some(target) = new_e2 {
+                    constructed_target = Some((2, target));
+                }
+            }
 
             // If a Face was split, move the proto topology now on the new Face.
             if let Some(new_f2) = new_f2 {
@@ -1762,6 +1777,25 @@ impl<O: ClassObject> ProtoTopologyManager<O> {
         if let (Some(new_f1), Some(old_f1)) = (new_f1, old_f1) {
             let other_edge = as_kind(self.ed_ref(ed)?.src_topo(2), ClassObjectKind::Edge);
             self.update_faces(k, brep, 1, old_f1, new_f1, new_e1, other_edge, Some(ed))?;
+        }
+        // Only actual allocation branches set constructed_target. Along/sibling
+        // reuse and Face/Face never do. No evidence escapes a failed update_faces.
+        if let Some((which, target)) = constructed_target {
+            let opposite_side = 3 - which;
+            // Metadata cannot turn an otherwise successful edit into an error.
+            if let Ok(d) = self.ed_ref(ed) {
+                if d.final_edge(which) == Some(target)
+                    && d.src_topo_type(opposite_side) == PointClassType::Edge
+                {
+                    if let Some(opposite) =
+                        as_kind(d.final_edge(opposite_side), ClassObjectKind::Edge)
+                    {
+                        if d.src_topo(opposite_side) == Some(opposite) {
+                            brep.report_constructed_edge_dependency(target, opposite);
+                        }
+                    }
+                }
+            }
         }
         Ok(())
     }

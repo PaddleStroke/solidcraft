@@ -916,10 +916,22 @@ pub(crate) fn sheet_lineage(before: Option<SheetBefore<'_>>, sheet: &crate::Surf
         }
         kept
     };
-    for g in grown.iter_mut().flatten() {
+    for (i, slot) in grown.iter_mut().enumerate() {
+        let Some(g) = slot else { continue };
         let (on, across) = (found(g.on.as_slice()), found(g.across.as_slice()));
-        // After an edge only where both its sides are found.
+        // After an edge only where both its sides are found. A converted rim with missing
+        // source faces must not become an unqualified, apparently exact generated role.
         let edge = !g.across.is_empty();
+        if edge
+            && (on.is_empty() || across.is_empty())
+            && parts
+                .get(i)
+                .and_then(Option::as_ref)
+                .is_some_and(|p| matches!(&p.part, SheetPart::Rim { edge: crate::sheet_surface_convert::RimEdge::Converted { .. }, .. }))
+        {
+            *slot = None;
+            continue;
+        }
         (g.on, g.across) = if edge && (on.is_empty() || across.is_empty()) { (Vec::new(), Vec::new()) } else { (on, across) };
     }
     history.substitute(0, &first.history).ok()?;
@@ -1005,6 +1017,15 @@ fn sheet_role(
     match part {
         SheetPart::Cap { panel, surface } => made(panel.as_str(), side(*surface).into(), None),
         SheetPart::Rim { panel, edge } => {
+            if let RimEdge::Converted { faces: [x, y], .. } = edge {
+                // Only the first conversion names this generated wall after its source edge.
+                // Later builds find the exact prior SheetFace before asking for a new role.
+                if converting {
+                    let made = recipe(panel)?;
+                    return Some(GrownFace { role: edge.role(), feature: Some(made.feature()), on: vec![*x], across: vec![*y], ordinal: place });
+                }
+                return None;
+            }
             // A rim past a bend's end is made from that bend end.
             let from = match edge {
                 RimEdge::Past { at_origin } => Some(SheetPart::BendEnd { panel: panel.clone(), at_origin: *at_origin }),

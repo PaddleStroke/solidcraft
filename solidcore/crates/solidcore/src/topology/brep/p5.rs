@@ -1029,6 +1029,15 @@ fn apply_vertex_join(
         curve,
         interval,
     } = join;
+    let survivor_ref = (env.key_of)(crate::error::EntityRef::Edge(survivor));
+    let removed_ref = (env.key_of)(crate::error::EntityRef::Edge(deleted));
+    crate::geom::object::report_boundary_edit(
+        env.context.as_deref_mut(),
+        crate::geom::object::BoundaryEdit::BeginJoin {
+            survivor: survivor_ref,
+            removed: removed_ref,
+        },
+    );
     if let Some(curve) = curve {
         set_joined_edge_curve(k, b, survivor, None, true, Some(env))?;
         set_joined_edge_curve(k, b, survivor, Some(curve), true, Some(env))?;
@@ -1052,6 +1061,13 @@ fn apply_vertex_join(
             get_or_create_uv_trim_curve(k, b, eu)?;
         }
     }
+    crate::geom::object::report_boundary_edit(
+        env.context.as_deref_mut(),
+        crate::geom::object::BoundaryEdit::CommitJoin {
+            survivor: survivor_ref,
+            removed: removed_ref,
+        },
+    );
     Ok(survivor)
 }
 

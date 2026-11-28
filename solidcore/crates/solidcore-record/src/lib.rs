@@ -46,10 +46,13 @@ pub mod vec;
 
 pub use accuracy::CurveAccuracy;
 pub use plane::Plane;
+pub use profile::BoundaryLoop;
+pub use profile::InputBoundary;
 pub use profile::Loop2;
 pub use profile::MAX_BEZIER_CTRL;
 pub use profile::MAX_BEZIER_DEGREE;
 pub use profile::Region2;
+pub use profile::RegionWithHistory;
 pub use profile::Seg2;
 pub use vec::Vec2;
 pub use vec::Vec3;

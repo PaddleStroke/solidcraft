@@ -106,3 +106,43 @@ impl Region2 {
         std::iter::once(&self.outer).chain(&self.holes)
     }
 }
+
+/// Which loop of an input region supplied a boundary segment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum BoundaryLoop {
+    /// The region's outer loop.
+    Outer,
+    /// A hole, by its index in the input region.
+    Hole(usize),
+}
+
+/// The original input boundary contributing to an output segment.
+/// Indices refer to the exact input arrays before normalization.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct InputBoundary {
+    /// Zero for the first operand, one for the second.
+    pub operand: usize,
+    /// Region index within that operand.
+    pub region: usize,
+    /// The original outer loop or hole.
+    pub loop_kind: BoundaryLoop,
+    /// Original segment index within that loop.
+    pub segment: usize,
+    /// The output retains this complete original input segment, certified by
+    /// construction. False still requires a certified contributing subpiece.
+    pub whole: bool,
+}
+
+/// A planar result with history aligned to its boundary segments.
+///
+/// Known entries are sorted, nonempty sets of every contributing input boundary.
+/// None means unknown, never a partial set. This is transient operation metadata.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RegionWithHistory {
+    /// Geometry identical to the geometry-only operation.
+    pub region: Region2,
+    /// One entry per outer segment.
+    pub outer: Vec<Option<Vec<InputBoundary>>>,
+    /// One loop per hole, one entry per segment.
+    pub holes: Vec<Vec<Option<Vec<InputBoundary>>>>,
+}

@@ -32,6 +32,243 @@ pub(crate) enum Piece {
     Tab(usize, usize),
 }
 
+/// The converted body's actual boundary edge and its two incident source faces. These are
+/// construction identities, never a geometric match to a generated wall.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
+pub struct ConvertedEdge {
+    pub edge: usize,
+    pub faces: [usize; 2],
+}
+
+/// Complete source sets aligned with a region's actual segments. None means unknown;
+/// a boolean that meets an unknown boundary cannot manufacture a partial known set.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct RegionOrigins {
+    pub outer: Vec<Option<Vec<ConvertedEdge>>>,
+    pub holes: Vec<Vec<Option<Vec<ConvertedEdge>>>>,
+}
+
+impl RegionOrigins {
+    pub(crate) fn unknown(r: &Region2) -> Self {
+        Self { outer: vec![None; r.outer.segs.len()], holes: r.holes.iter().map(|h| vec![None; h.segs.len()]).collect() }
+    }
+
+    pub(crate) fn loop_at(&self, k: usize) -> Option<&[Option<Vec<ConvertedEdge>>]> {
+        if k == 0 { Some(&self.outer) } else { self.holes.get(k - 1).map(Vec::as_slice) }
+    }
+
+    /// Permute only metadata at a caller's existing loop-orientation event.
+    pub(crate) fn oriented(&self, outer_reversed: bool, holes_reversed: &[bool]) -> Self {
+        let mut out = self.clone();
+        if outer_reversed {
+            out.outer.reverse();
+        }
+        for (i, hole) in out.holes.iter_mut().enumerate() {
+            if holes_reversed.get(i).copied().unwrap_or(false) {
+                hole.reverse();
+            }
+        }
+        out
+    }
+
+    /// Follow a development's own recorded parent segment or the source of a generated rip.
+    fn developed(flat: &solidcraft_develop::FlatPanel, own: Option<&Self>, rips: &[Option<ConvertedEdge>], work: &mut FlatWork) -> Self {
+        let cost = (|| {
+            let mut count = 0usize;
+            for lp in std::iter::once(&flat.region.outer).chain(&flat.region.holes) {
+                count = count.checked_add(lp.segs.len())?;
+            }
+            let slots = count.checked_mul(std::mem::size_of::<Option<Vec<ConvertedEdge>>>() + std::mem::size_of::<ConvertedEdge>())?;
+            slots.checked_add((flat.region.holes.len() + 1).checked_mul(std::mem::size_of::<Vec<Option<Vec<ConvertedEdge>>>>())?)
+        })();
+        if !work.charge_history(cost) {
+            return Self::default();
+        }
+        let mut loops = std::iter::once(&flat.region.outer).chain(&flat.region.holes).enumerate().map(|(li, lp)| {
+            lp.segs
+                .iter()
+                .enumerate()
+                .map(|(si, _)| match flat.origins.get(li).and_then(|l| l.get(si)) {
+                    Some(solidcraft_develop::EdgeFrom::Own(k)) => {
+                        split_sources(own.and_then(|o| o.loop_at(li)).and_then(|l| l.get(*k)).unwrap_or(&None))
+                    }
+                    Some(solidcraft_develop::EdgeFrom::Rip(j)) => rips.get(*j).copied().flatten().map(|e| vec![e]),
+                    None => None,
+                })
+                .collect::<Vec<_>>()
+        });
+        Self { outer: loops.next().unwrap_or_default(), holes: loops.collect() }
+    }
+}
+
+/// Without parameter intervals, a split child's complete contributor set is known only
+/// when its parent had one source. Mixed parents remain ambiguous, never a favorite subset.
+pub(crate) fn split_sources(tag: &Option<Vec<ConvertedEdge>>) -> Option<Vec<ConvertedEdge>> {
+    match tag.as_deref() {
+        Some([one]) => Some(vec![*one]),
+        _ => None,
+    }
+}
+
+/// Precharge source-reference copies, Vec storage, and comparison work before allocation.
+/// This observer has no influence on the geometry work allowance or its errors.
+pub(crate) fn charge_sources<'a>(
+    work: &mut FlatWork,
+    tags: impl IntoIterator<Item = &'a Option<Vec<ConvertedEdge>>>,
+    copies: usize,
+    sorting: bool,
+) -> bool {
+    let cost = (|| {
+        let mut slots = 0usize;
+        let mut refs = 0usize;
+        for tag in tags {
+            slots = slots.checked_add(1)?;
+            refs = refs.checked_add(tag.as_ref().map_or(0, Vec::len))?;
+        }
+        let storage = slots
+            .checked_mul(std::mem::size_of::<Option<Vec<ConvertedEdge>>>())?
+            .checked_add(refs.checked_mul(std::mem::size_of::<ConvertedEdge>())?)?
+            .checked_mul(copies)?;
+        let comparisons = if sorting { refs.checked_mul(refs.max(1).ilog2() as usize + 1)? } else { 0 };
+        storage.checked_add(comparisons)
+    })();
+    work.charge_history(cost)
+}
+
+/// All known parents of one constructed run; one unknown segment makes the run unknown.
+pub(crate) fn union_sources<'a, I>(tags: I, work: &mut FlatWork) -> Option<Vec<ConvertedEdge>>
+where
+    I: IntoIterator<Item = &'a Option<Vec<ConvertedEdge>>>,
+    I::IntoIter: Clone,
+{
+    let tags = tags.into_iter();
+    if !charge_sources(work, tags.clone(), 1, true) {
+        return None;
+    }
+    let mut all = Vec::new();
+    for tag in tags {
+        all.extend(tag.as_ref().filter(|s| !s.is_empty())?.iter().copied());
+    }
+    all.sort();
+    all.dedup();
+    (!all.is_empty()).then_some(all)
+}
+
+/// An explicit paired result. Geometry-only callers deliberately discard origins.
+#[derive(Clone, Debug)]
+pub(crate) struct Regions<T = Region2> {
+    pub geometry: Vec<T>,
+    pub origins: Vec<RegionOrigins>,
+}
+
+impl Regions {
+    pub(crate) fn unknown(geometry: Vec<Region2>) -> Self {
+        let origins = geometry.iter().map(RegionOrigins::unknown).collect();
+        Self { geometry, origins }
+    }
+}
+
+pub(crate) type Pieces = Regions<(Piece, Region2)>;
+
+#[derive(Clone, Copy)]
+pub(crate) struct PieceSource<'a> {
+    pub geometry: &'a [(Piece, Region2)],
+    pub origins: &'a [RegionOrigins],
+}
+
+impl Pieces {
+    pub(crate) fn source(&self) -> PieceSource<'_> {
+        PieceSource { geometry: &self.geometry, origins: &self.origins }
+    }
+}
+
+/// Resolve the kernel's current-input boundary indices against complete caller source sets.
+pub(crate) fn compose_regions(
+    output: Vec<solidcraft_kernel::RegionWithHistory>,
+    a: &[RegionOrigins],
+    b: &[RegionOrigins],
+    work: &mut FlatWork,
+) -> Regions {
+    let overhead = (|| {
+        let mut slots = 0usize;
+        let mut loops = 0usize;
+        for out in &output {
+            loops = loops.checked_add(out.holes.len().checked_add(1)?)?;
+            slots = slots.checked_add(out.outer.len())?;
+            for hole in &out.holes {
+                slots = slots.checked_add(hole.len())?;
+            }
+        }
+        slots
+            .checked_mul(std::mem::size_of::<Option<Vec<ConvertedEdge>>>())?
+            .checked_add(loops.checked_mul(std::mem::size_of::<Vec<Option<Vec<ConvertedEdge>>>>())?)
+    })();
+    if !work.charge_history(overhead) {
+        let geometry = output.into_iter().map(|out| out.region).collect::<Vec<_>>();
+        let origins = vec![RegionOrigins::default(); geometry.len()];
+        return Regions { geometry, origins };
+    }
+    let mut geometry = Vec::with_capacity(output.len());
+    let mut origins = Vec::with_capacity(output.len());
+    for out in output {
+        let mut compose = |source: &Option<Vec<solidcraft_kernel::InputBoundary>>| -> Option<Vec<ConvertedEdge>> {
+            let source = source.as_ref().filter(|s| !s.is_empty())?;
+            let lookup = |s: &solidcraft_kernel::InputBoundary| -> Option<&Option<Vec<ConvertedEdge>>> {
+                let input = match s.operand {
+                    0 => a,
+                    1 => b,
+                    _ => return None,
+                };
+                let region = input.get(s.region)?;
+                let lp = match s.loop_kind {
+                    solidcraft_kernel::BoundaryLoop::Outer => &region.outer,
+                    solidcraft_kernel::BoundaryLoop::Hole(k) => region.holes.get(k)?,
+                };
+                lp.get(s.segment)
+            };
+            // Resolve every parent before allocation; never retain a partial known set.
+            let mut refs = 0usize;
+            for s in source {
+                let parents = lookup(s)?.as_ref().filter(|s| !s.is_empty())?;
+                if !s.whole && parents.len() != 1 {
+                    return None;
+                }
+                refs = refs.checked_add(parents.len())?;
+            }
+            let cost = refs
+                .checked_mul(std::mem::size_of::<ConvertedEdge>())
+                .and_then(|n| n.checked_add(std::mem::size_of::<Vec<ConvertedEdge>>()))
+                .and_then(|n| refs.checked_mul(refs.max(1).ilog2() as usize + 1).and_then(|sort| n.checked_add(sort)));
+            if !work.charge_history(cost) {
+                return None;
+            }
+            let mut all = Vec::new();
+            for s in source {
+                let input = match s.operand {
+                    0 => a,
+                    1 => b,
+                    _ => return None,
+                };
+                let region = input.get(s.region)?;
+                let lp = match s.loop_kind {
+                    solidcraft_kernel::BoundaryLoop::Outer => &region.outer,
+                    solidcraft_kernel::BoundaryLoop::Hole(k) => region.holes.get(k)?,
+                };
+                all.extend(lp.get(s.segment)?.as_ref().filter(|s| !s.is_empty())?.iter().copied());
+            }
+            all.sort();
+            all.dedup();
+            (!all.is_empty()).then_some(all)
+        };
+        origins.push(RegionOrigins {
+            outer: out.outer.iter().map(&mut compose).collect(),
+            holes: out.holes.iter().map(|h| h.iter().map(&mut compose).collect()).collect(),
+        });
+        geometry.push(out.region);
+    }
+    Regions { geometry, origins }
+}
+
 /// How near (mm) a cut may come to a piece's loops and still be a hole of it as it is: as near
 /// as the sew joins points.
 const CLEAR: f64 = 1e-6;
@@ -44,43 +281,53 @@ const ON_LINE: f64 = 1e-7;
 /// cuts), with each piece of a zone sorted by what still holds it (see [`sort_zones`]), and their
 /// longest arcs halved (see [`halved`]). The flat pattern and the folded solid are both made of
 /// them, edge for edge.
-pub(crate) fn pieces(dev: &Development, work: &mut FlatWork) -> Result<Vec<(Piece, Region2)>> {
+pub(crate) fn pieces(dev: &Development, seeds: &[RegionOrigins], rips: &[Option<ConvertedEdge>], work: &mut FlatWork) -> Result<Pieces> {
     #[cfg(test)]
     crate::eval::cost_tests::count_flat();
     let mut pieces = Vec::new();
+    let mut origins = Vec::new();
     for (i, flat) in dev.panels.iter().enumerate() {
         let Some(flat) = flat else { continue };
         let placed = on_grid(&flat.region);
+        let source = RegionOrigins::developed(flat, seeds.get(i), rips, work);
         let trims: Vec<Region2> = dev.trims.iter().filter(|t| t.panel == i).map(|t| on_grid(&t.region)).collect();
         if trims.is_empty() {
             pieces.push((Piece::Panel(i), placed));
+            origins.push(source);
         } else {
             // Until the kernel's planar booleans take several tools that share an edge (#6748):
             // trims of two bends can share an edge and a corner with the panel, which the
             // planar booleans take apart only one tool at a time, so join them first.
-            let trims = stage(&format!("joining panel {i}'s trims"), planar_union(trims, work))?;
-            let left = stage(&format!("trimming panel {i}"), boolean_past_holes(&[placed], &trims, BoolOp::Cut, work))?;
-            pieces.extend(left.into_iter().map(|r| (Piece::Panel(i), r)));
+            let trims = stage(&format!("joining panel {i}'s trims"), planar_union(Regions::unknown(trims), work))?;
+            let left =
+                stage(&format!("trimming panel {i}"), boolean_past_holes(&[placed], &trims.geometry, BoolOp::Cut, &[source], &trims.origins, work))?;
+            pieces.extend(left.geometry.into_iter().map(|r| (Piece::Panel(i), r)));
+            origins.extend(left.origins);
         }
     }
     pieces.extend(dev.zones.iter().enumerate().map(|(z, zone)| (Piece::Zone(z), on_grid(&zone.region))));
+    origins.extend(dev.zones.iter().map(|zone| RegionOrigins::unknown(&zone.region)));
+    let pieces = Regions { geometry: pieces, origins };
     if dev.cuts.is_empty() {
-        return Ok(halved(pieces));
+        return Ok(halved(pieces, work));
     }
     // A cut clear inside one piece is a hole of it as it is, its curves kept; the rest are cut
     // from every piece they reach. A cut that came clear of the pieces but meets what the others
     // cut from them is cut the same way, after them.
     let cuts: Vec<Region2> = dev.cuts.iter().map(on_grid).collect();
-    let (inside, across): (Vec<&Region2>, Vec<&Region2>) = cuts.iter().partition(|c| pieces.iter().any(|(_, r)| holds_clear(r, c)));
+    let (inside, across): (Vec<&Region2>, Vec<&Region2>) = cuts.iter().partition(|c| pieces.geometry.iter().any(|(_, r)| holds_clear(r, c)));
     let mut out = cut_from(pieces, &across, work)?;
     let mut late = Vec::new();
     for c in inside {
-        match out.iter_mut().find(|(_, r)| holds_clear(r, c)) {
-            Some((_, r)) => r.holes.push(c.outer.ccw().reversed()),
+        match out.geometry.iter_mut().zip(&mut out.origins).find(|((_, r), _)| holds_clear(r, c)) {
+            Some(((_, r), source)) => {
+                source.holes.push(vec![None; c.outer.segs.len()]);
+                r.holes.push(c.outer.ccw().reversed());
+            }
             None => late.push(c),
         }
     }
-    Ok(halved(sort_zones(dev, cut_from(out, &late, work)?)?))
+    Ok(halved(sort_zones(dev, cut_from(out, &late, work)?)?, work))
 }
 
 /// The pieces with each arc of more than three quarters of a turn (a hole's whole circle) halved
@@ -89,34 +336,71 @@ pub(crate) fn pieces(dev: &Development, work: &mut FlatWork) -> Result<Vec<(Piec
 /// vertex, the folded solid's wall along such an arc is two faces, one on each half (see
 /// `sheet_surface_fold::cells`, which takes these pieces' arcs as they are). The flat keeps the
 /// same two edges: an edge of the flat is an edge of the folded sheet.
-fn halved(pieces: Vec<(Piece, Region2)>) -> Vec<(Piece, Region2)> {
-    let halves = |l: Loop2| Loop2 {
-        segs: l
+fn halved(mut pieces: Pieces, work: &mut FlatWork) -> Pieces {
+    let tags = pieces.origins.iter().flat_map(|r| r.outer.iter().chain(r.holes.iter().flatten()));
+    if !charge_sources(work, tags, 4, false) {
+        pieces.origins = vec![RegionOrigins::default(); pieces.geometry.len()];
+    }
+    let halves = |l: Loop2, source: Vec<Option<Vec<ConvertedEdge>>>| {
+        let mut tags = Vec::new();
+        let segs = l
             .segs
             .into_iter()
-            .flat_map(|e| match e {
-                Seg2::Arc { center, radius, start, sweep } if sweep.abs() > std::f64::consts::PI * 1.5 => {
-                    let half = sweep / 2.0;
-                    vec![Seg2::Arc { center, radius, start, sweep: half }, Seg2::Arc { center, radius, start: start + half, sweep: half }]
+            .enumerate()
+            .flat_map(|(k, e)| {
+                let tag = source.get(k).cloned().flatten();
+                match e {
+                    Seg2::Arc { center, radius, start, sweep } if sweep.abs() > std::f64::consts::PI * 1.5 => {
+                        let half = sweep / 2.0;
+                        let tag = split_sources(&tag);
+                        tags.extend([tag.clone(), tag]);
+                        vec![Seg2::Arc { center, radius, start, sweep: half }, Seg2::Arc { center, radius, start: start + half, sweep: half }]
+                    }
+                    e => {
+                        tags.push(tag);
+                        vec![e]
+                    }
                 }
-                e => vec![e],
             })
-            .collect(),
+            .collect();
+        (Loop2 { segs }, tags)
     };
-    pieces.into_iter().map(|(piece, r)| (piece, Region2 { outer: halves(r.outer), holes: r.holes.into_iter().map(halves).collect() })).collect()
+    let mut geometry = Vec::new();
+    let mut origins = Vec::new();
+    for (k, (piece, r)) in pieces.geometry.into_iter().enumerate() {
+        let source = pieces.origins.get(k).cloned().unwrap_or_else(|| RegionOrigins::unknown(&r));
+        let (outer, outer_tags) = halves(r.outer, source.outer);
+        let mut holes = Vec::new();
+        let mut hole_tags = Vec::new();
+        for (i, h) in r.holes.into_iter().enumerate() {
+            let (h, tags) = halves(h, source.holes.get(i).cloned().unwrap_or_default());
+            holes.push(h);
+            hole_tags.push(tags);
+        }
+        geometry.push((piece, Region2 { outer, holes }));
+        origins.push(RegionOrigins { outer: outer_tags, holes: hole_tags });
+    }
+    Regions { geometry, origins }
 }
 
 /// `pieces` less `cuts`, joined first: what each piece leaves, each a piece of the same kind.
-fn cut_from(pieces: Vec<(Piece, Region2)>, cuts: &[&Region2], work: &mut FlatWork) -> Result<Vec<(Piece, Region2)>> {
+fn cut_from(mut pieces: Pieces, cuts: &[&Region2], work: &mut FlatWork) -> Result<Pieces> {
+    if !charge_sources(work, pieces.origins.iter().flat_map(|r| r.outer.iter().chain(r.holes.iter().flatten())), 1, false) {
+        pieces.origins = vec![RegionOrigins::default(); pieces.geometry.len()];
+    }
     if cuts.is_empty() {
         return Ok(pieces);
     }
-    let cuts = stage("joining what is cut from the flat", planar_union(cuts.iter().map(|c| (*c).clone()).collect(), work))?;
-    let mut out = Vec::with_capacity(pieces.len());
-    for (piece, region) in pieces {
-        out.extend(stage("cutting the flat", boolean_past_holes(&[region], &cuts, BoolOp::Cut, work))?.into_iter().map(|r| (piece, r)));
+    let cuts = stage("joining what is cut from the flat", planar_union(Regions::unknown(cuts.iter().map(|c| (*c).clone()).collect()), work))?;
+    let mut out = Vec::with_capacity(pieces.geometry.len());
+    let mut origins = Vec::new();
+    for (k, (piece, region)) in pieces.geometry.into_iter().enumerate() {
+        let source = pieces.origins.get(k).cloned().unwrap_or_else(|| RegionOrigins::unknown(&region));
+        let cut = stage("cutting the flat", boolean_past_holes(&[region], &cuts.geometry, BoolOp::Cut, &[source], &cuts.origins, work))?;
+        out.extend(cut.geometry.into_iter().map(|r| (piece, r)));
+        origins.extend(cut.origins);
     }
-    Ok(out)
+    Ok(Regions { geometry: out, origins })
 }
 
 /// Whether `cut` lies clear inside `region`, so that it is a hole of it as it is: within its
@@ -198,9 +482,9 @@ fn segment_distance(p: Vec2, a: Vec2, b: Vec2) -> f64 {
 /// its panels' tangent lines bends with the zone; one that runs along only one is a tab of that
 /// panel. A piece that runs along neither is refused. A zone left with nothing that bends (cuts
 /// part the sheet there) leaves its panels as pieces of their own, each where the bend held it.
-fn sort_zones(dev: &Development, pieces: Vec<(Piece, Region2)>) -> Result<Vec<(Piece, Region2)>> {
-    let mut out = Vec::with_capacity(pieces.len());
-    for (piece, region) in pieces {
+fn sort_zones(dev: &Development, pieces: Pieces) -> Result<Pieces> {
+    let mut out = Vec::with_capacity(pieces.geometry.len());
+    for (piece, region) in pieces.geometry {
         let Piece::Zone(z) = piece else {
             out.push((piece, region));
             continue;
@@ -216,7 +500,7 @@ fn sort_zones(dev: &Development, pieces: Vec<(Piece, Region2)>) -> Result<Vec<(P
         };
         out.push((sorted, region));
     }
-    Ok(out)
+    Ok(Regions { geometry: out, origins: pieces.origins })
 }
 
 /// Whether an edge of `region`'s outline runs along the line from `a` to `b` for more than a
@@ -251,8 +535,15 @@ pub(crate) fn join_pieces(pieces: &[(Piece, Region2)], work: &mut FlatWork) -> R
         }
         bare.push(Region2 { outer: r.outer, holes: near });
     }
-    let joined = stage("joining the sheet's pieces", planar_union(bare, work))?;
-    stage("joining the sheet's pieces", put_back(joined, carried))
+    let joined = stage("joining the sheet's pieces", planar_union(Regions::unknown(bare), work))?;
+    let carried = carried
+        .into_iter()
+        .map(|h| {
+            let tags = vec![None; h.segs.len()];
+            (h, tags)
+        })
+        .collect();
+    Ok(stage("joining the sheet's pieces", put_back(joined, carried))?.geometry)
 }
 
 /// A loop's box, out by [`CLEAR`]: the box that holds its segments (see
@@ -341,19 +632,22 @@ fn holes_apart(region: &Region2) -> Vec<bool> {
 /// The holes `carried` back in the regions of `out` that hold them: each kept clear of every
 /// other loop (see [`holes_apart`] and [`loop_clear_of`]), so that the region holding a point of
 /// it holds it all, read exactly (see [`holds`]).
-fn put_back(mut out: Vec<Region2>, carried: Vec<Loop2>) -> Result<Vec<Region2>> {
-    let mut boxes: Vec<(Aabb2, Vec<Aabb2>)> = out.iter().map(|r| (loop_box(&r.outer), r.holes.iter().map(loop_box).collect())).collect();
-    for h in carried {
+fn put_back(mut out: Regions, carried: Vec<(Loop2, Vec<Option<Vec<ConvertedEdge>>>)>) -> Result<Regions> {
+    let mut boxes: Vec<(Aabb2, Vec<Aabb2>)> = out.geometry.iter().map(|r| (loop_box(&r.outer), r.holes.iter().map(loop_box).collect())).collect();
+    for (h, source) in carried {
         let Some(at) = h.segs.first().map(Seg2::start) else { continue };
-        let (r, (_, hole_boxes)) = out
+        let ((r, tags), (_, hole_boxes)) = out
+            .geometry
             .iter_mut()
+            .zip(&mut out.origins)
             .zip(&mut boxes)
-            .find(|(r, (outer_box, hole_boxes))| {
+            .find(|((r, _), (outer_box, hole_boxes))| {
                 outer_box.contains(at) && holds(&r.outer, at) && !r.holes.iter().zip(hole_boxes.iter()).any(|(k, kb)| kb.contains(at) && holds(k, at))
             })
             .ok_or_else(|| DocError::Invalid("a cut-out of the flat lost its piece".into()))?;
         hole_boxes.push(loop_box(&h));
         r.holes.push(h);
+        tags.holes.push(source);
     }
     Ok(out)
 }
@@ -379,27 +673,43 @@ pub(crate) fn loop_clear_of(h: &Loop2, t: &Region2) -> bool {
 /// `op` of `a` with `b` ([`planar_boolean`]), the holes of `a` clear of every region of `b`
 /// (see [`loop_clear_of`]) and of their own region's other loops (see [`holes_apart`]) left out
 /// of it and put back in the region of the result that holds them.
-pub(crate) fn boolean_past_holes(a: &[Region2], b: &[Region2], op: BoolOp, work: &mut FlatWork) -> Result<Vec<Region2>> {
+pub(crate) fn boolean_past_holes(
+    a: &[Region2],
+    b: &[Region2],
+    op: BoolOp,
+    a_origins: &[RegionOrigins],
+    b_origins: &[RegionOrigins],
+    work: &mut FlatWork,
+) -> Result<Regions> {
     let clear_of_tools = |h: &Loop2| b.iter().all(|t| loop_clear_of(h, t));
-    let mut carried: Vec<Loop2> = Vec::new();
+    let a_origins =
+        if charge_sources(work, a_origins.iter().flat_map(|r| r.outer.iter().chain(r.holes.iter().flatten())), 2, false) { a_origins } else { &[] };
+    let mut carried = Vec::new();
+    let mut bare_origins = Vec::new();
     let bare: Vec<Region2> = a
         .iter()
-        .map(|r| {
+        .enumerate()
+        .map(|(ri, r)| {
+            let source = a_origins.get(ri).cloned().unwrap_or_else(|| RegionOrigins::unknown(r));
             let mut near = Vec::new();
-            for (h, apart) in r.holes.iter().zip(holes_apart(r)) {
+            let mut near_origins = Vec::new();
+            for (hi, (h, apart)) in r.holes.iter().zip(holes_apart(r)).enumerate() {
+                let tags = source.holes.get(hi).cloned().unwrap_or_else(|| vec![None; h.segs.len()]);
                 if apart && clear_of_tools(h) {
-                    carried.push(h.clone());
+                    carried.push((h.clone(), tags));
                 } else {
                     near.push(h.clone());
+                    near_origins.push(tags);
                 }
             }
+            bare_origins.push(RegionOrigins { outer: source.outer, holes: near_origins });
             Region2 { outer: r.outer.clone(), holes: near }
         })
         .collect();
     if carried.is_empty() {
-        return planar_boolean(a, b, op, work);
+        return planar_boolean(a, b, op, a_origins, b_origins, work);
     }
-    put_back(planar_boolean(&bare, b, op, work)?, carried)
+    put_back(planar_boolean(&bare, b, op, &bare_origins, b_origins, work)?, carried)
 }
 
 /// How far apart (mm) the planar booleans let a loop's segments end and still close it: the
@@ -409,30 +719,48 @@ const CLOSE: f64 = 1e-7;
 /// `op` of `a` with `b` by the kernel's planar booleans, as the regions are: every edge of the
 /// result is a piece of an edge of `a` or `b`, however short, and no corner moves. The work is
 /// charged to `work`, which bounds the flat's.
-pub(crate) fn planar_boolean(a: &[Region2], b: &[Region2], op: BoolOp, work: &mut FlatWork) -> Result<Vec<Region2>> {
+pub(crate) fn planar_boolean(
+    a: &[Region2],
+    b: &[Region2],
+    op: BoolOp,
+    a_origins: &[RegionOrigins],
+    b_origins: &[RegionOrigins],
+    work: &mut FlatWork,
+) -> Result<Regions> {
     let edges =
         |rs: &[Region2]| rs.iter().flat_map(|r| std::iter::once(&r.outer).chain(&r.holes)).fold(0usize, |n, l| n.saturating_add(l.segs.len()));
     let n = edges(a).saturating_add(edges(b));
     work.charge(n.saturating_mul(n).saturating_mul(16))?;
-    Ok(solidcraft_kernel::planar_regions_boolean(a, b, op, CLOSE)?)
+    Ok(compose_regions(solidcraft_kernel::planar_regions_boolean_with_history(a, b, op, CLOSE)?, a_origins, b_origins, work))
 }
 
 /// The union of `regions` ([`planar_boolean`]), in balanced rounds: many pieces side by side do
 /// not each meet a growing union one at a time.
-pub(crate) fn planar_union(regions: Vec<Region2>, work: &mut FlatWork) -> Result<Vec<Region2>> {
-    let mut groups: Vec<Vec<Region2>> = regions.into_iter().map(|r| vec![r]).collect();
+pub(crate) fn planar_union(mut regions: Regions, work: &mut FlatWork) -> Result<Regions> {
+    if !charge_sources(work, regions.origins.iter().flat_map(|r| r.outer.iter().chain(r.holes.iter().flatten())), 1, false) {
+        regions.origins = vec![RegionOrigins::default(); regions.geometry.len()];
+    }
+    let mut groups: Vec<Regions> = regions
+        .geometry
+        .into_iter()
+        .enumerate()
+        .map(|(k, r)| {
+            let source = regions.origins.get(k).cloned().unwrap_or_else(|| RegionOrigins::unknown(&r));
+            Regions { geometry: vec![r], origins: vec![source] }
+        })
+        .collect();
     while groups.len() > 1 {
         let mut next = Vec::with_capacity(groups.len().div_ceil(2));
         let mut iter = groups.into_iter();
         while let Some(a) = iter.next() {
             match iter.next() {
-                Some(b) => next.push(planar_boolean(&a, &b, BoolOp::Union, work)?),
+                Some(b) => next.push(planar_boolean(&a.geometry, &b.geometry, BoolOp::Union, &a.origins, &b.origins, work)?),
                 None => next.push(a),
             }
         }
         groups = next;
     }
-    Ok(groups.pop().unwrap_or_default())
+    Ok(groups.pop().unwrap_or_else(|| Regions::unknown(Vec::new())))
 }
 
 /// A region with its points on a nanometer grid. Until the kernel's planar booleans weld edges
@@ -468,6 +796,31 @@ mod tests {
 
     fn rect_loop(x0: f64, y0: f64, x1: f64, y1: f64) -> Loop2 {
         Loop2::polygon(&[Vec2::new(x0, y0), Vec2::new(x1, y0), Vec2::new(x1, y1), Vec2::new(x0, y1)])
+    }
+
+    #[test]
+    fn exhausted_boundary_history_keeps_the_same_boolean_geometry() {
+        let a = Region2 { outer: rect_loop(0.0, 0.0, 20.0, 10.0), holes: Vec::new() };
+        let b = Region2 { outer: rect_loop(5.0, -5.0, 15.0, 15.0), holes: Vec::new() };
+        let edge = ConvertedEdge { edge: 0, faces: [0, 1] };
+        let origins = RegionOrigins { outer: vec![Some(vec![edge]); 4], holes: Vec::new() };
+        let live = planar_boolean(
+            std::slice::from_ref(&a),
+            std::slice::from_ref(&b),
+            BoolOp::Cut,
+            std::slice::from_ref(&origins),
+            &[],
+            &mut FlatWork::new(),
+        )
+        .unwrap();
+        assert!(live.origins.iter().flat_map(|r| &r.outer).any(Option::is_some));
+        let mut exhausted = FlatWork::new();
+        assert!(!exhausted.charge_history(None));
+        let without_history = planar_boolean(&[a], &[b], BoolOp::Cut, &[origins], &[], &mut exhausted).unwrap();
+        assert_eq!(without_history.geometry, live.geometry);
+        assert_eq!(without_history.geometry.iter().map(Region2::area).sum::<f64>(), 100.0);
+        assert!(without_history.origins.iter().flat_map(|r| r.outer.iter().chain(r.holes.iter().flatten())).all(Option::is_none));
+        assert!(exhausted.charge(1).is_ok(), "optional history never spends the geometry budget");
     }
 
     fn ref_holds_clear(region: &Region2, cut: &Region2) -> bool {
@@ -591,14 +944,77 @@ mod tests {
                 carried.push(Loop2::circle(Vec2::new(210.0 + col as f64 * 10.0, 20.0 + row as f64 * 16.0), 2.0).reversed());
             }
         }
-        let placed = put_back(base.clone(), carried.clone()).unwrap();
+        let carried_with_origins = |holes: Vec<Loop2>| {
+            holes
+                .into_iter()
+                .map(|h| {
+                    let tags = vec![None; h.segs.len()];
+                    (h, tags)
+                })
+                .collect()
+        };
+        let placed = put_back(Regions::unknown(base.clone()), carried_with_origins(carried.clone())).unwrap().geometry;
         let expected_placed = ref_put_back(base.clone(), carried).unwrap();
         assert_eq!(placed, expected_placed);
         assert_eq!(placed[0].holes.len(), 61);
         assert_eq!(placed[1].holes.len(), 60);
 
         // A hole inside an existing hole or outside all regions must fail identically to reference.
-        assert!(put_back(base.clone(), vec![Loop2::circle(Vec2::new(10.0, 10.0), 0.5).reversed()]).is_err());
-        assert!(put_back(base, vec![Loop2::circle(Vec2::new(160.0, 60.0), 2.0).reversed()]).is_err());
+        assert!(put_back(Regions::unknown(base.clone()), carried_with_origins(vec![Loop2::circle(Vec2::new(10.0, 10.0), 0.5).reversed()])).is_err());
+        assert!(put_back(Regions::unknown(base), carried_with_origins(vec![Loop2::circle(Vec2::new(160.0, 60.0), 2.0).reversed()])).is_err());
+    }
+
+    #[test]
+    fn trimming_a_previously_merged_boundary_does_not_copy_all_ancestors() {
+        let region = |x0, x1| Region2 { outer: rect_loop(x0, 0.0, x1, 10.0), holes: Vec::new() };
+        let origins = |base: usize| RegionOrigins {
+            outer: (0..4).map(|k| Some(vec![ConvertedEdge { edge: base + k, faces: [base + k, base + k + 1] }])).collect(),
+            holes: Vec::new(),
+        };
+        let first = origins(0);
+        let second = origins(4);
+        let whole = planar_boolean(
+            &[region(0.0, 10.0)],
+            &[region(10.0, 20.0)],
+            BoolOp::Union,
+            std::slice::from_ref(&first),
+            std::slice::from_ref(&second),
+            &mut FlatWork::new(),
+        )
+        .unwrap();
+        assert_eq!(whole.geometry.len(), 1);
+        assert_eq!(whole.origins.len(), 1);
+        let bottom = Seg2::Line { a: Vec2::new(0.0, 0.0), b: Vec2::new(20.0, 0.0) };
+        let at = whole.geometry[0].outer.segs.iter().position(|s| *s == bottom).expect("the real union must merge the two bottom edges");
+        let parents = Some(vec![first.outer[0].as_ref().unwrap()[0], second.outer[0].as_ref().unwrap()[0]]);
+        assert_eq!(whole.origins[0].outer[at], parents, "the setup must produce actual mixed parents before the second boolean");
+
+        let unchanged = planar_boolean(&whole.geometry, &[], BoolOp::Union, &whole.origins, &[], &mut FlatWork::new()).unwrap();
+        assert_eq!(unchanged.geometry, whole.geometry);
+        assert_eq!(unchanged.origins, whole.origins, "an unchanged whole mixed boundary retains both known parents");
+
+        // The tool stays outside y=0 and y=10, so it contributes neither bottom nor top.
+        let tool = Region2 { outer: rect_loop(-1.0, -1.0, 5.0, 11.0), holes: Vec::new() };
+        let shortened = Seg2::Line { a: Vec2::new(0.0, 0.0), b: Vec2::new(5.0, 0.0) };
+        let singleton = planar_boolean(
+            &[region(0.0, 20.0)],
+            std::slice::from_ref(&tool),
+            BoolOp::Intersect,
+            std::slice::from_ref(&first),
+            &[],
+            &mut FlatWork::new(),
+        )
+        .unwrap();
+        assert_eq!(singleton.geometry.len(), 1);
+        let single_at = singleton.geometry[0].outer.segs.iter().position(|s| *s == shortened).expect("the singleton control retains x=0..5");
+        assert_eq!(singleton.origins[0].outer[single_at], first.outer[0], "trimming one known parent preserves that parent");
+        assert_eq!(singleton.geometry[0].area(), 50.0);
+
+        let trimmed = planar_boolean(&whole.geometry, &[tool], BoolOp::Intersect, &whole.origins, &[], &mut FlatWork::new()).unwrap();
+        assert_eq!(trimmed.geometry, singleton.geometry, "ancestral metadata does not change the boolean geometry");
+        let trimmed_at = trimmed.geometry[0].outer.segs.iter().position(|s| *s == shortened).expect("the mixed control retains the same x=0..5 edge");
+        // Only the left rectangle contributes to x=0..5. Without an input-extent certificate,
+        // the old full mixed set cannot be certified for this strict subpiece.
+        assert_eq!(trimmed.origins[0].outer[trimmed_at], None);
     }
 }

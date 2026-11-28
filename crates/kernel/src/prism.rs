@@ -8,6 +8,8 @@
 use solidcore_record::{Plane, Region2, Seg2, Vec2};
 use solidcraft_geom::prelude::*;
 
+pub use solidcore_record::{BoundaryLoop, InputBoundary, RegionWithHistory};
+
 use crate::body::Body;
 use crate::{BoolOp, KernelError, Result};
 
@@ -23,19 +25,34 @@ pub const PLANAR_FIT_TOL: f64 = 1e-3;
 /// a canonical order. `tolerance` (mm, 1e-9 to 1) is how far apart a loop's segments may end and
 /// still close it. solidcore's ([`solidcore_ops::prism::planar_regions_boolean`]).
 pub fn planar_regions_boolean(a: &[Region2], b: &[Region2], op: BoolOp, tolerance: f64) -> Result<Vec<Region2>> {
-    let op = match op {
+    crate::guard("planar region boolean", || {
+        solidcore_ops::prism::planar_regions_boolean(a, b, planar_operation(op), tolerance).map_err(planar_error)
+    })
+}
+
+/// The same planar boolean, with each result boundary's exact input sources alongside its
+/// segments. Unknown sources remain unknown; callers must not use them as certified names.
+pub fn planar_regions_boolean_with_history(a: &[Region2], b: &[Region2], op: BoolOp, tolerance: f64) -> Result<Vec<RegionWithHistory>> {
+    crate::guard("planar region boolean", || {
+        solidcore_ops::prism::planar_regions_boolean_with_history(a, b, planar_operation(op), tolerance).map_err(planar_error)
+    })
+}
+
+fn planar_operation(op: BoolOp) -> solidcore_ops::BooleanOp {
+    match op {
         BoolOp::Union => solidcore_ops::BooleanOp::Union,
         BoolOp::Cut => solidcore_ops::BooleanOp::Subtract,
         BoolOp::Intersect => solidcore_ops::BooleanOp::Intersect,
-    };
-    crate::guard("planar region boolean", || {
-        solidcore_ops::prism::planar_regions_boolean(a, b, op, tolerance).map_err(|e| match e {
-            solidcore_ops::Error::Argument => KernelError::Invalid("planar boolean tolerance must be finite and between 1e-9 and 1 mm".into()),
-            solidcore_ops::Error::Profile(_) => KernelError::Invalid(format!("planar boolean: {e}")),
-            solidcore_ops::Error::Internal(m) => KernelError::Internal(format!("planar regions: {m}")),
-            e => KernelError::Failed(format!("planar regions: {e}")),
-        })
-    })
+    }
+}
+
+fn planar_error(e: solidcore_ops::Error) -> KernelError {
+    match e {
+        solidcore_ops::Error::Argument => KernelError::Invalid("planar boolean tolerance must be finite and between 1e-9 and 1 mm".into()),
+        solidcore_ops::Error::Profile(_) => KernelError::Invalid(format!("planar boolean: {e}")),
+        solidcore_ops::Error::Internal(m) => KernelError::Internal(format!("planar regions: {m}")),
+        e => KernelError::Failed(format!("planar regions: {e}")),
+    }
 }
 
 /// The channel between two walls filled as `options` asks, solidcore's

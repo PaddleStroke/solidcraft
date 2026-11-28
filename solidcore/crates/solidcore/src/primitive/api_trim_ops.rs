@@ -240,6 +240,18 @@ pub fn trim_project_parallel(
 /// Those of the new B-rep and of
 /// [`crate::topology::brep::p8::create_planar_faces_with_3d_curves`].
 pub fn create_planar_faces(k: &mut Kernel, curves: &[Curve]) -> Result<Brep> {
+    create_planar_faces_with_edges(k, curves).map(|(body, _)| body)
+}
+
+/// Creates the same faces and returns the actual edge made from each input curve.
+/// Missing construction mappings are omitted, never replaced by an order guess.
+///
+/// # Errors
+/// Those of the geometric planar-face constructor.
+pub fn create_planar_faces_with_edges(
+    k: &mut Kernel,
+    curves: &[Curve],
+) -> Result<(Brep, Vec<(crate::topology::EdgeId, usize)>)> {
     let mut b = new_api_brep(k)?;
     let region = b.infinite_region();
     let mut state = ArenaNotifyState::new(&b);
@@ -251,10 +263,10 @@ pub fn create_planar_faces(k: &mut Kernel, curves: &[Curve]) -> Result<Brep> {
         marks: &mut marks,
         this_face: &this_face,
     };
-    crate::topology::brep::p8::create_planar_faces_with_3d_curves(
+    let (_, edges) = crate::topology::brep::p8::create_planar_faces_with_3d_curves_and_edges(
         k, &mut b, region, curves, API_TOL, &mut fenv,
     )?;
-    Ok(b)
+    Ok((b, edges))
 }
 
 /// Trims `brep` in place by `curve` projected along `direction`, keeping the side of

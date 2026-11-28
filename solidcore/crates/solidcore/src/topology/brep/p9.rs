@@ -1235,10 +1235,40 @@ pub(crate) fn make_vertex_split_edge_with_curve_identity_state(
             "split edge without primary use",
         )?;
         let same = b.edgeuse(primary)?.orientation == OrientType::Same;
+        let lower = (state.key_of)(EntityRef::Edge(if same { edge_id } else { new_edge }));
+        let upper = (state.key_of)(EntityRef::Edge(if same { new_edge } else { edge_id }));
+        state.with_env(k, |env| {
+            crate::geom::object::report_boundary_edit(
+                env.context.as_deref_mut(),
+                crate::geom::object::BoundaryEdit::BeginSplit {
+                    parent: edge_ref,
+                    lower,
+                    upper,
+                    bounds: [interval.min(), interval.max()],
+                    at: parameter,
+                },
+            );
+            Ok(())
+        })?;
         edge::set_interval(b, edge_id, if same { &ivl1 } else { &ivl2 })?;
         edge::set_interval(b, new_edge, if same { &ivl2 } else { &ivl1 })?;
-        let mut copied =
-            required(b.edge(edge_id)?.curve.as_ref(), "split edge without curve")?.copy(k)?;
+        let mut copy_source = crate::nurbs::b_spline_curve_n_lib::CopySourceOutcome::Uncertified;
+        let mut lower_source = crate::nurbs::b_spline_curve_n_lib::TrimSourceOutcome::Uncertified;
+        let mut upper_source = crate::nurbs::b_spline_curve_n_lib::TrimSourceOutcome::Uncertified;
+        let record_sources;
+        let mut copied = {
+            let source = required(b.edge(edge_id)?.curve.as_ref(), "split edge without curve")?;
+            let work = source.source_domain_observation_work();
+            record_sources = state.with_env(k, |env| {
+                Ok(work.is_some_and(|work| {
+                    crate::geom::object::reserve_boundary_source_work(
+                        env.context.as_deref_mut(),
+                        work,
+                    )
+                }))
+            })?;
+            source.copy_with_source(k, record_sources.then_some(&mut copy_source))?
+        };
         let old_curve_ref = state.with_env(k, |env| {
             let curve = required(
                 b.edge_mut(edge_id)?.curve.as_mut(),
@@ -1279,20 +1309,22 @@ pub(crate) fn make_vertex_split_edge_with_curve_identity_state(
                 b.edge_mut(edge_id)?.curve.as_mut(),
                 "split edge without curve",
             )?
-            .trim(
+            .trim_with_source(
                 k,
                 &mut ivl1,
                 crate::nurbs::b_spline_curve_n_lib::TrimMode::Notify,
+                record_sources.then_some(&mut lower_source),
             )?;
             split_parameter = ivl1.max();
             required(
                 b.edge_mut(new_edge)?.curve.as_mut(),
                 "new split edge without curve",
             )?
-            .trim(
+            .trim_with_source(
                 k,
                 &mut ivl2,
                 crate::nurbs::b_spline_curve_n_lib::TrimMode::Notify,
+                record_sources.then_some(&mut upper_source),
             )?;
             edge::set_interval(b, edge_id, &ivl1)?;
             edge::set_interval(b, new_edge, &ivl2)?;
@@ -1301,20 +1333,22 @@ pub(crate) fn make_vertex_split_edge_with_curve_identity_state(
                 b.edge_mut(edge_id)?.curve.as_mut(),
                 "split edge without curve",
             )?
-            .trim(
+            .trim_with_source(
                 k,
                 &mut ivl2,
                 crate::nurbs::b_spline_curve_n_lib::TrimMode::Notify,
+                record_sources.then_some(&mut upper_source),
             )?;
             split_parameter = ivl2.min();
             required(
                 b.edge_mut(new_edge)?.curve.as_mut(),
                 "new split edge without curve",
             )?
-            .trim(
+            .trim_with_source(
                 k,
                 &mut ivl1,
                 crate::nurbs::b_spline_curve_n_lib::TrimMode::Notify,
+                record_sources.then_some(&mut lower_source),
             )?;
             edge::set_interval(b, edge_id, &ivl2)?;
             edge::set_interval(b, new_edge, &ivl1)?;
@@ -1449,6 +1483,18 @@ pub(crate) fn make_vertex_split_edge_with_curve_identity_state(
         })?;
         sync_edge_cache(b, edge_id)?;
         sync_edge_cache(b, new_edge)?;
+        state.with_env(k, |env| {
+            crate::geom::object::report_boundary_edit(
+                env.context.as_deref_mut(),
+                crate::geom::object::BoundaryEdit::CommitSplit {
+                    parent: edge_ref,
+                    copy_source,
+                    lower_source,
+                    upper_source,
+                },
+            );
+            Ok(())
+        })?;
         Ok(SplitEdgeOutput {
             split: true,
             edges: Some([edge_id, new_edge]),
@@ -1606,6 +1652,15 @@ pub fn make_edge_in_face_with_vu_with_curve_identity(
         vertexuses.push(b.add_vertexuse_record(Vertexuse::default())?);
     }
     register_entities(env, &[EntityRef::Edge(edge_id)]);
+    // This actual allocation precedes the original first SetCurve notification.
+    // An observer may track pending birth; it is not source/coverage evidence.
+    if crate::geom::object::reserve_boundary_source_work(env.context.as_deref_mut(), 4) {
+        let target = (env.key_of)(EntityRef::Edge(edge_id));
+        crate::geom::object::report_boundary_edit(
+            env.context.as_deref_mut(),
+            crate::geom::object::BoundaryEdit::FreshAllocated { target },
+        );
+    }
     for &eu in &uses {
         register_entities(env, &[EntityRef::Edgeuse(eu)]);
     }
@@ -3195,6 +3250,7 @@ fn drop_curve(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::math::det;
 
     /// The face-orientation repair's final status 1 (upstream `TRUE`) comes back as
     /// [`OrientSheetNote::Reoriented`] on the success path, and a caller that stops on it
@@ -4271,7 +4327,7 @@ mod tests {
         for i in 0..360 {
             let a = f64::from(i).to_radians();
             for (r, z) in [(rs.0, 0.0), (0.5 * (rs.0 + rs.1), 0.5 * h), (rs.1, h)] {
-                let p = Point3::new(r * a.cos(), r * a.sin(), z);
+                let p = Point3::new(r * det::cos(a), r * det::sin(a), z);
                 assert!(bx.contains_point(p, 0.0), "{p:?} outside {bx:?}");
             }
         }

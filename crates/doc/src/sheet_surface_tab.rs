@@ -11,7 +11,7 @@ use solidcraft_geom::prelude::*;
 use solidcraft_kernel::BoolOp;
 
 use crate::sheet::{FlatWork, TAB_ADDS_NOTHING, TAB_APART, TAB_CUT_AWAY, TAB_IN_BEND, TAB_OFF_SHEET, TAB_OVERLAPS, TAB_PAST_BEND, TAB_SEVERAL};
-use crate::sheet_surface::Piece;
+use crate::sheet_surface::{Piece, RegionOrigins, compose_regions};
 use crate::{DocError, Result, SurfaceSheet};
 
 fn err<T>(msg: impl Into<String>) -> Result<T> {
@@ -161,7 +161,7 @@ impl SurfaceSheet {
     /// it in the `strips` across the panel's joints (see [`Self::tab_on`]).
     fn join_outline(&mut self, i: usize, profile: &[Region2], region: &Region2, strips: &[Region2]) -> Result<()> {
         clear_of(profile, strips)?;
-        let one = joined(region, profile)?;
+        let (one, origins) = joined(region, profile, self.panel_origins(i))?;
         let added = solidcraft_kernel::planar_regions_boolean(std::slice::from_ref(&one), std::slice::from_ref(region), BoolOp::Cut, 1e-9)?;
         if area(&added) <= 1e-6 * area(std::slice::from_ref(region)).max(1.0) {
             return err(TAB_ADDS_NOTHING);
@@ -176,18 +176,17 @@ impl SurfaceSheet {
             .map(|(_, b)| b)
             .collect();
         self.clear_folded(i, &added, &others)?;
-        if let Some(p) = self.sheet.panels.get_mut(i) {
-            p.region = one;
-        }
+        self.set_panel_region(i, one, origins)?;
         self.flat_apart()
     }
 
     /// Flat, no piece of the sheet may run onto another.
     fn flat_apart(&self) -> Result<()> {
         let dev = self.develop().map_err(|e| DocError::Invalid(e.to_string()))?;
-        let pieces = crate::sheet_surface::pieces(&dev, &mut crate::sheet::FlatWork::new())?;
+        let pieces = crate::sheet_surface::pieces(&dev, &[], &[], &mut crate::sheet::FlatWork::new())?.geometry;
         let regions: Vec<Region2> = pieces.into_iter().map(|(_, r)| r).collect();
-        let whole = crate::sheet_surface::planar_union(regions.clone(), &mut crate::sheet::FlatWork::new())?;
+        let whole =
+            crate::sheet_surface::planar_union(crate::sheet_surface::Regions::unknown(regions.clone()), &mut crate::sheet::FlatWork::new())?.geometry;
         if (area(&regions) - area(&whole)).abs() > 1e-6 * area(&regions).max(1.0) {
             return err(TAB_OVERLAPS);
         }
@@ -250,7 +249,7 @@ impl SurfaceSheet {
         met: &[(usize, Region2)],
     ) -> Result<()> {
         clear_of(profile, strips.0)?;
-        let tiny = 1e-6 * area(std::slice::from_ref(&joined(region, profile)?)).max(1.0);
+        let tiny = 1e-6 * area(std::slice::from_ref(&joined(region, profile, self.panel_origins(i))?.0)).max(1.0);
         let here = dev.placements.get(i).copied().flatten().ok_or_else(|| DocError::Invalid(TAB_OFF_SHEET.into()))?;
         let others: Vec<solidcraft_geom::Aabb3> = self
             .piece_boxes_in_space()
@@ -261,16 +260,24 @@ impl SurfaceSheet {
             .map(|(_, b)| b)
             .collect();
         let (riding, rest) = riding_with(dev, i)?;
-        let before = crate::sheet_surface::planar_union(riding, &mut FlatWork::new())?;
+        let before = crate::sheet_surface::planar_union(crate::sheet_surface::Regions::unknown(riding), &mut FlatWork::new())?.geometry;
         // The profile touches what the panel has built: no part of what it joins floats apart.
-        let with = crate::sheet_surface::planar_union(before.iter().cloned().chain(profile.iter().cloned()).collect(), &mut FlatWork::new())?;
+        let with = crate::sheet_surface::planar_union(
+            crate::sheet_surface::Regions::unknown(before.iter().cloned().chain(profile.iter().cloned()).collect()),
+            &mut FlatWork::new(),
+        )?
+        .geometry;
         for r in &with {
             let held = solidcraft_kernel::planar_regions_boolean(std::slice::from_ref(r), &before, BoolOp::Intersect, 1e-9)?;
             if area(&held) <= tiny {
                 return err(TAB_APART);
             }
         }
-        let taken = crate::sheet_surface::planar_union(met.iter().map(|(_, c)| c.clone()).collect(), &mut FlatWork::new())?;
+        let taken = crate::sheet_surface::planar_union(
+            crate::sheet_surface::Regions::unknown(met.iter().map(|(_, c)| c.clone()).collect()),
+            &mut FlatWork::new(),
+        )?
+        .geometry;
         let back = solidcraft_kernel::planar_regions_boolean(profile, &taken, BoolOp::Intersect, 1e-9)?;
         // What it gives back past a joint's line belongs to the pieces the cuts took it from:
         // the outline there would lie on them in the flat (past the trim, which ends a thickness
@@ -280,9 +287,9 @@ impl SurfaceSheet {
         let past = solidcraft_kernel::planar_regions_boolean(&back, strips.1, BoolOp::Intersect, 1e-9)?;
         let outline =
             if area(&past) > tiny { solidcraft_kernel::planar_regions_boolean(profile, &past, BoolOp::Cut, 1e-9)? } else { profile.to_vec() };
-        let one = match outline.is_empty() {
-            true => region.clone(),
-            false => joined(region, &outline).or_else(|_| joined(region, profile))?,
+        let (one, origins) = match outline.is_empty() {
+            true => (region.clone(), self.panel_origins(i)),
+            false => joined(region, &outline, self.panel_origins(i)).or_else(|_| joined(region, profile, self.panel_origins(i)))?,
         };
         // Past the far side of a bend it fills, what it gives back runs along the line where the
         // bend's other panel begins in the flat.
@@ -316,9 +323,7 @@ impl SurfaceSheet {
             );
         }
         self.sheet.cuts = cuts;
-        if let Some(p) = self.sheet.panels.get_mut(i) {
-            p.region = one;
-        }
+        self.set_panel_region(i, one, origins)?;
         let dev = self.develop().map_err(|e| DocError::Invalid(e.to_string()))?;
         let (riding, rest_after) = riding_with(&dev, i)?;
         // No other piece changes.
@@ -335,7 +340,7 @@ impl SurfaceSheet {
             return err(TAB_IN_BEND);
         }
         // All it gives back rides with the panel.
-        let after = crate::sheet_surface::planar_union(riding, &mut FlatWork::new())?;
+        let after = crate::sheet_surface::planar_union(crate::sheet_surface::Regions::unknown(riding), &mut FlatWork::new())?.geometry;
         let lost = solidcraft_kernel::planar_regions_boolean(&back, &after, BoolOp::Cut, 1e-9)?;
         if area(&lost) > tiny {
             return err(TAB_CUT_AWAY);
@@ -363,10 +368,17 @@ fn clear_of(profile: &[Region2], strips: &[Region2]) -> Result<()> {
 
 /// `region` joined with `profile`, which must make one region: the profile touches or overlaps
 /// the outline.
-fn joined(region: &Region2, profile: &[Region2]) -> Result<Region2> {
-    let joined = solidcraft_kernel::planar_regions_boolean(std::slice::from_ref(region), profile, BoolOp::Union, 1e-9)?;
-    let [one] = <[Region2; 1]>::try_from(joined).map_err(|_| DocError::Invalid(TAB_APART.into()))?;
-    Ok(oriented(one))
+fn joined(region: &Region2, profile: &[Region2], origin: RegionOrigins) -> Result<(Region2, RegionOrigins)> {
+    let joined = compose_regions(
+        solidcraft_kernel::planar_regions_boolean_with_history(std::slice::from_ref(region), profile, BoolOp::Union, 1e-9)?,
+        &[origin],
+        &[],
+        &mut crate::sheet::FlatWork::new(),
+    );
+    let [one] = <[Region2; 1]>::try_from(joined.geometry).map_err(|_| DocError::Invalid(TAB_APART.into()))?;
+    let origins = joined.origins.into_iter().next().unwrap_or_default();
+    let origins = origins.oriented(!one.outer.is_ccw(), &one.holes.iter().map(Loop2::is_ccw).collect::<Vec<_>>());
+    Ok((oriented(one), origins))
 }
 
 /// The pieces of `dev`'s flat that ride with panel `i` (its own and the pieces of zone left
@@ -375,7 +387,7 @@ fn riding_with(dev: &Development, i: usize) -> Result<(Vec<Region2>, Vec<(Piece,
     let back = dev.placements.get(i).copied().flatten().ok_or_else(|| DocError::Invalid(TAB_OFF_SHEET.into()))?.inverse();
     let mut riding = Vec::new();
     let mut rest: Vec<(Piece, f64)> = Vec::new();
-    for (piece, r) in crate::sheet_surface::pieces(dev, &mut FlatWork::new())? {
+    for (piece, r) in crate::sheet_surface::pieces(dev, &[], &[], &mut FlatWork::new())?.geometry {
         match piece {
             Piece::Panel(p) | Piece::Tab(_, p) if p == i => riding.push(back.region(&r)),
             _ => rest.push((piece, r.area().abs())),
