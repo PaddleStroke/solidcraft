@@ -694,7 +694,7 @@ impl SurfaceSheet {
 
         let folded = crate::sheet_surface_convert::fold_onto(&self.sheet, dev, &self.places)?;
         let mut solids = vec![Vec::new(); self.sheet.panels.len()];
-        for (piece, region) in crate::sheet_surface::pieces(dev, &mut crate::sheet::FlatWork::new())? {
+        for (piece, region) in crate::sheet_surface::pieces(dev, &[], &[], &mut crate::sheet::FlatWork::new())?.geometry {
             let (Piece::Panel(index) | Piece::Tab(_, index)) = piece else { continue };
             if !matches!(self.sheet.panels.get(index).map(|panel| &panel.surface), Some(Surface::Plane)) {
                 continue;
@@ -5769,10 +5769,12 @@ mod tests {
                 std::slice::from_ref(&b3.zone),
                 std::slice::from_ref(&other.zone),
                 BoolOp::Intersect,
+                &[],
+                &[],
                 &mut work,
             )
             .unwrap();
-            let overlap: f64 = hit.iter().map(Region2::area).sum();
+            let overlap: f64 = hit.geometry.iter().map(Region2::area).sum();
             assert!(overlap < 1e-6, "bend 3 zone overlaps bend {} zone by {overlap}", i + 1);
         }
         // Unfolding and refolding must both produce valid single-shell solids.
@@ -5816,10 +5818,12 @@ mod tests {
                     std::slice::from_ref(&b3.zone),
                     std::slice::from_ref(&other.zone),
                     BoolOp::Intersect,
+                    &[],
+                    &[],
                     &mut work,
                 )
                 .unwrap();
-                let overlap: f64 = hit.iter().map(Region2::area).sum();
+                let overlap: f64 = hit.geometry.iter().map(Region2::area).sum();
                 assert!(overlap < 1e-6, "{pos}: bend 3 overlaps bend {} by {overlap}", i + 1);
             }
         }
