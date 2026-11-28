@@ -2616,102 +2616,104 @@ pub(crate) fn set_up_polar_conversion(
         // won't bump into the limits.
         e.set_step_interval(Extent1d::from_min_max(0.0, 360.0));
 
-        // Get Polar angle about ZAxis from XAxis in degrees.
-        e.base.charge_query_point(k, OP_SET_UP)?;
-        let pnt1 = e.base.evaluate_point(lowest_angle_param)?;
-        e.base.charge_query_point(k, OP_SET_UP)?;
-        let pnt2 = e.base.evaluate_point(highest_angle_param)?;
+        let adjusted = (|| -> Result<Extent1d> {
+            // Get Polar angle about ZAxis from XAxis in degrees.
+            e.base.charge_query_point(k, OP_SET_UP)?;
+            let pnt1 = e.base.evaluate_point(lowest_angle_param)?;
+            e.base.charge_query_point(k, OP_SET_UP)?;
+            let pnt2 = e.base.evaluate_point(highest_angle_param)?;
 
-        // WR-719 (the fork's cbeb14b): STEPInversion() on the full
-        // circle set above takes a point at its seam's end (360, to its zone tolerance /
-        // 100 and 1e-4 deg) as the seam's start (0): right for a closed curve, whose end
-        // is its start, but an open arc ending that near the seam (an ellipse trimmed
-        // 1.2e-6 deg short of 360) had its end angle made 360, its analytic domain then
-        // disagreeing with its NURB by the gap. An open arc's ends are their own polar
-        // angles, as STEPInversion() computes them before that rule.
-        let (mut lowest_deg, mut highest_deg);
-        if is_closed_base(k, &e.base, &e.base.natural_interval(), 0.0)? {
-            charge_query(k, Some(32), OP_SET_UP)?;
-            lowest_deg = e.step_inversion(k, pnt1, false, 0.0).0;
-            charge_query(k, Some(32), OP_SET_UP)?;
-            highest_deg = e.step_inversion(k, pnt2, false, 0.0).0;
-        } else {
-            let own_angle = |pnt: Point3| {
-                let vec = pnt - e.position.origin();
-                let mut angle = det::atan2(
-                    e.radius_x / e.radius_y * vec.dot(e.position.y_axis()),
-                    vec.dot(e.position.x_axis()),
-                );
-                if angle < 0.0 {
-                    angle += TWO_PI;
-                }
-                rad_to_deg(angle)
+            // WR-719 (the fork's cbeb14b): STEPInversion() on the full
+            // circle set above takes a point at its seam's end (360, to its zone tolerance /
+            // 100 and 1e-4 deg) as the seam's start (0): right for a closed curve, whose end
+            // is its start, but an open arc ending that near the seam (an ellipse trimmed
+            // 1.2e-6 deg short of 360) had its end angle made 360, its analytic domain then
+            // disagreeing with its NURB by the gap. An open arc's ends are their own polar
+            // angles, as STEPInversion() computes them before that rule.
+            let (mut lowest_deg, mut highest_deg);
+            if is_closed_base(k, &e.base, &e.base.natural_interval(), 0.0)? {
+                charge_query(k, Some(32), OP_SET_UP)?;
+                lowest_deg = e.step_inversion(k, pnt1, false, 0.0).0;
+                charge_query(k, Some(32), OP_SET_UP)?;
+                highest_deg = e.step_inversion(k, pnt2, false, 0.0).0;
+            } else {
+                let own_angle = |pnt: Point3| {
+                    let vec = pnt - e.position.origin();
+                    let mut angle = det::atan2(
+                        e.radius_x / e.radius_y * vec.dot(e.position.y_axis()),
+                        vec.dot(e.position.x_axis()),
+                    );
+                    if angle < 0.0 {
+                        angle += TWO_PI;
+                    }
+                    rad_to_deg(angle)
+                };
+                lowest_deg = own_angle(pnt1);
+                highest_deg = own_angle(pnt2);
+            }
+
+            // STEPInversion will snap dHighestDeg to Min param according to tolerance.
+            // Only account for noise here. [B630]
+            if highest_deg <= lowest_deg + EFF_ZERO {
+                highest_deg += 360.0; // closed curve.
+            }
+
+            // Move to period of greatest overlap with input sAnalIvl.
+            let input_mid = anal_ivl.mid();
+            let mut this_mid = (lowest_deg + highest_deg) / 2.0;
+
+            // Upstream loops without a bound; a shift that no longer changes the midpoint
+            // (beyond about 2^61 degrees) would never end.
+            let stuck = || SolidError::NotConverged {
+                operation: OP_SET_UP,
+                iterations: u32::try_from(MAX_PERIOD_SHIFTS).unwrap_or(u32::MAX),
             };
-            lowest_deg = own_angle(pnt1);
-            highest_deg = own_angle(pnt2);
-        }
+            let mut shifts = 0usize;
+            while this_mid > input_mid + 180.0 + EFF_ZERO {
+                charge_query(k, Some(8), OP_SET_UP)?;
+                let next_mid = this_mid - 360.0;
+                shifts += 1;
+                if next_mid == this_mid || shifts > MAX_PERIOD_SHIFTS {
+                    return Err(stuck());
+                }
+                lowest_deg -= 360.0;
+                highest_deg -= 360.0;
+                this_mid = next_mid;
+            }
+            while this_mid < input_mid - 180.0 - EFF_ZERO {
+                charge_query(k, Some(8), OP_SET_UP)?;
+                let next_mid = this_mid + 360.0;
+                shifts += 1;
+                if next_mid == this_mid || shifts > MAX_PERIOD_SHIFTS {
+                    return Err(stuck());
+                }
+                lowest_deg += 360.0;
+                highest_deg += 360.0;
+                this_mid = next_mid;
+            }
 
-        // STEPInversion will snap dHighestDeg to Min param according to tolerance.
-        // Only account for noise here. [B630]
-        if highest_deg <= lowest_deg + EFF_ZERO {
-            highest_deg += 360.0; // closed curve.
-        }
+            // watch out for tolerance creep
+            let low_change_deg = lowest_deg - anal_ivl.min();
+            if low_change_deg < EFF_ZERO * 1000.0 && low_change_deg > -EFF_ZERO * 1000.0 {
+                lowest_deg = anal_ivl.min();
+            }
 
-        // Move to period of greatest overlap with input sAnalIvl.
-        let input_mid = anal_ivl.mid();
-        let mut this_mid = (lowest_deg + highest_deg) / 2.0;
+            let high_change_deg = highest_deg - anal_ivl.max();
+            if high_change_deg < EFF_ZERO * 1000.00 && high_change_deg > -EFF_ZERO * 1000.0 {
+                highest_deg = anal_ivl.max();
+            }
 
-        // Upstream loops without a bound; a shift that no longer changes the midpoint
-        // (beyond about 2^61 degrees) would never end.
-        let stuck = || SolidError::NotConverged {
-            operation: OP_SET_UP,
-            iterations: u32::try_from(MAX_PERIOD_SHIFTS).unwrap_or(u32::MAX),
-        };
-        let mut shifts = 0usize;
-        while this_mid > input_mid + 180.0 + EFF_ZERO {
-            if let Err(error) = charge_query(k, Some(8), OP_SET_UP) {
+            // (SetMinMax's status is ignored upstream)
+            let _ = anal_ivl.set_min_max(lowest_deg, highest_deg);
+            Ok(anal_ivl)
+        })();
+        match adjusted {
+            Ok(interval) => anal_ivl = interval,
+            Err(error) => {
                 e.set_step_interval(anal_ivl);
                 return Err(error);
             }
-            let next_mid = this_mid - 360.0;
-            shifts += 1;
-            if next_mid == this_mid || shifts > MAX_PERIOD_SHIFTS {
-                e.set_step_interval(anal_ivl);
-                return Err(stuck());
-            }
-            lowest_deg -= 360.0;
-            highest_deg -= 360.0;
-            this_mid = next_mid;
         }
-        while this_mid < input_mid - 180.0 - EFF_ZERO {
-            if let Err(error) = charge_query(k, Some(8), OP_SET_UP) {
-                e.set_step_interval(anal_ivl);
-                return Err(error);
-            }
-            let next_mid = this_mid + 360.0;
-            shifts += 1;
-            if next_mid == this_mid || shifts > MAX_PERIOD_SHIFTS {
-                e.set_step_interval(anal_ivl);
-                return Err(stuck());
-            }
-            lowest_deg += 360.0;
-            highest_deg += 360.0;
-            this_mid = next_mid;
-        }
-
-        // watch out for tolerance creep
-        let low_change_deg = lowest_deg - anal_ivl.min();
-        if low_change_deg < EFF_ZERO * 1000.0 && low_change_deg > -EFF_ZERO * 1000.0 {
-            lowest_deg = anal_ivl.min();
-        }
-
-        let high_change_deg = highest_deg - anal_ivl.max();
-        if high_change_deg < EFF_ZERO * 1000.00 && high_change_deg > -EFF_ZERO * 1000.0 {
-            highest_deg = anal_ivl.max();
-        }
-
-        // (SetMinMax's status is ignored upstream)
-        let _ = anal_ivl.set_min_max(lowest_deg, highest_deg);
         e.set_step_interval(anal_ivl);
     }
 
@@ -3672,5 +3674,34 @@ mod tests {
         assert!(matches!(result, Err(SolidError::OutOfFuel { .. })));
         assert!(work.is_disabled());
         assert!(source.polar_converter().is_polar_conversion_possible());
+    }
+
+    #[test]
+    fn a_declined_endpoint_restores_the_short_arc_step_domain_before_retry() {
+        use crate::geom::context::ProofWork;
+        let ordinary = kernel();
+        let source = circle(&ordinary, -360.0, -270.0, 2.0, false);
+        assert_eq!(source.base().gw_nurb().unwrap().knots().len(), 6);
+        let original_domain = source.step_interval();
+        let mut observed = source.clone_exact_bounded();
+        let mut limited = kernel();
+        // Owner64, quarter-circle setup64, six-knot scan/storage98*6+432, no
+        // internal knot, then64 for the temporary-domain records. The first
+        // Point header needs32 more, so it declines after full-turn installation.
+        let work = ProofWork::new(64 + 64 + 98 * 6 + 432 + 64);
+        limited.context.set_proof_work(Some(work.clone()));
+        let mut actual = PolarConversion::default();
+        let error = set_up_polar_conversion(&mut actual, &mut observed, &limited).unwrap_err();
+        assert!(matches!(error, SolidError::OutOfFuel { .. }));
+        assert!(work.is_disabled());
+        assert_eq!(observed.step_interval(), original_domain);
+        set_up_polar_conversion(&mut actual, &mut observed, &ordinary).unwrap();
+        let mut reference = source.clone_exact_bounded();
+        let mut expected = PolarConversion::default();
+        set_up_polar_conversion(&mut expected, &mut reference, &ordinary).unwrap();
+        assert_eq!(observed.step_interval(), original_domain);
+        assert_eq!(actual.natural_knots, expected.natural_knots);
+        assert_eq!(actual.angles, expected.angles);
+        assert_eq!(actual.exact_conversion, expected.exact_conversion);
     }
 }

@@ -2280,63 +2280,89 @@ impl Curve {
         mode: TrimMode,
         zone_tol_3d: f64,
     ) -> Result<()> {
-        self.trim_with_zone_tol_observed(k, trim_interval, mode, zone_tol_3d, None)
+        self.trim_with_zone_tol_impl(k, trim_interval, mode, zone_tol_3d, false)
+            .map(|_| ())
     }
 
-    /// The same physical trim with optional actual source-domain evidence.
+    /// The same physical trim returning actual source-domain evidence only on success.
     pub(crate) fn trim_with_source(
         &mut self,
         k: &Kernel,
         trim_interval: &mut Extent1d,
         mode: TrimMode,
-        outcome: Option<&mut crate::nurbs::b_spline_curve_n_lib::TrimSourceOutcome>,
-    ) -> Result<()> {
-        self.trim_with_zone_tol_observed(
+    ) -> Result<crate::nurbs::b_spline_curve_n_lib::TrimSourceOutcome> {
+        self.trim_with_zone_tol_impl(
             k,
             trim_interval,
             mode,
             crate::geom::tol::zone_tol_3d(k, crate::geom::tol::SmallTopoType::NormalSize),
-            outcome,
+            true,
         )
     }
 
-    fn trim_with_zone_tol_observed(
+    fn trim_with_zone_tol_impl(
         &mut self,
         k: &Kernel,
         trim_interval: &mut Extent1d,
         mode: TrimMode,
         zone_tol_3d: f64,
-        mut outcome: Option<&mut crate::nurbs::b_spline_curve_n_lib::TrimSourceOutcome>,
-    ) -> Result<()> {
-        if let Some(outcome) = outcome.as_deref_mut() {
-            *outcome = crate::nurbs::b_spline_curve_n_lib::TrimSourceOutcome::Uncertified;
-        }
+        collect_source: bool,
+    ) -> Result<crate::nurbs::b_spline_curve_n_lib::TrimSourceOutcome> {
+        use crate::nurbs::b_spline_curve_n_lib::TrimSourceOutcome;
         self.memo = CurveMemo::new();
         match &mut self.kind {
             CurveKind::BSpline(c) => {
-                c.trim_with_zone_tol_observed(trim_interval, mode, zone_tol_3d, outcome)
+                if collect_source {
+                    c.trim_with_zone_tol_observed(trim_interval, mode, zone_tol_3d)
+                } else {
+                    c.trim_with_zone_tol(trim_interval, mode, zone_tol_3d)
+                        .map(|()| TrimSourceOutcome::Uncertified)
+                }
             }
-            CurveKind::Hyperbola(c) => c.base.trim_with_zone_tol(trim_interval, mode, zone_tol_3d),
+            CurveKind::Hyperbola(c) => c
+                .base
+                .trim_with_zone_tol(trim_interval, mode, zone_tol_3d)
+                .map(|()| TrimSourceOutcome::Uncertified),
             CurveKind::Ellipse(c) => {
-                c.trim_with_zone_tol_observed(k, trim_interval, mode, zone_tol_3d, outcome)
+                if collect_source {
+                    c.trim_with_zone_tol_observed(k, trim_interval, mode, zone_tol_3d)
+                } else {
+                    c.trim_with_zone_tol(k, trim_interval, mode, zone_tol_3d)
+                        .map(|()| TrimSourceOutcome::Uncertified)
+                }
             }
-            CurveKind::Parabola(c) => {
-                c.base_mut()
-                    .trim_with_zone_tol(trim_interval, mode, zone_tol_3d)
-            }
+            CurveKind::Parabola(c) => c
+                .base_mut()
+                .trim_with_zone_tol(trim_interval, mode, zone_tol_3d)
+                .map(|()| TrimSourceOutcome::Uncertified),
             CurveKind::Hermite(_)
             | CurveKind::Conic(_)
             | CurveKind::Iso(_)
             | CurveKind::Composite(_) => Err(base_err(BaseCurveMethod::Trim)),
-            CurveKind::Projected(c) => c.trim_with_zone_tol(k, trim_interval, mode, zone_tol_3d),
-            CurveKind::Offset(c) => c.trim(trim_interval, mode == TrimMode::IntervalOnly),
-            CurveKind::CrvInVolume(c) => c.trim_with_zone_tol(k, trim_interval, mode, zone_tol_3d),
-            CurveKind::CrvOnSurf(c) => c.trim_with_zone_tol(k, trim_interval, mode, zone_tol_3d),
-            CurveKind::TangentField(c) => {
-                c.base_mut()
-                    .trim_with_zone_tol(k, trim_interval, mode, zone_tol_3d)
+            CurveKind::Projected(c) => c
+                .trim_with_zone_tol(k, trim_interval, mode, zone_tol_3d)
+                .map(|()| TrimSourceOutcome::Uncertified),
+            CurveKind::Offset(c) => c
+                .trim(trim_interval, mode == TrimMode::IntervalOnly)
+                .map(|()| TrimSourceOutcome::Uncertified),
+            CurveKind::CrvInVolume(c) => c
+                .trim_with_zone_tol(k, trim_interval, mode, zone_tol_3d)
+                .map(|()| TrimSourceOutcome::Uncertified),
+            CurveKind::CrvOnSurf(c) => c
+                .trim_with_zone_tol(k, trim_interval, mode, zone_tol_3d)
+                .map(|()| TrimSourceOutcome::Uncertified),
+            CurveKind::TangentField(c) => c
+                .base_mut()
+                .trim_with_zone_tol(k, trim_interval, mode, zone_tol_3d)
+                .map(|()| TrimSourceOutcome::Uncertified),
+            CurveKind::Line(c) => {
+                if collect_source {
+                    c.trim_owned_observed(self.owner, trim_interval, mode)
+                } else {
+                    c.trim_owned(self.owner, trim_interval, mode)
+                        .map(|()| TrimSourceOutcome::Uncertified)
+                }
             }
-            CurveKind::Line(c) => c.trim_owned_observed(self.owner, trim_interval, mode, outcome),
         }
     }
 
@@ -2379,35 +2405,74 @@ impl Curve {
     ///
     /// `SM_ERR` for kinds without `Copy` (Hermite curves).
     pub fn copy(&self, k: &Kernel) -> Result<Self> {
-        self.copy_with_source(k, None)
+        self.copy_impl(k, false).map(|(copied, _)| copied)
     }
 
-    /// The same copy, with optional evidence from its actual native construction.
+    /// The same copy, returning evidence from its actual native construction only on success.
     pub(crate) fn copy_with_source(
         &self,
         k: &Kernel,
-        mut outcome: Option<&mut crate::nurbs::b_spline_curve_n_lib::CopySourceOutcome>,
-    ) -> Result<Self> {
-        if let Some(outcome) = outcome.as_deref_mut() {
-            *outcome = crate::nurbs::b_spline_curve_n_lib::CopySourceOutcome::Uncertified;
-        }
+    ) -> Result<(Self, crate::nurbs::b_spline_curve_n_lib::CopySourceOutcome)> {
+        self.copy_impl(k, true)
+    }
+
+    fn copy_impl(
+        &self,
+        k: &Kernel,
+        collect_source: bool,
+    ) -> Result<(Self, crate::nurbs::b_spline_curve_n_lib::CopySourceOutcome)> {
+        use crate::nurbs::b_spline_curve_n_lib::CopySourceOutcome;
 
         match &self.kind {
-            CurveKind::Composite(c) => c.copy(k).map(Self::from),
-            CurveKind::BSpline(c) => Ok(Self::from(c.copy_with_source(outcome))),
-            CurveKind::Ellipse(c) => c.copy_with_source(k, outcome).map(Self::from),
-            CurveKind::Hyperbola(c) => Ok(Self::from(c.copy())),
-            CurveKind::Parabola(c) => Ok(Self::from(c.copy())),
+            CurveKind::Composite(c) => c
+                .copy(k)
+                .map(|copied| (Self::from(copied), CopySourceOutcome::Uncertified)),
+            CurveKind::BSpline(c) => {
+                let (copied, outcome) = if collect_source {
+                    c.copy_with_source()
+                } else {
+                    (c.copy(), CopySourceOutcome::Uncertified)
+                };
+                Ok((Self::from(copied), outcome))
+            }
+            CurveKind::Ellipse(c) => {
+                let (copied, outcome) = if collect_source {
+                    c.copy_with_source(k)?
+                } else {
+                    (c.copy(k)?, CopySourceOutcome::Uncertified)
+                };
+                Ok((Self::from(copied), outcome))
+            }
+            CurveKind::Hyperbola(c) => Ok((Self::from(c.copy()), CopySourceOutcome::Uncertified)),
+            CurveKind::Parabola(c) => Ok((Self::from(c.copy()), CopySourceOutcome::Uncertified)),
             CurveKind::Hermite(_) | CurveKind::Conic(_) | CurveKind::Iso(_) => {
                 Err(base_err(BaseCurveMethod::Copy))
             }
-            CurveKind::Projected(c) => c.copy(k).map(Self::from),
-            CurveKind::Offset(c) => c.copy().map(Self::from),
-            CurveKind::CrvInVolume(c) => c.copy().map(Self::from),
-            CurveKind::CrvOnSurf(c) => c.copy(k).map(Self::from),
+            CurveKind::Projected(c) => c
+                .copy(k)
+                .map(|copied| (Self::from(copied), CopySourceOutcome::Uncertified)),
+            CurveKind::Offset(c) => c
+                .copy()
+                .map(|copied| (Self::from(copied), CopySourceOutcome::Uncertified)),
+            CurveKind::CrvInVolume(c) => c
+                .copy()
+                .map(|copied| (Self::from(copied), CopySourceOutcome::Uncertified)),
+            CurveKind::CrvOnSurf(c) => c
+                .copy(k)
+                .map(|copied| (Self::from(copied), CopySourceOutcome::Uncertified)),
             // SmCrvOnSurf::Copy (not overridden): `new SmCrvOnSurf(*this)`, the base only
-            CurveKind::TangentField(c) => c.base().copy(k).map(Self::from),
-            CurveKind::Line(c) => Ok(Self::from(c.copy_with_source(outcome))),
+            CurveKind::TangentField(c) => c
+                .base()
+                .copy(k)
+                .map(|copied| (Self::from(copied), CopySourceOutcome::Uncertified)),
+            CurveKind::Line(c) => {
+                let (copied, outcome) = if collect_source {
+                    c.copy_with_source()
+                } else {
+                    (c.copy(), CopySourceOutcome::Uncertified)
+                };
+                Ok((Self::from(copied), outcome))
+            }
         }
     }
 

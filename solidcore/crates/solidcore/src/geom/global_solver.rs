@@ -557,16 +557,20 @@ fn subtree_height<O: Copy + PartialEq>(
         if !work.charge(cost) {
             return Err(work.stopped(operation));
         }
-        capacity
+        capacity.map(|capacity| (capacity, work))
     } else {
         None
     };
     let mut state = vec![0u8; n];
     let mut height = vec![0usize; n];
     let mut stack = match stack_capacity {
-        Some(capacity) => {
+        Some((capacity, work)) => {
             // Some-only exact reserve avoids hidden stack-growth allocations.
-            let mut stack = Vec::with_capacity(capacity);
+            let mut stack = Vec::new();
+            if stack.try_reserve_exact(capacity).is_err() {
+                work.disable();
+                return Err(work.stopped(operation));
+            }
             stack.push((top, false));
             stack
         }

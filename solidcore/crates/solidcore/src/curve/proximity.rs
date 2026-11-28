@@ -1073,8 +1073,8 @@ impl Curve {
                                 reference,
                                 work,
                             );
-                        charge_optional(Some(work), Some(0))?;
                         k.check_cancelled(OP)?;
+                        charge_optional(Some(work), Some(0))?;
                         if let Some(Some(bound)) = soft(certified)? {
                             if bound <= radius {
                                 return Ok(Some(bound));
@@ -1142,6 +1142,8 @@ impl Curve {
         ends: &[(Vec3, f64)],
         work: &ProofWork,
     ) -> Result<bool> {
+        const OP_WORK: &str = "curve::proximity::proved_together_with_work";
+        k.check_real_cancelled(OP_WORK)?;
         let result = (|| {
             let Some(query) = k.optional_proof_view(work) else {
                 return Ok(false);
@@ -1154,10 +1156,11 @@ impl Curve {
             };
             mine.proved_together(&query, interval, &theirs, other.1, radius, ends)
         })();
-        if work.is_disabled() {
-            Ok(false)
-        } else {
-            result
+        k.check_real_cancelled(OP_WORK)?;
+        match result {
+            Err(error @ crate::error::SolidError::Cancelled { .. }) => Err(error),
+            _ if work.is_disabled() => Ok(false),
+            other => other,
         }
     }
 
@@ -2369,5 +2372,48 @@ mod tests {
         // The same finite-piece path as the original unchanged seam regression
         // remains responsible for the full curve. The total allowance stays 2M.
         assert_optional_pair(&k, &a, &whole, &a, &whole, 1e-3, true);
+    }
+
+    #[test]
+    fn real_cancellation_escapes_an_already_declined_optional_pair() {
+        use crate::geom::context::ProofWork;
+        use crate::kernel::CancelToken;
+        use crate::SolidError;
+        let a = Curve::from(Line::from_points(
+            Point3::ZERO,
+            Point3::new(1.0, 0.0, 0.0),
+            3,
+        ));
+        let b = Curve::from(Line::from_points(
+            Point3::ZERO,
+            Point3::new(1.0, 0.0, 0.0),
+            3,
+        ));
+        for declined in [false, true] {
+            let token = CancelToken::with_fuel(3);
+            let mut k = Kernel::default();
+            k.set_cancel_token(token.clone());
+            let work = ProofWork::new(crate::prism::sheet::READ_WORK);
+            if declined {
+                work.disable();
+            }
+            token.cancel();
+            let error = a
+                .proved_together_with_work(
+                    &k,
+                    &a.natural_interval(),
+                    (&b, &b.natural_interval()),
+                    1e-4,
+                    &[],
+                    &work,
+                )
+                .unwrap_err();
+            assert!(matches!(error, SolidError::Cancelled { .. }));
+            assert_eq!(
+                token.polls(),
+                Some(0),
+                "observing a real flag spends no geometry fuel"
+            );
+        }
     }
 }

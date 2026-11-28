@@ -668,7 +668,10 @@ impl<O: Copy + PartialEq> Tree<O> {
     /// and a point-sized box at `point` (upstream `pOptExistingObjectList`).
     #[must_use]
     pub fn from_point(point: Point3, point_size: f64, with_object_list: bool) -> Self {
-        let mut tree = Self::new(None);
+        Self::point_tree(Self::new(None), point, point_size, with_object_list)
+    }
+
+    fn point_tree(mut tree: Self, point: Point3, point_size: f64, with_object_list: bool) -> Self {
         let mut node = TreeNode::zeroed();
         node.bbox = Extent3d::from_point(point);
         node.bbox.expand_absolute(point_size);
@@ -694,20 +697,29 @@ impl<O: Copy + PartialEq> Tree<O> {
         work: Option<&ProofWork>,
     ) -> Result<Self> {
         if let Some(work) = work {
-            // CurveHandle query records: Tree168, initial node capacity4*208,
-            // node scratch/init+write2*208 and fixed bbox/bookkeeping32.
+            // Price the explicit one-node and optional one-list reservation requests.
+            // CurveHandle: Tree168 + node208 + scratch/write416 + fixed32 =824;
+            // an object-list item adds88 + scratch/write176 + fixed16 =280.
             let cost = 168
-                + 4 * 208
+                + 208
                 + 2 * 208
                 + 32
                 + if with_object_list {
-                    4 * 88 + 2 * 88 + 16
+                    88 + 2 * 88 + 16
                 } else {
                     0
                 };
             if !work.charge(Some(cost)) {
                 return Err(work.stopped("geom::tree::Tree::from_point_with_work"));
             }
+            let mut tree = Self::new(None);
+            if tree.nodes.try_reserve_exact(1).is_err()
+                || (with_object_list && tree.lists.try_reserve_exact(1).is_err())
+            {
+                work.disable();
+                return Err(work.stopped("geom::tree::Tree::from_point_with_work"));
+            }
+            return Ok(Self::point_tree(tree, point, point_size, with_object_list));
         }
         Ok(Self::from_point(point, point_size, with_object_list))
     }
@@ -2095,5 +2107,27 @@ mod tests {
         let ordinary_companion =
             Tree::<u64>::from_point_with_work(point, 0.125, false, None).unwrap();
         assert_eq!(format!("{ordinary:?}"), format!("{ordinary_companion:?}"));
+    }
+
+    #[test]
+    fn query_point_trees_reserve_nodes_and_optional_lists_before_shared_construction() {
+        let point = Point3::new(2.0, -3.0, 4.0);
+        for with_list in [false, true] {
+            let ordinary = Tree::<u64>::from_point(point, 0.125, with_list);
+            let work = ProofWork::new(16_000);
+            let query =
+                Tree::<u64>::from_point_with_work(point, 0.125, with_list, Some(&work)).unwrap();
+            assert_eq!(format!("{ordinary:?}"), format!("{query:?}"));
+            assert_eq!(query.nodes.len(), 1);
+            assert!(query.nodes.capacity() >= 1);
+            assert_eq!(query.lists.len(), usize::from(with_list));
+            assert!(!work.is_disabled());
+            let short = ProofWork::new(100);
+            assert!(matches!(
+                Tree::<u64>::from_point_with_work(point, 0.125, with_list, Some(&short)),
+                Err(SolidError::OutOfFuel { .. })
+            ));
+            assert!(short.is_disabled());
+        }
     }
 }

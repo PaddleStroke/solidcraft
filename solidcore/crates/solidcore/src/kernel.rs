@@ -172,6 +172,14 @@ pub struct Caches {
     /// their domains. A [`Cell`] so that test can set it through the `&Kernel` it takes.
     /// Crate-private: not a kernel option.
     pub(crate) refit_raising_trims: Cell<bool>,
+    /// Not upstream (#23441): whether two faces on one cone, torus or surface of revolution
+    /// with a planar generator cover each other past their own sweeps
+    /// (`surface::surface::p3::sweep_turn_window`): a face of the same surface beyond the
+    /// covering face's part of the turn, as two halves of a split cone are. Set only while
+    /// [`crate::topology::brep::p5::remove_splits_of_one_sweep`] takes such splits out; every
+    /// other cover keeps upstream's, within the covering surface's own sweep. A [`Cell`] as
+    /// [`Self::refit_raising_trims`]. Crate-private: not a kernel option.
+    pub(crate) cover_across_sweeps: Cell<bool>,
 }
 
 impl Default for Caches {
@@ -183,6 +191,7 @@ impl Default for Caches {
             prove_lazy_trim_raise: true,
             hold_trim_raise: false,
             refit_raising_trims: Cell::new(false),
+            cover_across_sweeps: Cell::new(false),
         }
     }
 }
@@ -195,6 +204,7 @@ impl Caches {
             prove_lazy_trim_raise: self.prove_lazy_trim_raise,
             hold_trim_raise: self.hold_trim_raise,
             refit_raising_trims: Cell::new(self.refit_raising_trims.get()),
+            cover_across_sweeps: Cell::new(self.cover_across_sweeps.get()),
             ..Self::default()
         };
     }
@@ -1435,11 +1445,16 @@ impl CancelToken {
         let mut fuel = None;
         let mut counted_stop = false;
         while let Some(current) = token {
-            if !work.charge(Some(1)) {
-                return Some(work.stopped(operation));
-            }
             if current.flag.load(Ordering::Relaxed) {
                 return Some(SolidError::Cancelled { operation });
+            }
+            if !work.charge(Some(1)) {
+                // Real stop signals remain observable after optional analysis stops.
+                return Some(if current.flagged() {
+                    SolidError::Cancelled { operation }
+                } else {
+                    work.stopped(operation)
+                });
             }
             if let Some(polls) = &current.polls {
                 let made = polls.made.load(Ordering::Relaxed);
@@ -1886,6 +1901,17 @@ impl Kernel {
         Ok(())
     }
 
+    /// Observes real cancellation flags without spending geometry fuel or optional work.
+    ///
+    /// # Errors
+    /// [`SolidError::Cancelled`] when a real cancellation flag has been set.
+    pub(crate) fn check_real_cancelled(&self, operation: &'static str) -> crate::Result<()> {
+        if self.cancel.as_ref().is_some_and(CancelToken::flagged) {
+            return Err(SolidError::Cancelled { operation });
+        }
+        Ok(())
+    }
+
     /// A generator at the start of the sequence of the kernel's [seed](Self::seed).
     ///
     /// A call that draws random numbers makes one for itself and draws from it, so what it
@@ -2272,5 +2298,22 @@ mod tests {
         let view = original.metadata_view(&original.context);
         assert!(view.check_cancelled("ordinary cache").is_ok());
         assert_eq!(token.polls(), Some(1));
+    }
+
+    #[test]
+    fn a_later_real_flag_dominates_a_spent_optional_poll_allowance() {
+        // Owner64 + observation token64 leave exactly0 or1 optional poll unit.
+        for allowance in [128, 129] {
+            let fuel = CancelToken::with_fuel(0);
+            assert!(fuel.check("geometry").unwrap_err().is_out_of_fuel());
+            let flag = CancelToken::new();
+            let joined = fuel.either(&flag);
+            let work = crate::geom::context::ProofWork::new(allowance);
+            let observed = joined.observation_only(&work).unwrap();
+            flag.cancel();
+            let error = observed.check("optional pair").unwrap_err();
+            assert!(matches!(error, SolidError::Cancelled { .. }));
+            assert_eq!(fuel.polls(), Some(1));
+        }
     }
 }

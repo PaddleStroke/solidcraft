@@ -148,12 +148,13 @@ fn proved_full_current_pair(
     b: &Brep,
     pair: (EdgeId, EdgeId),
     session: &Session<'_, '_, '_>,
-) -> bool {
+) -> Result<bool> {
     let Some(work) = session.context.as_deref().and_then(Context::proof_work) else {
-        return false;
+        return Ok(false);
     };
+    k.check_real_cancelled(OP)?;
     if !work.charge(Some(16)) {
-        return false;
+        return Ok(false);
     }
     let proof = || -> Result<bool> {
         let (Some(ca), Some(cb)) = (edge::curve(a, pair.0)?, edge::curve(b, pair.1)?) else {
@@ -168,7 +169,12 @@ fn proved_full_current_pair(
             work,
         )
     };
-    proof().unwrap_or(false)
+    let result = proof();
+    k.check_real_cancelled(OP)?;
+    match result {
+        Err(error) if error.is_cancelled() => Err(error),
+        other => Ok(other.unwrap_or(false)),
+    }
 }
 
 /// Optional proof of the already selected complete current pair, never a search.
@@ -178,9 +184,9 @@ fn proved_current_alias(
     b: &Brep,
     pair: (EdgeId, EdgeId),
     session: &Session<'_, '_, '_>,
-) -> bool {
+) -> Result<bool> {
     let Some(work) = session.context.as_deref().and_then(Context::proof_work) else {
-        return false;
+        return Ok(false);
     };
     // Bound the two actual map lookups by the actual mate-map length.
     let cost = session
@@ -193,8 +199,9 @@ fn proved_current_alias(
         .checked_add(1)
         .and_then(|n| n.checked_mul(4))
         .and_then(|n| n.checked_add(24));
+    k.check_real_cancelled(OP)?;
     if !work.charge(cost.and_then(|n| u64::try_from(n).ok())) {
-        return false;
+        return Ok(false);
     }
     let proof = || -> Result<bool> {
         let (Some(a0), Some(a1)) = edge::start_end_vertices(a, pair.0)? else {
@@ -210,11 +217,17 @@ fn proved_current_alias(
         if !((m0 == b0 && m1 == b1) || (m0 == b1 && m1 == b0)) {
             return Ok(false);
         }
-        Ok(proved_full_current_pair(k, a, b, pair, session))
+        proved_full_current_pair(k, a, b, pair, session)
     };
-    // Query errors only decline this optional witness; original geometry and
+    // Cancellation escapes; other query errors only decline this optional witness.
+    // Original geometry and
     // both existing Copy status/error paths below remain unchanged.
-    proof().unwrap_or(false)
+    let result = proof();
+    k.check_real_cancelled(OP)?;
+    match result {
+        Err(error) if error.is_cancelled() => Err(error),
+        other => Ok(other.unwrap_or(false)),
+    }
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -258,7 +271,7 @@ fn finish_with(
         // get coincident edges, then coincident vertices
         let (edges, other_edges) = session.ti.common_edges(a, b)?;
         for (primary, other) in edges.iter().zip(&other_edges) {
-            let alias = proved_current_alias(k, a, b, (*primary, *other), &session);
+            let alias = proved_current_alias(k, a, b, (*primary, *other), &session)?;
             let alias_pair = alias.then(|| {
                 (
                     (session.key_of)(EntityRef::Edge(*primary)),
@@ -431,7 +444,7 @@ fn finish_with(
                 {
                     // A newly owned slot is not by itself a whole-source
                     // certificate: copy/trim may have changed its native curve.
-                    let copied = proved_full_current_pair(k, a, b, (target, source), &session);
+                    let copied = proved_full_current_pair(k, a, b, (target, source), &session)?;
                     let source_key = session.other_key_of;
                     let target = (session.key_of)(EntityRef::Edge(target));
                     let mut env = session.env();

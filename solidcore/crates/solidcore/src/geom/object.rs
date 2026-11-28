@@ -370,7 +370,7 @@ pub fn report_boundary_edit(context: Option<&mut Context>, event: BoundaryEdit) 
         .is_some_and(|c| c.reserve_boundary_edit(storage));
     let relay = context.reserve_relay_boundary_edit(storage);
     if user || system {
-        context.notify_observers(CallbackEvent::BoundaryEdit(Box::new(event)));
+        context.notify_observers(CallbackEvent::BoundaryEdit(Box::new(event), [user, system]));
     } else if relay {
         context.notify_relay_boundary_edit(event);
     }

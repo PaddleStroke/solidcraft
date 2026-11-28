@@ -335,19 +335,20 @@ pub fn copy_nurb_curve(from: &Curve) -> Curve {
 /// (the end knots stay put) (`sm_FixupKnotVector`; upstream default
 /// `tol2d = SM_EFF_ZERO_PARAM`).
 pub fn fixup_knot_vector(knots: &mut [f64], tol2d: f64) {
-    fixup_knot_vector_observed(knots, tol2d, None);
+    fixup_knot_vector_impl(knots, tol2d, false);
 }
 
-/// The same fix-up, optionally recording actual writes that alter the copy.
-pub(crate) fn fixup_knot_vector_observed(
-    knots: &mut [f64],
-    tol2d: f64,
-    mut unchanged: Option<&mut bool>,
-) {
+/// The same fix-up, returning whether its actual writes preserved the copy.
+pub(crate) fn fixup_knot_vector_observed(knots: &mut [f64], tol2d: f64) -> bool {
+    fixup_knot_vector_impl(knots, tol2d, true)
+}
+
+fn fixup_knot_vector_impl(knots: &mut [f64], tol2d: f64, collect_source: bool) -> bool {
+    let mut unchanged = true;
     let tol2d = tol2d.abs();
     let n_kts = knots.len();
     let (Some(&u0), Some(&u1)) = (knots.first(), knots.last()) else {
-        return;
+        return unchanged;
     };
     let scaled_zero = scaled_zero2(&u0, &u1);
 
@@ -367,8 +368,8 @@ pub(crate) fn fixup_knot_vector_observed(
             // Same (multiple) knot.
             mult += 1;
             if let Some(slot) = knots.get_mut(i + 1) {
-                if let Some(unchanged) = unchanged.as_deref_mut() {
-                    *unchanged &= slot.to_bits() == a.to_bits();
+                if collect_source {
+                    unchanged &= slot.to_bits() == a.to_bits();
                 }
                 *slot = a;
             }
@@ -416,13 +417,14 @@ pub(crate) fn fixup_knot_vector_observed(
     for (&k, &mult) in kts.iter().zip(&mults) {
         for _ in 0..mult {
             if let Some(slot) = slots.next() {
-                if let Some(unchanged) = unchanged.as_deref_mut() {
-                    *unchanged &= slot.to_bits() == k.to_bits();
+                if collect_source {
+                    unchanged &= slot.to_bits() == k.to_bits();
                 }
                 *slot = k;
             }
         }
     }
+    unchanged
 }
 
 // ---- Bezier segments, split and trim ------------------------------------------------

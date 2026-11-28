@@ -1575,7 +1575,8 @@ where
     C: CurveEvaluate + ?Sized,
     D: FnOnce(&C, f64) -> Result<bool>,
 {
-    crate::curve::curve::p3::charge_query_work(k, Some(512), OP_CACHE)?;
+    const OP_IS_ARC: &str = "curve::curve::p5::is_arc_base";
+    crate::curve::curve::p3::charge_query_work(k, Some(512), OP_IS_ARC)?;
     // no work - degenerate curve
     if is_degenerate(curve, tol)? {
         return Ok(None);
@@ -1644,7 +1645,7 @@ where
     // center of circle and on plane.
     let mut ave_radius = radius;
     for i in 1..num_samples {
-        crate::curve::curve::p3::charge_query_work(k, Some(64), OP_CACHE)?;
+        crate::curve::curve::p3::charge_query_work(k, Some(64), OP_IS_ARC)?;
         // get next samplePoint param value
         let param = if i == num_samples - 1 {
             interval.max()
@@ -3613,5 +3614,15 @@ mod tests {
             // Check the old path after observing the source state, so the cold control stays cold.
             assert!(a.proved_together(&k, &ia, &b, &ib, 1e-4, &[]).unwrap());
         }
+    }
+
+    #[test]
+    fn arc_recognition_names_its_own_optional_work_stop() {
+        use crate::geom::context::ProofWork;
+        let mut query = Kernel::default();
+        query.context.set_proof_work(Some(ProofWork::new(0)));
+        let error = is_arc_base(&query, &unevaluable(), |_, _| Ok(false), 10, 1e-6).unwrap_err();
+        assert!(matches!(error, SolidError::OutOfFuel { operation, .. }
+            if operation == "curve::curve::p5::is_arc_base"));
     }
 }

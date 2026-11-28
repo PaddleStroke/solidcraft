@@ -1061,7 +1061,7 @@ impl<O: Copy + PartialEq> CurveCache<O> {
     /// `InvalidInput` for fewer Beziers than spans; [`SolidError::Unported`] from
     /// the box and evaluation callees.
     pub fn build_tree(&mut self, k: &Kernel, leaf_beziers: &[Nurb]) -> Result<()> {
-        if k.context.proof_work().is_some() {
+        if k.context.proof_work().is_some() && !self.spans.is_empty() {
             query_charge(
                 k,
                 (|| {
@@ -2099,5 +2099,30 @@ mod tests {
         after_stop.tessellate(&ordinary).unwrap();
         assert_eq!(after_stop.spans(), plain.spans());
         assert_eq!(after_stop.parents(), plain.parents());
+    }
+
+    #[test]
+    fn disjoint_query_cache_keeps_no_spans_and_the_shared_allowance() {
+        use crate::geom::context::ProofWork;
+        let ordinary = Kernel::default();
+        let options = CurveCacheOptions {
+            chord_height_tolerance: 0.01,
+            make_full_tree: true,
+            ..CurveCacheOptions::default()
+        };
+        let make_cache =
+            |interval| -> CurveCache<u32> { CurveCache::new(cubic(), interval, options) };
+        let outside = Extent1d::from_min_max(2.0, 3.0);
+        let plain = make_cache(outside).tessellate(&ordinary).unwrap_err();
+        assert_eq!(plain.curve_failure(), Some(&CurveFailure::NoSpans));
+        let work = ProofWork::new(crate::prism::sheet::READ_WORK);
+        let query = ordinary.optional_proof_view(&work).unwrap();
+        let observed = make_cache(outside).tessellate(&query).unwrap_err();
+        assert_eq!(observed.curve_failure(), Some(&CurveFailure::NoSpans));
+        assert!(!work.is_disabled());
+        make_cache(Extent1d::from_min_max(0.0, 1.0))
+            .tessellate(&query)
+            .unwrap();
+        assert!(!work.is_disabled());
     }
 }

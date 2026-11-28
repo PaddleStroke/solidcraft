@@ -393,7 +393,6 @@ crates/solidcore/src/blend/hcr.rs	-	int-div	1	proven	usize::MAX / 2	constant non
 crates/solidcore/src/blend/law_corners.rs	LawCornerPieces::classify	windows	1	proven	windows(2)	constant non-zero size
 crates/solidcore/src/blend/law_corners.rs	sphere_zone	with_capacity	1	proven	Vec::with_capacity(9)	constant capacity
 crates/solidcore/src/blend/law_corners.rs	sphere_zone	with_capacity	2	proven	Vec::with_capacity(9)	constant capacity
-crates/solidcore/src/boolean/edge_history.rs	BoundaryHistory::sort	swap	1	proven	swap(j - 1, j)	atoms.get(j - 1)? and atoms.get(j)? both succeeded just above with j > 0, so both indices are in bounds
 crates/solidcore/src/boolean/merge/p2.rs	MergeState::merge_added_body	Vec::remove	1	proven	remove(i)	i is position() in the same Vec
 crates/solidcore/src/boolean/merge/p4.rs	classify_edge_faces	step_by	1	proven	step_by(2)	constant non-zero step
 crates/solidcore/src/boolean/topology_intersector/p1.rs	TopologyIntersector::face_face_intersect	Vec::insert	1	open	insert((jj + 1).min(faces2.len()), new_face)	
@@ -514,7 +513,6 @@ crates/solidcore/src/geom/geom_utility/p2.rs	segment_segment_intersect	with_capa
 crates/solidcore/src/geom/geom_utility/p2.rs	sphere_circle_sphere_circle_intersect	int-rem	1	proven	ii % 2	constant non-zero divisor
 crates/solidcore/src/geom/geom_utility/p2.rs	triangle_point_distance	f64::clamp	1	proven	clamp(0.0, 1.0)	constant bounds, min <= max
 crates/solidcore/src/geom/geom_utility/p2.rs	triangle_point_distance	f64::clamp	2	proven	clamp(0.0, 1.0)	constant bounds, min <= max
-crates/solidcore/src/geom/global_solver.rs	subtree_height	with_capacity	1	proven	Vec::with_capacity(capacity)	capacity = 4 * n + 4 by checked arithmetic, n = tree.nodes().len() of a tree already in memory
 crates/solidcore/src/geom/grid.rs	Grid::voxel_address	f64::clamp	1	proven	clamp(0.0, 1.0)	constant bounds, min <= max
 crates/solidcore/src/geom/grid.rs	Grid::voxel_address	f64::clamp	2	proven	clamp(0.0, 1.0)	constant bounds, min <= max
 crates/solidcore/src/geom/grid.rs	Grid::voxel_address	f64::clamp	3	proven	clamp(0.0, 1.0)	constant bounds, min <= max
@@ -623,6 +621,7 @@ crates/solidcore/src/intersect/surface_tracer.rs	find_boundary_start_points_base
 crates/solidcore/src/intersect/surface_tracer.rs	flush_curve	windows	1	proven	windows(2)	constant non-zero size
 crates/solidcore/src/intersect/topology_solver/p2.rs	swap_curve_surface_parameters	rotate	1	proven	rotate_left(1)	get_mut(..3)? yields a slice of length 3, so rotation by 1 fits
 crates/solidcore/src/intersect/topology_solver/p2.rs	swap_curve_surface_parameters	rotate	2	proven	rotate_left(1)	get_mut(..3)? yields a slice of length 3, so rotation by 1 fits
+crates/solidcore/src/mass/enclosure.rs	default_refinement_budget	Ord::clamp	1	proven	clamp(CELL_BUDGET, MAX_CELL_BUDGET)	constant bounds CELL_BUDGET (1 << 17) <= MAX_CELL_BUDGET (1 << 22)
 crates/solidcore/src/mass/integrator.rs	OdeIntegrator::integrate	copy_from_slice	1	open	copy_from_slice(&y)	
 crates/solidcore/src/mass/integrator/properties.rs	boundary_properties	windows	1	proven	windows(2)	constant non-zero size
 crates/solidcore/src/nurbs/b_spline_curve/analysis.rs	pairs	windows	1	proven	windows(2)	constant non-zero size

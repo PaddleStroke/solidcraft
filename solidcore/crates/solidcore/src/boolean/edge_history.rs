@@ -25,31 +25,12 @@ pub struct Certificate {
     owner: ProofWork,
 }
 
-impl Certificate {
-    // This is exactly the old Ord key, detached from mutable allowance state.
-    // Its owner Arc is retained by the arena for the whole local traversal.
-    fn key(&self) -> (usize, usize) {
-        (self.owner.operation_key(), self.index)
-    }
-}
-
 impl PartialEq for Certificate {
     fn eq(&self, other: &Self) -> bool {
         self.index == other.index && self.owner.same_operation(&other.owner)
     }
 }
 impl Eq for Certificate {}
-impl PartialOrd for Certificate {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-impl Ord for Certificate {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.key().cmp(&other.key())
-    }
-}
-
 /// Coverage of one exact original input-boundary token.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct BoundarySource {
@@ -125,15 +106,15 @@ impl BoundaryHistory {
     }
 
     fn copy_atoms(&mut self, id: &Certificate) -> Option<Vec<Atom>> {
-        self.copy_key_atoms(id.key())
-    }
-
-    fn copy_key_atoms(&mut self, (owner, index): (usize, usize)) -> Option<Vec<Atom>> {
-        // Compare the same live Arc address as owns()/Certificate equality BEFORE
-        // looking up an index. A foreign arena is never reinterpreted locally.
-        if self.owner.as_ref()?.operation_key() != owner {
+        if !self.owns(id) {
             return None;
         }
+        self.copy_index_atoms(id.index)
+    }
+
+    // Indices are local to this arena. Callers must validate ownership before
+    // deduplicating or looking up a Certificate supplied from another operation.
+    fn copy_index_atoms(&mut self, index: usize) -> Option<Vec<Atom>> {
         let count = self.certificates.get(index)?.len();
         if !self.charge(count.checked_add(1)?) {
             return None;
@@ -167,7 +148,8 @@ impl BoundaryHistory {
                 if !self.charge(2) {
                     return None;
                 }
-                atoms.swap(j - 1, j);
+                let (left, right) = atoms.split_at_mut_checked(j)?;
+                std::mem::swap(left.last_mut()?, right.first_mut()?);
                 j -= 1;
             }
         }
@@ -195,8 +177,8 @@ impl BoundaryHistory {
         Some(false)
     }
 
-    // A search visits at most every stored key. Certificate keys compare two
-    // scalar fields; include one insertion/end bookkeeping item per operation.
+    // A search visits at most every stored key. Retain the conservative two-scalar
+    // comparison envelope and one insertion/end bookkeeping item per operation.
     fn charge_tree(&mut self, entries: usize, operations: usize) -> bool {
         entries
             .checked_add(1)
@@ -336,7 +318,10 @@ impl BoundaryHistory {
             if !self.charge_tree(seen.len(), 1) {
                 return None;
             }
-            if !seen.insert(id.key()) {
+            if !self.owns(&id) {
+                return None;
+            }
+            if !seen.insert(id.index) {
                 continue;
             }
             let atoms = self.copy_atoms(&id)?;
@@ -362,7 +347,7 @@ impl BoundaryHistory {
         // orders those indices in this same arena, without a second sort/copy.
         let mut covered = BTreeMap::new();
         for key in seen {
-            let atoms = self.copy_key_atoms(key)?;
+            let atoms = self.copy_index_atoms(key)?;
             let mut yes = true;
             for atom in atoms {
                 if !self.charge(1) {
@@ -380,7 +365,8 @@ impl BoundaryHistory {
                             }
                             self.partitions
                                 .get(partition)
-                                .and_then(|parent| covered.get(&parent.key()))
+                                .filter(|parent| self.owns(parent))
+                                .and_then(|parent| covered.get(&parent.index))
                                 .copied()
                                 .unwrap_or(false)
                         }
@@ -399,7 +385,7 @@ impl BoundaryHistory {
         if !self.charge_tree(covered.len(), 1) {
             return None;
         }
-        covered.get(&certificate.key()).copied()
+        covered.get(&certificate.index).copied()
     }
 
     fn roots_of(&mut self, certificate: Certificate) -> Option<Vec<usize>> {
@@ -416,7 +402,10 @@ impl BoundaryHistory {
             if !self.charge_tree(visited.len(), 1) {
                 return None;
             }
-            if !visited.insert(id.key()) {
+            if !self.owns(&id) {
+                return None;
+            }
+            if !visited.insert(id.index) {
                 continue;
             }
             let atoms = self.copy_atoms(&id)?;
@@ -629,6 +618,9 @@ impl Collector {
             self.incomplete = true;
             return;
         }
+        if !self.reserve_pending_slot() {
+            return;
+        }
         self.pending.push(Some(Pending::Split {
             parent,
             lower,
@@ -636,6 +628,42 @@ impl Collector {
             bounds,
             source,
         }));
+    }
+
+    fn reserve_pending_slot(&mut self) -> bool {
+        // The same canonical growth/move bound used for an alias bracket also
+        // covers split/join slots. Reserve before constructing any queued record.
+        let cost = self
+            .pending
+            .len()
+            .checked_add(1)
+            .and_then(|n| n.checked_mul(384));
+        if !cost.is_some_and(|work| self.history.charge(work)) {
+            return false;
+        }
+        if self.pending.try_reserve_exact(1).is_err() {
+            if let Some(work) = self.history.proof_work() {
+                work.disable();
+            }
+            return false;
+        }
+        true
+    }
+
+    fn take_pending(&mut self, at: usize) -> Option<Pending> {
+        // Every slot is checked once and may move once. The existing canonical
+        // 384-byte bracket envelope bounds its retained record and move.
+        if !self
+            .pending
+            .len()
+            .checked_mul(386)
+            .is_some_and(|work| self.history.charge(work))
+        {
+            return None;
+        }
+        let taken = self.pending.get_mut(at)?.take();
+        self.pending.retain(Option::is_some);
+        taken
     }
 
     fn commit_split(
@@ -667,7 +695,7 @@ impl Collector {
             return;
         };
         // rposition proves the remove index is present.
-        let Some(pending) = self.pending.get_mut(at_pending).and_then(Option::take) else {
+        let Some(pending) = self.take_pending(at_pending) else {
             self.incomplete = true;
             return;
         };
@@ -729,6 +757,9 @@ impl Collector {
             self.incomplete = true;
             return;
         }
+        if !self.reserve_pending_slot() {
+            return;
+        }
         self.pending.push(Some(Pending::Join {
             survivor,
             removed,
@@ -755,9 +786,7 @@ impl Collector {
         }
         let Some(at) = self.pending.iter().rposition(|p| matches!(p, Some(Pending::Join { survivor: a, removed: b, .. }) if *a == survivor && *b == removed)) else { self.incomplete = true; return };
         // rposition proves the remove index is present.
-        let Some(Pending::Join { first, second, .. }) =
-            self.pending.get_mut(at).and_then(Option::take)
-        else {
+        let Some(Pending::Join { first, second, .. }) = self.take_pending(at) else {
             self.incomplete = true;
             return;
         };
@@ -949,19 +978,7 @@ impl Collector {
             self.deferred.get(&first).copied(),
             self.deferred.get(&second).copied(),
         ];
-        // Reserve a full possible Vec growth and moves before adding the slot.
-        let reserve = self
-            .pending
-            .len()
-            .checked_add(1)
-            .and_then(|n| n.checked_mul(384));
-        if !reserve.is_some_and(|w| self.history.charge(w)) {
-            return;
-        }
-        if self.pending.try_reserve_exact(1).is_err() {
-            if let Some(work) = self.history.proof_work() {
-                work.disable();
-            }
+        if !self.reserve_pending_slot() {
             return;
         }
         self.pending.push(Some(Pending::Alias {
@@ -1033,7 +1050,7 @@ impl Collector {
             copies,
             valid,
             ..
-        }) = self.pending.get_mut(at).and_then(Option::take)
+        }) = self.take_pending(at)
         else {
             self.incomplete = true;
             return;
@@ -1465,6 +1482,9 @@ mod tests {
         let local = second.original(22).unwrap();
         assert_eq!(alien.index, local.index);
         assert_eq!(second.sources(&alien), None);
+        assert_eq!(second.copy_atoms(&alien), None);
+        assert_eq!(second.covered_by(&[Atom::Root(22)], &alien), None);
+        assert_eq!(second.roots_of(alien.clone()), None);
         assert_eq!(second.united(Some(alien), Some(local)), None);
     }
 
@@ -1512,24 +1532,34 @@ mod tests {
 
     #[test]
     fn exhausted_history_keeps_the_actual_planar_boolean_geometry() {
-        let fixture = |exhaust: bool| {
+        let fixture = |exhaust: Option<bool>| {
             let mut k = Kernel::default();
             let mut history = BoundaryHistory::default();
             let (a, first) = rectangle(&mut k, &mut history, [0.0, 0.0], [10.0, 10.0], 0);
             let (b, second) = rectangle(&mut k, &mut history, [5.0, -5.0], [15.0, 5.0], 4);
-            if exhaust {
+            if exhaust == Some(true) {
                 history.proof_work().unwrap().disable();
             }
-            let (outcome, sources) = run(
-                &mut k,
-                a,
-                b,
-                Boolean2d::Intersection,
-                &first,
-                &second,
-                &mut history,
-            )
-            .unwrap();
+            assert!(k.context.proof_work().is_none());
+            let (outcome, sources) = if exhaust.is_some() {
+                run(
+                    &mut k,
+                    a,
+                    b,
+                    Boolean2d::Intersection,
+                    &first,
+                    &second,
+                    &mut history,
+                )
+                .unwrap()
+            } else {
+                (
+                    super::super::api_brep::boolean_2d(&mut k, a, b, Boolean2d::Intersection)
+                        .unwrap(),
+                    EdgeSources::new(),
+                )
+            };
+            assert!(k.context.proof_work().is_none());
             let Boolean2dOutcome::Result(body) = outcome else {
                 panic!("the intersection must exist")
             };
@@ -1559,24 +1589,56 @@ mod tests {
                 .values()
                 .filter_map(Clone::clone)
                 .any(|id| history.sources(&id).is_some());
-            if exhaust {
-                assert!(!known);
-            } else {
+            if exhaust == Some(false) {
                 assert!(
                     known,
                     "the normal producer path must actually preserve a certificate"
                 );
+            } else {
+                assert!(!known);
             }
             points
                 .into_iter()
                 .map(|p| p.map(f64::to_bits))
                 .collect::<Vec<_>>()
         };
+        let ordinary = fixture(None);
         assert_eq!(
-            fixture(false),
-            fixture(true),
-            "optional observer exhaustion must preserve geometry bits"
+            ordinary,
+            fixture(Some(false)),
+            "an active observer must preserve the unobserved geometry bits"
         );
+        assert_eq!(
+            ordinary,
+            fixture(Some(true)),
+            "optional observer exhaustion must preserve the unobserved geometry bits"
+        );
+    }
+
+    fn actual_bottom_sources(
+        body: &Brep,
+        sources: &EdgeSources,
+        history: &mut BoundaryHistory,
+        right: f64,
+    ) -> Vec<BoundarySource> {
+        let mut bottoms = Vec::new();
+        for (&edge, certificate) in sources {
+            let (a, b) = edge::start_end_vertices(body, edge).unwrap();
+            let mut ends = [a, b].map(|vertex| {
+                let point = body.vertex(vertex.unwrap()).unwrap().point;
+                [point.x, point.y, point.z]
+            });
+            ends.sort_by(|a, b| a[0].total_cmp(&b[0]));
+            if ends == [[0.0, 0.0, 0.0], [right, 0.0, 0.0]] {
+                bottoms.push(certificate);
+            }
+        }
+        assert_eq!(
+            bottoms.len(),
+            1,
+            "select the one actual complete bottom edge"
+        );
+        history.sources(bottoms[0].as_ref().unwrap()).unwrap()
     }
 
     #[test]
@@ -1599,11 +1661,10 @@ mod tests {
             })
         };
         assert!(
-            sources
-                .values()
-                .filter_map(Clone::clone)
-                .filter_map(|id| history.sources(&id))
-                .any(|values| complete_bottom(&values, &[0, 4])),
+            complete_bottom(
+                &actual_bottom_sources(&first, &sources, &mut history, 15.0),
+                &[0, 4]
+            ),
             "the first actual split/alias/rejoin must retain both whole bottom parents"
         );
         // Rebind these actual current edges in a fresh Collector; never reseed
@@ -1622,11 +1683,10 @@ mod tests {
             panic!("the second union must exist")
         };
         assert!(
-            sources
-                .values()
-                .filter_map(Clone::clone)
-                .filter_map(|id| history.sources(&id))
-                .any(|values| complete_bottom(&values, &[0, 4, 8])),
+            complete_bottom(
+                &actual_bottom_sources(&second, &sources, &mut history, 20.0),
+                &[0, 4, 8]
+            ),
             "nested partitions of the mixed intermediate must rejoin across all actual rounds"
         );
         let points: Vec<_> = crate::topology::brep::p1::vertices(&second, None)
@@ -2127,5 +2187,45 @@ mod tests {
             c.incomplete,
             "a pending snapshot cannot repair an unrelated domain edit"
         );
+    }
+
+    #[test]
+    fn completed_alias_brackets_do_not_accumulate_empty_slots() {
+        let (mut collector, [first, second, ..]) = alias_fixture();
+        construct_dependency(&mut collector, first, second);
+        for _ in 0..32 {
+            collector.begin_alias(first, second);
+            assert_eq!(collector.pending.len(), 1);
+            alias_copies(&mut collector, first, second);
+            collector.commit_alias(first, second);
+            assert!(collector.pending.is_empty());
+            assert!(!collector.incomplete);
+            assert!(!collector.history.is_exhausted());
+            assert_eq!(
+                projected(&mut collector, first),
+                Some(vec![BoundarySource {
+                    input: 7,
+                    whole: true
+                },])
+            );
+        }
+    }
+
+    #[test]
+    fn pending_compaction_keeps_outer_brackets_and_declines_only_metadata() {
+        let (mut collector, [first, second, third, fourth]) = alias_fixture();
+        collector.begin_join(first, second);
+        collector.begin_join(third, fourth);
+        collector.commit_join(third, fourth);
+        assert_eq!(collector.pending.len(), 1);
+        assert!(matches!(collector.pending[0],
+            Some(Pending::Join { survivor, removed, .. })
+                if survivor == first.key && removed == second.key));
+        collector.commit_join(first, second);
+        assert!(collector.pending.is_empty());
+        collector.begin_join(first, second);
+        collector.history.proof_work().unwrap().disable();
+        collector.commit_join(first, second);
+        assert!(collector.history.is_exhausted());
     }
 }

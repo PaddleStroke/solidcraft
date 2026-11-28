@@ -1252,11 +1252,10 @@ pub(crate) fn make_vertex_split_edge_with_curve_identity_state(
         })?;
         edge::set_interval(b, edge_id, if same { &ivl1 } else { &ivl2 })?;
         edge::set_interval(b, new_edge, if same { &ivl2 } else { &ivl1 })?;
-        let mut copy_source = crate::nurbs::b_spline_curve_n_lib::CopySourceOutcome::Uncertified;
-        let mut lower_source = crate::nurbs::b_spline_curve_n_lib::TrimSourceOutcome::Uncertified;
-        let mut upper_source = crate::nurbs::b_spline_curve_n_lib::TrimSourceOutcome::Uncertified;
+        let lower_source;
+        let upper_source;
         let record_sources;
-        let mut copied = {
+        let (mut copied, copy_source) = {
             let source = required(b.edge(edge_id)?.curve.as_ref(), "split edge without curve")?;
             let work = source.source_domain_observation_work();
             record_sources = state.with_env(k, |env| {
@@ -1267,7 +1266,14 @@ pub(crate) fn make_vertex_split_edge_with_curve_identity_state(
                     )
                 }))
             })?;
-            source.copy_with_source(k, record_sources.then_some(&mut copy_source))?
+            if record_sources {
+                source.copy_with_source(k)?
+            } else {
+                (
+                    source.copy(k)?,
+                    crate::nurbs::b_spline_curve_n_lib::CopySourceOutcome::Uncertified,
+                )
+            }
         };
         let old_curve_ref = state.with_env(k, |env| {
             let curve = required(
@@ -1305,51 +1311,83 @@ pub(crate) fn make_vertex_split_edge_with_curve_identity_state(
         })?;
         let split_parameter;
         if same {
-            required(
+            let curve = required(
                 b.edge_mut(edge_id)?.curve.as_mut(),
                 "split edge without curve",
-            )?
-            .trim_with_source(
-                k,
-                &mut ivl1,
-                crate::nurbs::b_spline_curve_n_lib::TrimMode::Notify,
-                record_sources.then_some(&mut lower_source),
             )?;
+            lower_source = if record_sources {
+                curve.trim_with_source(
+                    k,
+                    &mut ivl1,
+                    crate::nurbs::b_spline_curve_n_lib::TrimMode::Notify,
+                )?
+            } else {
+                curve.trim(
+                    k,
+                    &mut ivl1,
+                    crate::nurbs::b_spline_curve_n_lib::TrimMode::Notify,
+                )?;
+                crate::nurbs::b_spline_curve_n_lib::TrimSourceOutcome::Uncertified
+            };
             split_parameter = ivl1.max();
-            required(
+            let curve = required(
                 b.edge_mut(new_edge)?.curve.as_mut(),
                 "new split edge without curve",
-            )?
-            .trim_with_source(
-                k,
-                &mut ivl2,
-                crate::nurbs::b_spline_curve_n_lib::TrimMode::Notify,
-                record_sources.then_some(&mut upper_source),
             )?;
+            upper_source = if record_sources {
+                curve.trim_with_source(
+                    k,
+                    &mut ivl2,
+                    crate::nurbs::b_spline_curve_n_lib::TrimMode::Notify,
+                )?
+            } else {
+                curve.trim(
+                    k,
+                    &mut ivl2,
+                    crate::nurbs::b_spline_curve_n_lib::TrimMode::Notify,
+                )?;
+                crate::nurbs::b_spline_curve_n_lib::TrimSourceOutcome::Uncertified
+            };
             edge::set_interval(b, edge_id, &ivl1)?;
             edge::set_interval(b, new_edge, &ivl2)?;
         } else {
-            required(
+            let curve = required(
                 b.edge_mut(edge_id)?.curve.as_mut(),
                 "split edge without curve",
-            )?
-            .trim_with_source(
-                k,
-                &mut ivl2,
-                crate::nurbs::b_spline_curve_n_lib::TrimMode::Notify,
-                record_sources.then_some(&mut upper_source),
             )?;
+            upper_source = if record_sources {
+                curve.trim_with_source(
+                    k,
+                    &mut ivl2,
+                    crate::nurbs::b_spline_curve_n_lib::TrimMode::Notify,
+                )?
+            } else {
+                curve.trim(
+                    k,
+                    &mut ivl2,
+                    crate::nurbs::b_spline_curve_n_lib::TrimMode::Notify,
+                )?;
+                crate::nurbs::b_spline_curve_n_lib::TrimSourceOutcome::Uncertified
+            };
             split_parameter = ivl2.min();
-            required(
+            let curve = required(
                 b.edge_mut(new_edge)?.curve.as_mut(),
                 "new split edge without curve",
-            )?
-            .trim_with_source(
-                k,
-                &mut ivl1,
-                crate::nurbs::b_spline_curve_n_lib::TrimMode::Notify,
-                record_sources.then_some(&mut lower_source),
             )?;
+            lower_source = if record_sources {
+                curve.trim_with_source(
+                    k,
+                    &mut ivl1,
+                    crate::nurbs::b_spline_curve_n_lib::TrimMode::Notify,
+                )?
+            } else {
+                curve.trim(
+                    k,
+                    &mut ivl1,
+                    crate::nurbs::b_spline_curve_n_lib::TrimMode::Notify,
+                )?;
+                crate::nurbs::b_spline_curve_n_lib::TrimSourceOutcome::Uncertified
+            };
             edge::set_interval(b, edge_id, &ivl2)?;
             edge::set_interval(b, new_edge, &ivl1)?;
         }

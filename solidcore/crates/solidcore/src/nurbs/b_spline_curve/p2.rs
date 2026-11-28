@@ -743,11 +743,14 @@ impl BSplineCurve {
         if self.degree()? == 1 && self.number_control_points()? == 2 {
             // the IsLine check will always pass because of the previous definition check
             if let Some(work) = k.context.proof_work() {
-                // is_line has no Kernel: reserve its at most nine native D1
-                // samples before entering the unchanged helper.
-                let cost = self
-                    .proof_native_work(1, false)
-                    .and_then(|n| n.checked_mul(9)?.checked_add(512 + 10));
+                // is_line reads two control points directly for a non-rational
+                // segment; only a rational segment can take nine native D1 samples.
+                let cost = if self.is_rational()? {
+                    self.proof_native_work(1, false)
+                        .and_then(|n| n.checked_mul(9)?.checked_add(512 + 10))
+                } else {
+                    Some(512 + 10)
+                };
                 if !work.charge(cost) {
                     return Err(work.stopped(OP_ANALYTIC));
                 }
@@ -2618,5 +2621,57 @@ mod tests {
             let p_ref = wr37_exact_offset_point(ell.base(), t, Vec3::Z, 0.25);
             assert!(p_off.distance(p_ref) <= 2.0 * tol);
         }
+    }
+
+    #[test]
+    fn nonrational_segment_recognition_debits_only_the_branch_it_runs() {
+        use crate::geom::context::ProofWork;
+        let source = line(Point3::ZERO, Point3::new(2.0, 0.0, 0.0));
+        let interval = source.natural_interval();
+        let mut query = Kernel::default();
+        // The actual path has three native Point calls (1305 each for p1/K4),
+        // 512 setup,522 direct-control IsLine and two125 Line evaluations:5199.
+        // The old nine-D1 reservation alone exceeds19000, so8192 separates
+        // actual branch work without changing the operation's2M allowance.
+        let work = ProofWork::new(8192);
+        query.context.set_proof_work(Some(work.clone()));
+        let analytic = source
+            .create_analytic_curve(&query, &interval)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(analytic, AnalyticCurve::Line(_)));
+        assert!(!work.is_disabled());
+        assert_eq!(
+            analytic.evaluate_point(interval.min()).unwrap(),
+            Point3::ZERO
+        );
+        assert_eq!(
+            analytic.evaluate_point(interval.max()).unwrap(),
+            Point3::new(2.0, 0.0, 0.0)
+        );
+    }
+
+    #[test]
+    fn rational_segment_recognition_keeps_the_sampled_work_reservation() {
+        use crate::geom::context::ProofWork;
+        let raw = Curve::new(
+            vec![
+                CPoint::new(0.0, 0.0, 0.0, 1.0),
+                CPoint::new(2.0, 0.0, 0.0, 2.0),
+            ],
+            1,
+            vec![0.0, 0.0, 1.0, 1.0],
+        )
+        .unwrap();
+        let source = BSplineCurve::from_nurb(raw, 3, false);
+        assert!(source.is_rational().unwrap());
+        let mut query = Kernel::default();
+        let work = ProofWork::new(8192);
+        query.context.set_proof_work(Some(work.clone()));
+        assert!(matches!(
+            source.create_analytic_curve(&query, &source.natural_interval()),
+            Err(SolidError::OutOfFuel { .. })
+        ));
+        assert!(work.is_disabled());
     }
 }

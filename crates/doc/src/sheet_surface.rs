@@ -543,7 +543,7 @@ pub(crate) fn join_pieces(pieces: &[(Piece, Region2)], work: &mut FlatWork) -> R
             (h, tags)
         })
         .collect();
-    Ok(stage("joining the sheet's pieces", put_back(joined, carried))?.geometry)
+    Ok(stage("joining the sheet's pieces", put_back(joined, carried, work))?.geometry)
 }
 
 /// A loop's box, out by [`CLEAR`]: the box that holds its segments (see
@@ -632,7 +632,7 @@ fn holes_apart(region: &Region2) -> Vec<bool> {
 /// The holes `carried` back in the regions of `out` that hold them: each kept clear of every
 /// other loop (see [`holes_apart`] and [`loop_clear_of`]), so that the region holding a point of
 /// it holds it all, read exactly (see [`holds`]).
-fn put_back(mut out: Regions, carried: Vec<(Loop2, Vec<Option<Vec<ConvertedEdge>>>)>) -> Result<Regions> {
+fn put_back(mut out: Regions, carried: Vec<(Loop2, Vec<Option<Vec<ConvertedEdge>>>)>, work: &mut FlatWork) -> Result<Regions> {
     let mut boxes: Vec<(Aabb2, Vec<Aabb2>)> = out.geometry.iter().map(|r| (loop_box(&r.outer), r.holes.iter().map(loop_box).collect())).collect();
     for (h, source) in carried {
         let Some(at) = h.segs.first().map(Seg2::start) else { continue };
@@ -646,8 +646,17 @@ fn put_back(mut out: Regions, carried: Vec<(Loop2, Vec<Option<Vec<ConvertedEdge>
             })
             .ok_or_else(|| DocError::Invalid("a cut-out of the flat lost its piece".into()))?;
         hole_boxes.push(loop_box(&h));
+        let hole_index = r.holes.len();
         r.holes.push(h);
-        tags.holes.push(source);
+        let needed = hole_index.checked_add(1);
+        let storage = needed.and_then(|n| n.checked_mul(std::mem::size_of::<Vec<Option<Vec<ConvertedEdge>>>>())).and_then(|n| n.checked_mul(2));
+        let additional = needed.map(|n| n.saturating_sub(tags.holes.len()));
+        if work.charge_history(storage) && additional.is_some_and(|n| tags.holes.try_reserve_exact(n).is_ok()) {
+            tags.holes.resize_with(hole_index, Vec::new);
+            tags.holes.push(source);
+        } else {
+            *tags = RegionOrigins::default();
+        }
     }
     Ok(out)
 }
@@ -709,7 +718,7 @@ pub(crate) fn boolean_past_holes(
     if carried.is_empty() {
         return planar_boolean(a, b, op, a_origins, b_origins, work);
     }
-    put_back(planar_boolean(&bare, b, op, &bare_origins, b_origins, work)?, carried)
+    put_back(planar_boolean(&bare, b, op, &bare_origins, b_origins, work)?, carried, work)
 }
 
 /// How far apart (mm) the planar booleans let a loop's segments end and still close it: the
@@ -953,15 +962,25 @@ mod tests {
                 })
                 .collect()
         };
-        let placed = put_back(Regions::unknown(base.clone()), carried_with_origins(carried.clone())).unwrap().geometry;
+        let placed = put_back(Regions::unknown(base.clone()), carried_with_origins(carried.clone()), &mut FlatWork::new()).unwrap().geometry;
         let expected_placed = ref_put_back(base.clone(), carried).unwrap();
         assert_eq!(placed, expected_placed);
         assert_eq!(placed[0].holes.len(), 61);
         assert_eq!(placed[1].holes.len(), 60);
 
         // A hole inside an existing hole or outside all regions must fail identically to reference.
-        assert!(put_back(Regions::unknown(base.clone()), carried_with_origins(vec![Loop2::circle(Vec2::new(10.0, 10.0), 0.5).reversed()])).is_err());
-        assert!(put_back(Regions::unknown(base), carried_with_origins(vec![Loop2::circle(Vec2::new(160.0, 60.0), 2.0).reversed()])).is_err());
+        assert!(
+            put_back(
+                Regions::unknown(base.clone()),
+                carried_with_origins(vec![Loop2::circle(Vec2::new(10.0, 10.0), 0.5).reversed()]),
+                &mut FlatWork::new()
+            )
+            .is_err()
+        );
+        assert!(
+            put_back(Regions::unknown(base), carried_with_origins(vec![Loop2::circle(Vec2::new(160.0, 60.0), 2.0).reversed()]), &mut FlatWork::new())
+                .is_err()
+        );
     }
 
     #[test]
@@ -1016,5 +1035,33 @@ mod tests {
         // Only the left rectangle contributes to x=0..5. Without an input-extent certificate,
         // the old full mixed set cannot be certified for this strict subpiece.
         assert_eq!(trimmed.origins[0].outer[trimmed_at], None);
+    }
+    #[test]
+    fn carried_hole_sources_keep_their_actual_geometry_index_after_unknown_history() {
+        let region = Region2 {
+            outer: rect_loop(0.0, 0.0, 20.0, 10.0),
+            holes: vec![rect_loop(1.0, 2.0, 3.0, 4.0).reversed(), rect_loop(5.0, 2.0, 7.0, 4.0).reversed()],
+        };
+        let carried = rect_loop(11.0, 2.0, 13.0, 4.0).reversed();
+        let tag = |edge| Some(vec![ConvertedEdge { edge, faces: [0, edge + 1] }]);
+        let first = (4..8).map(tag).collect::<Vec<_>>();
+        let second = (8..12).map(tag).collect::<Vec<_>>();
+        let added = (12..16).map(tag).collect::<Vec<_>>();
+        for holes in [Vec::new(), vec![first.clone()], vec![first.clone(), second.clone()]] {
+            let before = holes.clone();
+            let out = Regions { geometry: vec![region.clone()], origins: vec![RegionOrigins { outer: Vec::new(), holes }] };
+            let result = put_back(out, vec![(carried.clone(), added.clone())], &mut FlatWork::new()).unwrap();
+            assert_eq!(result.geometry[0].holes, vec![region.holes[0].clone(), region.holes[1].clone(), carried.clone()]);
+            assert_eq!(result.origins[0].holes.len(), 3);
+            assert_eq!(result.origins[0].holes[0], before.first().cloned().unwrap_or_default());
+            assert_eq!(result.origins[0].holes[1], before.get(1).cloned().unwrap_or_default());
+            assert_eq!(result.origins[0].holes[2], added);
+        }
+        let out = Regions { geometry: vec![region], origins: vec![RegionOrigins::default()] };
+        let mut spent = FlatWork::new();
+        assert!(!spent.charge_history(None));
+        let result = put_back(out, vec![(carried, added)], &mut spent).unwrap();
+        assert_eq!(result.geometry[0].holes.len(), 3);
+        assert_eq!(result.origins[0], RegionOrigins::default(), "a declined padding charge cannot misassign a known hole");
     }
 }

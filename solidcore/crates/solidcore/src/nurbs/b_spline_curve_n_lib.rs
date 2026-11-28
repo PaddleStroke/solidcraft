@@ -2689,7 +2689,8 @@ impl BSplineCurve {
         mode: TrimMode,
         zone_tol_3d: f64,
     ) -> Result<()> {
-        self.trim_with_zone_tol_observed(trim_interval, mode, zone_tol_3d, None)
+        self.trim_with_zone_tol_impl(trim_interval, mode, zone_tol_3d, false)
+            .map(|_| ())
     }
 
     /// The same trim; evidence follows actual construction and is invalidated by cleanup.
@@ -2698,23 +2699,28 @@ impl BSplineCurve {
         trim_interval: &mut Extent1d,
         mode: TrimMode,
         zone_tol_3d: f64,
-        mut outcome: Option<&mut TrimSourceOutcome>,
-    ) -> Result<()> {
+    ) -> Result<TrimSourceOutcome> {
+        self.trim_with_zone_tol_impl(trim_interval, mode, zone_tol_3d, true)
+    }
+
+    fn trim_with_zone_tol_impl(
+        &mut self,
+        trim_interval: &mut Extent1d,
+        mode: TrimMode,
+        zone_tol_3d: f64,
+        collect_source: bool,
+    ) -> Result<TrimSourceOutcome> {
         const OP: &str = OP_TRIM;
-        if let Some(outcome) = outcome.as_deref_mut() {
-            *outcome = TrimSourceOutcome::Uncertified;
-        }
+        let mut outcome = TrimSourceOutcome::Uncertified;
         let mut source_proved = true;
 
         // no work - the natural interval is contained by the new interval
         let nat_ivl = self.natural_interval();
         if nat_ivl.is_contained_by(trim_interval, EFF_ZERO) {
-            if mode != TrimMode::IntervalOnly {
-                if let Some(outcome) = outcome.as_deref_mut() {
-                    *outcome = TrimSourceOutcome::Retained(nat_ivl);
-                }
+            if mode != TrimMode::IntervalOnly && collect_source {
+                outcome = TrimSourceOutcome::Retained(nat_ivl);
             }
-            return Ok(());
+            return Ok(outcome);
         }
 
         // locals
@@ -2827,12 +2833,10 @@ impl BSplineCurve {
         if (d_min - first_knot).abs() < scaled_zero_min
             && (d_max - last_knot).abs() < scaled_zero_max
         {
-            if mode != TrimMode::IntervalOnly {
-                if let Some(outcome) = outcome.as_deref_mut() {
-                    *outcome = TrimSourceOutcome::Retained(nat_ivl);
-                }
+            if mode != TrimMode::IntervalOnly && collect_source {
+                outcome = TrimSourceOutcome::Retained(nat_ivl);
             }
-            return Ok(());
+            return Ok(outcome);
         }
 
         // Reset interval if we happen to fall nearly on some knots (status ignored).
@@ -2903,15 +2907,13 @@ impl BSplineCurve {
             self.nurb_is_borrowed = false;
             self.nurb = Some(cur1);
         }
-        if mode != TrimMode::IntervalOnly && source_proved {
-            if let Some(outcome) = outcome {
-                let source = Extent1d::from_min_max(d_min, d_max);
-                if self.natural_interval() == source {
-                    *outcome = TrimSourceOutcome::Retained(source);
-                }
+        if mode != TrimMode::IntervalOnly && source_proved && collect_source {
+            let source = Extent1d::from_min_max(d_min, d_max);
+            if self.natural_interval() == source {
+                outcome = TrimSourceOutcome::Retained(source);
             }
         }
-        Ok(())
+        Ok(outcome)
     }
 
     /// `SmTol::MapTo1d(tol, t, *this)`: `tol` mapped to parameter space with the first
@@ -4258,8 +4260,7 @@ mod tests {
     #[test]
     fn copy_source_evidence_observes_actual_knot_fixup() {
         let stable = cubic();
-        let mut outcome = CopySourceOutcome::Uncertified;
-        let observed = stable.copy_with_source(Some(&mut outcome));
+        let (observed, outcome) = stable.copy_with_source();
         assert_eq!(outcome, CopySourceOutcome::Preserved);
         assert!(observed.same_definition(&stable.copy()));
 
@@ -4272,7 +4273,7 @@ mod tests {
             !plain.same_definition(&near_knots),
             "the source has an actual knot fix-up"
         );
-        let observed = near_knots.copy_with_source(Some(&mut outcome));
+        let (observed, outcome) = near_knots.copy_with_source();
         assert_eq!(outcome, CopySourceOutcome::Uncertified);
         assert!(
             observed.same_definition(&plain),
@@ -4303,14 +4304,8 @@ mod tests {
                 .unwrap();
             let mut observed = cubic();
             let mut interval = input;
-            let mut outcome = TrimSourceOutcome::Uncertified;
-            observed
-                .trim_with_zone_tol_observed(
-                    &mut interval,
-                    TrimMode::Silent,
-                    zone,
-                    Some(&mut outcome),
-                )
+            let outcome = observed
+                .trim_with_zone_tol_observed(&mut interval, TrimMode::Silent, zone)
                 .unwrap();
             assert_eq!(outcome, TrimSourceOutcome::Retained(expected));
             assert_eq!(interval, plain_interval);
@@ -4335,9 +4330,8 @@ mod tests {
         );
         let mut observed = short_span_arc(3);
         let mut interval = input;
-        let mut outcome = TrimSourceOutcome::Uncertified;
-        observed
-            .trim_with_zone_tol_observed(&mut interval, TrimMode::Silent, zone, Some(&mut outcome))
+        let outcome = observed
+            .trim_with_zone_tol_observed(&mut interval, TrimMode::Silent, zone)
             .unwrap();
         assert_eq!(outcome, TrimSourceOutcome::Uncertified);
         assert_eq!(interval, plain_interval);
@@ -4345,13 +4339,8 @@ mod tests {
 
         let mut retained = short_span_arc(3);
         let mut retained_interval = input;
-        retained
-            .trim_with_zone_tol_observed(
-                &mut retained_interval,
-                TrimMode::Silent,
-                1e-9,
-                Some(&mut outcome),
-            )
+        let outcome = retained
+            .trim_with_zone_tol_observed(&mut retained_interval, TrimMode::Silent, 1e-9)
             .unwrap();
         assert_eq!(outcome, TrimSourceOutcome::Retained(input));
         assert_eq!(
@@ -4368,25 +4357,14 @@ mod tests {
         let natural = original.natural_interval();
         let mut observed = cubic();
         let mut interval = Extent1d::from_min_max(0.1, 0.9);
-        let mut outcome = TrimSourceOutcome::Retained(natural);
-        observed
-            .trim_with_zone_tol_observed(
-                &mut interval,
-                TrimMode::IntervalOnly,
-                zone,
-                Some(&mut outcome),
-            )
+        let outcome = observed
+            .trim_with_zone_tol_observed(&mut interval, TrimMode::IntervalOnly, zone)
             .unwrap();
         assert_eq!(outcome, TrimSourceOutcome::Uncertified);
         assert!(observed.same_definition(&original));
         let mut whole_request = Extent1d::from_min_max(-1.0, 2.0);
-        observed
-            .trim_with_zone_tol_observed(
-                &mut whole_request,
-                TrimMode::Silent,
-                zone,
-                Some(&mut outcome),
-            )
+        let outcome = observed
+            .trim_with_zone_tol_observed(&mut whole_request, TrimMode::Silent, zone)
             .unwrap();
         assert_eq!(outcome, TrimSourceOutcome::Retained(natural));
         assert!(observed.same_definition(&original));

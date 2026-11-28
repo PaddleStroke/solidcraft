@@ -488,22 +488,39 @@ impl Line {
     /// fixed up.
     #[must_use]
     pub fn copy(&self) -> Self {
-        self.copy_with_source(None)
+        self.copy_impl(false).0
     }
 
     /// The same copy, with evidence from its actual B-spline fix-up.
     pub(crate) fn copy_with_source(
         &self,
-        outcome: Option<&mut crate::nurbs::b_spline_curve_n_lib::CopySourceOutcome>,
-    ) -> Self {
-        Self {
-            base: self.base.copy_with_source(outcome),
-            point: self.point,
-            vector: self.vector,
-            anal_domain: self.anal_domain,
-            scale: self.scale,
-            inside_out: self.inside_out,
-        }
+    ) -> (Self, crate::nurbs::b_spline_curve_n_lib::CopySourceOutcome) {
+        self.copy_impl(true)
+    }
+
+    fn copy_impl(
+        &self,
+        collect_source: bool,
+    ) -> (Self, crate::nurbs::b_spline_curve_n_lib::CopySourceOutcome) {
+        let (base, outcome) = if collect_source {
+            self.base.copy_with_source()
+        } else {
+            (
+                self.base.copy(),
+                crate::nurbs::b_spline_curve_n_lib::CopySourceOutcome::Uncertified,
+            )
+        };
+        (
+            Self {
+                base,
+                point: self.point,
+                vector: self.vector,
+                anal_domain: self.anal_domain,
+                scale: self.scale,
+                inside_out: self.inside_out,
+            },
+            outcome,
+        )
     }
 
     /// Not upstream: the same line by definition, exactly (IEEE `==`; a NaN refuses):
@@ -2245,35 +2262,40 @@ impl Line {
         trim_interval: &Extent1d,
         mode: TrimMode,
     ) -> Result<()> {
-        self.trim_owned_observed(owner, trim_interval, mode, None)
+        self.trim_owned_impl(owner, trim_interval, mode, false)
+            .map(|_| ())
     }
 
-    /// The same trim, recording only successful source-frame transport.
+    /// The same trim, returning only successful source-frame transport.
     pub(crate) fn trim_owned_observed(
         &mut self,
         owner: Option<ObjectRef>,
         trim_interval: &Extent1d,
         mode: TrimMode,
-        mut outcome: Option<&mut crate::nurbs::b_spline_curve_n_lib::TrimSourceOutcome>,
-    ) -> Result<()> {
-        if let Some(outcome) = outcome.as_deref_mut() {
-            *outcome = crate::nurbs::b_spline_curve_n_lib::TrimSourceOutcome::Uncertified;
-        }
+    ) -> Result<crate::nurbs::b_spline_curve_n_lib::TrimSourceOutcome> {
+        self.trim_owned_impl(owner, trim_interval, mode, true)
+    }
+
+    fn trim_owned_impl(
+        &mut self,
+        owner: Option<ObjectRef>,
+        trim_interval: &Extent1d,
+        mode: TrimMode,
+        collect_source: bool,
+    ) -> Result<crate::nurbs::b_spline_curve_n_lib::TrimSourceOutcome> {
+        let mut outcome = crate::nurbs::b_spline_curve_n_lib::TrimSourceOutcome::Uncertified;
         // no work - current natural interval is a subSet of targetInterval
         let nat_ivl = self.natural_interval();
         if nat_ivl.is_contained_by(trim_interval, EFF_ZERO) {
-            if mode != TrimMode::IntervalOnly {
-                if let Some(outcome) = outcome.as_deref_mut() {
-                    *outcome =
-                        crate::nurbs::b_spline_curve_n_lib::TrimSourceOutcome::Retained(nat_ivl);
-                }
+            if mode != TrimMode::IntervalOnly && collect_source {
+                outcome = crate::nurbs::b_spline_curve_n_lib::TrimSourceOutcome::Retained(nat_ivl);
             }
-            return Ok(());
+            return Ok(outcome);
         }
 
         // When asked - just return the Nurb interval
         if mode == TrimMode::IntervalOnly {
-            return Ok(());
+            return Ok(outcome);
         }
 
         // trim the analytic interval
@@ -2292,17 +2314,16 @@ impl Line {
 
         // Set Nurb Parameterization
         let parameter_status = self.base.edit_parameterization(trim_interval);
-        if let Some(outcome) = outcome {
-            if domain_status.is_ok()
-                && rebuilt
-                && parameter_status.is_ok()
-                && self.natural_interval() == *trim_interval
-            {
-                *outcome =
-                    crate::nurbs::b_spline_curve_n_lib::TrimSourceOutcome::Retained(*trim_interval);
-            }
+        if collect_source
+            && domain_status.is_ok()
+            && rebuilt
+            && parameter_status.is_ok()
+            && self.natural_interval() == *trim_interval
+        {
+            outcome =
+                crate::nurbs::b_spline_curve_n_lib::TrimSourceOutcome::Retained(*trim_interval);
         }
-        Ok(())
+        Ok(outcome)
     }
 
     // ---- validity and input -----------------------------------------------------------

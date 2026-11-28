@@ -366,8 +366,9 @@ fn face_chart(b: &Body, q: &Query, shape: &Shape, f: usize, sag: f64, tol: f64) 
     loops.sort_by(|x, y| area(&y.0).total_cmp(&area(&x.0)));
     let mut it = loops.into_iter();
     let Some((outer, mut uses)) = it.next() else { return Err("a face of the body has no edges".into()) };
+    let outer_reversed = !outer.is_ccw();
     for u in &mut uses {
-        if !outer.is_ccw() {
+        if outer_reversed {
             for k in &mut u.segments {
                 *k = outer.segs.len() - 1 - *k;
             }
@@ -388,9 +389,10 @@ fn face_chart(b: &Body, q: &Query, shape: &Shape, f: usize, sag: f64, tol: f64) 
                 }
             }
         }
+        let hole_reversed = hole.is_ccw();
         for u in &mut hole_uses {
             u.loop_index = holes.len() + 1;
-            if hole.is_ccw() {
+            if hole_reversed {
                 for k in &mut u.segments {
                     *k = hole.segs.len() - 1 - *k;
                 }
@@ -3747,9 +3749,25 @@ pub(crate) fn cap_frame(dev: &Development, frame: Rigid3, i: usize, surface: boo
 /// `r` through `map`, a rigid map of the plane (mirrored or not): lines and arcs stay lines and
 /// arcs, free-form curves map exactly through their control points.
 pub(crate) fn rigid_region(r: &Region2, map: impl Fn(Vec2) -> Vec2) -> Region2 {
+    rigid_region_observed(r, map, None)
+}
+
+/// The same rigid map, reporting the actual loop-order decision to an optional metadata observer.
+/// The observer cannot alter geometry or fail the map; ordinary callers allocate no metadata.
+pub(crate) fn rigid_region_observed(r: &Region2, map: impl Fn(Vec2) -> Vec2, mut observe: Option<&mut dyn FnMut(usize, usize, bool)>) -> Region2 {
     let seg = rigid_seg(&map);
     let map_loop = |lp: &Loop2| Loop2 { segs: lp.segs.iter().map(&seg).collect() };
-    Region2 { outer: map_loop(&r.outer).ccw(), holes: r.holes.iter().map(|h| map_loop(h).ccw().reversed()).collect() }
+    let mut oriented = |lp: &Loop2, index: usize, hole: bool| {
+        let mapped = map_loop(lp);
+        let ccw = mapped.is_ccw();
+        if let Some(observer) = observe.as_mut() {
+            observer(index, mapped.segs.len(), if hole { ccw } else { !ccw });
+        }
+        // Exactly Loop2::ccw's clone/reversal sequence, including >=0 at zero and false at NaN.
+        let canonical = if ccw { mapped.clone() } else { mapped.reversed() };
+        if hole { canonical.reversed() } else { canonical }
+    };
+    Region2 { outer: oriented(&r.outer, 0, false), holes: r.holes.iter().enumerate().map(|(i, h)| oriented(h, i + 1, true)).collect() }
 }
 
 /// Each segment through `map`, a rigid map of the plane (mirrored or not), still running the way
@@ -3949,6 +3967,28 @@ impl SurfaceSheet {
     /// Capture a known parent map at the same event that installs a panel's geometry.
     pub(crate) fn remember_panel_origins(&mut self, i: usize, origins: RegionOrigins) {
         if let Some(panel) = self.sheet.panels.get(i) {
+            let mut observer = FlatWork::new();
+            let mut known = false;
+            'source: for lp in std::iter::once(&origins.outer).chain(&origins.holes) {
+                if !observer.charge_history(Some(1)) {
+                    self.converted_boundaries.remove(&panel.name);
+                    return;
+                }
+                for tag in lp {
+                    if !observer.charge_history(Some(1)) {
+                        self.converted_boundaries.remove(&panel.name);
+                        return;
+                    }
+                    if tag.as_ref().is_some_and(|source| !source.is_empty()) {
+                        known = true;
+                        break 'source;
+                    }
+                }
+            }
+            if !known {
+                self.converted_boundaries.remove(&panel.name);
+                return;
+            }
             let cost = (|| {
                 let mut count = 0usize;
                 for lp in std::iter::once(&panel.region.outer).chain(&panel.region.holes) {
@@ -3956,7 +3996,6 @@ impl SurfaceSheet {
                 }
                 count.checked_mul(std::mem::size_of::<Seg2>())?.checked_add((panel.region.holes.len() + 1).checked_mul(std::mem::size_of::<Loop2>())?)
             })();
-            let mut observer = FlatWork::new();
             if observer.charge_history(cost) && charge_sources(&mut observer, origins.outer.iter().chain(origins.holes.iter().flatten()), 1, false) {
                 self.converted_boundaries.insert(panel.name.clone(), ConvertedBoundary { region: panel.region.clone(), origins });
             } else {
@@ -4598,7 +4637,7 @@ impl SurfaceSheet {
         let (solid_pieces, solid_origins) = if self.countersinks.is_empty() {
             (pieces, piece_origins)
         } else {
-            let pieces = self.solid_pieces_for_countersinks(&dev, &pieces, &piece_origins)?;
+            let pieces = self.solid_pieces_for_countersinks(&dev, &pieces, &piece_origins, &mut work)?;
             (pieces.geometry, pieces.origins)
         };
         let namer = crate::sheet::FaceNamer::new(&self.sheet, &dev, &solid_pieces, &self.sketch_curves, &self.recipes, &self.beads);
@@ -4697,7 +4736,26 @@ impl SurfaceSheet {
     /// opposing-cone breakthrough opening (less non-full circular bores) so the two cones cut
     /// through solid metal cleanly without a zero-height vertical wall along their intersection.
     /// The flat pattern keeps the exact through-opening from `pieces`.
-    fn solid_pieces_for_countersinks(&self, dev: &Development, pieces: &[(Piece, Region2)], origins: &[RegionOrigins]) -> Result<Pieces> {
+    fn solid_pieces_for_countersinks(
+        &self,
+        dev: &Development,
+        pieces: &[(Piece, Region2)],
+        origins: &[RegionOrigins],
+        work: &mut FlatWork,
+    ) -> Result<Pieces> {
+        let copy_sources = |source: Option<&RegionOrigins>, work: &mut FlatWork| {
+            let Some(source) = source else { return RegionOrigins::default() };
+            let overhead = source
+                .holes
+                .len()
+                .checked_mul(std::mem::size_of::<Vec<Option<Vec<ConvertedEdge>>>>())
+                .and_then(|n| n.checked_add(std::mem::size_of::<RegionOrigins>()));
+            if work.charge_history(overhead) && charge_sources(work, source.outer.iter().chain(source.holes.iter().flatten()), 1, false) {
+                source.clone()
+            } else {
+                RegionOrigins::default()
+            }
+        };
         let t = self.thickness;
         let tol = 1e-7;
         let mut by_panel: BTreeMap<usize, Vec<&crate::Countersink>> = BTreeMap::new();
@@ -4742,7 +4800,7 @@ impl SurfaceSheet {
             }
         }
         if edits.is_empty() {
-            return Ok(Regions { geometry: pieces.to_vec(), origins: origins.to_vec() });
+            return Ok(Regions { geometry: pieces.to_vec(), origins: origins.iter().map(|source| copy_sources(Some(source), work)).collect() });
         }
         let is_matching_circle = |lp: &Loop2, want_center: Vec2, want_radius: f64| -> bool {
             let Some(Seg2::Arc { sweep: first_sweep, .. }) = lp.segs.first() else { return false };
@@ -4759,7 +4817,7 @@ impl SurfaceSheet {
         let mut out = Vec::with_capacity(pieces.len());
         let mut out_origins = Vec::new();
         for (ri, (piece, region)) in pieces.iter().enumerate() {
-            let mut source = origins.get(ri).cloned().unwrap_or_else(|| RegionOrigins::unknown(region));
+            let mut source = copy_sources(origins.get(ri), work);
             let Piece::Panel(p) = *piece else {
                 out.push((*piece, region.clone()));
                 out_origins.push(source);
@@ -4794,7 +4852,10 @@ impl SurfaceSheet {
                 continue;
             }
             let outer_only = Region2 { outer: cur.outer.clone(), holes: Vec::new() };
-            let outer_source = RegionOrigins { outer: source.outer.clone(), holes: Vec::new() };
+            let outer_source = RegionOrigins {
+                outer: if charge_sources(work, source.outer.iter(), 1, false) { source.outer.clone() } else { Vec::new() },
+                holes: Vec::new(),
+            };
             let mut cur_vec = vec![cur];
             let mut cur_origins = vec![source];
             for pr in patch {
@@ -4804,16 +4865,11 @@ impl SurfaceSheet {
                     solidcraft_kernel::BoolOp::Intersect,
                     tol,
                 )?;
-                let clipped = crate::sheet_surface::compose_regions(
-                    clipped,
-                    &[RegionOrigins::unknown(pr)],
-                    std::slice::from_ref(&outer_source),
-                    &mut FlatWork::new(),
-                );
+                let clipped = crate::sheet_surface::compose_regions(clipped, &[RegionOrigins::default()], std::slice::from_ref(&outer_source), work);
                 if !clipped.geometry.is_empty() {
                     let joined =
                         solidcraft_kernel::planar_regions_boolean_with_history(&cur_vec, &clipped.geometry, solidcraft_kernel::BoolOp::Union, tol)?;
-                    let joined = crate::sheet_surface::compose_regions(joined, &cur_origins, &clipped.origins, &mut FlatWork::new());
+                    let joined = crate::sheet_surface::compose_regions(joined, &cur_origins, &clipped.origins, work);
                     cur_vec = joined.geometry;
                     cur_origins = joined.origins;
                 }
@@ -5370,5 +5426,92 @@ mod tests {
         assert_eq!(conv_sheet.regions[0].holes.len(), 6);
         assert_eq!(conv_sheet.bends.len(), 1);
         assert!((conv_sheet.regions[0].area() - rec_flat_area).abs() < 1e-6);
+    }
+    fn review_source_plate() -> crate::SurfaceSheet {
+        let rule = crate::ConvertRule {
+            thickness: 2.0,
+            k_factor: 0.5,
+            bend_radius: 1.0,
+            gap: 0.1,
+            corner_relief: crate::sheet::ReliefShape::Notch,
+            corner_relief_size: 0.0,
+            relief_width: 0.0,
+            relief_depth: 0.0,
+            bend_relief: crate::sheet::BendReliefShape::Rectangular,
+        };
+        let region =
+            Region2 { outer: Loop2::polygon(&[Vec2::ZERO, Vec2::new(20.0, 0.0), Vec2::new(20.0, 10.0), Vec2::new(0.0, 10.0)]), holes: Vec::new() };
+        crate::SurfaceSheet::base("Plate", "Rule", &rule, solidcore_record::Plane::XY, region, &[], 1).unwrap().0
+    }
+
+    #[test]
+    fn unknown_panel_origins_do_not_persist_a_geometry_only_sidecar() {
+        let mut sheet = review_source_plate();
+        let region = sheet.sheet.panels[0].region.clone();
+        let name = sheet.sheet.panels[0].name.clone();
+        sheet.remember_panel_origins(0, super::RegionOrigins::unknown(&region));
+        assert!(sheet.converted_boundaries.is_empty());
+        assert!(serde_json::to_value(&sheet).unwrap().get("converted_boundaries").is_none());
+        let tag = Some(vec![super::ConvertedEdge { edge: 2, faces: [0, 1] }]);
+        let mut known = super::RegionOrigins::unknown(&region);
+        known.outer[0] = tag;
+        sheet.remember_panel_origins(0, known.clone());
+        assert_eq!(sheet.panel_origins(0), known);
+        assert_eq!(sheet.converted_boundaries[&name].region, region);
+        sheet.sheet.panels[0].region.outer.segs.rotate_left(1);
+        assert_eq!(sheet.panel_origins(0), super::RegionOrigins::default(), "the stale-region guard remains active");
+        sheet.remember_panel_origins(0, super::RegionOrigins::default());
+        assert!(sheet.converted_boundaries.is_empty(), "a later observer decline removes stale evidence too");
+    }
+
+    #[test]
+    fn countersink_patch_origins_use_the_builds_exhausted_history_allowance() {
+        use solidcraft_geom::Loop2Geom as _;
+        let mut sheet = review_source_plate();
+        sheet.countersinks = [false, true]
+            .into_iter()
+            .map(|far| crate::Countersink {
+                panel: 0,
+                center: Vec2::new(10.0, 5.0),
+                far,
+                outer_radius: 3.0,
+                half_angle: std::f64::consts::FRAC_PI_4,
+                depth: 1.5,
+            })
+            .collect();
+        let dev = sheet.develop().unwrap();
+        let region = Region2 { outer: sheet.sheet.panels[0].region.outer.clone(), holes: vec![Loop2::circle(Vec2::new(10.0, 5.0), 2.0).reversed()] };
+        let tag = |edge| Some(vec![super::ConvertedEdge { edge, faces: [0, edge + 1] }]);
+        let source = super::RegionOrigins { outer: (0..4).map(tag).collect(), holes: vec![vec![None; region.holes[0].segs.len()]] };
+        let pieces = vec![(super::Piece::Panel(0), region)];
+        let normal = sheet.solid_pieces_for_countersinks(&dev, &pieces, std::slice::from_ref(&source), &mut super::FlatWork::new()).unwrap();
+        assert!(normal.origins.iter().flat_map(|r| &r.outer).any(Option::is_some), "the unchanged outer boundary remains observable");
+        let mut spent = super::FlatWork::new();
+        assert!(!spent.charge_history(None));
+        let unknown = sheet.solid_pieces_for_countersinks(&dev, &pieces, std::slice::from_ref(&source), &mut spent).unwrap();
+        assert_eq!(unknown.geometry, normal.geometry, "the observer cannot change the opposing-cone patch");
+        assert!(unknown.origins.iter().flat_map(|r| r.outer.iter().chain(r.holes.iter().flatten())).all(Option::is_none));
+        assert!(!spent.charge_history(Some(1)), "patch rounds never reset the build allowance");
+    }
+
+    #[test]
+    fn observed_rigid_regions_report_the_actual_canonical_and_zero_area_loop_orders() {
+        use solidcraft_geom::Loop2Geom as _;
+        let outer = Loop2::polygon(&[Vec2::ZERO, Vec2::new(4.0, 0.0), Vec2::new(4.0, 4.0), Vec2::new(0.0, 4.0)]);
+        let hole = Loop2::polygon(&[Vec2::new(1.0, 1.0), Vec2::new(2.0, 1.0), Vec2::new(2.0, 2.0), Vec2::new(1.0, 2.0)]);
+        let zero = Loop2::polygon(&[Vec2::ZERO, Vec2::new(1.0, 0.0), Vec2::new(2.0, 0.0)]);
+        for (region, want) in [
+            (Region2 { outer: outer.clone(), holes: vec![hole.reversed()] }, vec![(0, 4, true), (1, 4, true)]),
+            (Region2 { outer: outer.reversed(), holes: vec![hole] }, vec![(0, 4, false), (1, 4, false)]),
+            (Region2 { outer: zero.clone(), holes: vec![zero] }, vec![(0, 3, false), (1, 3, true)]),
+        ] {
+            let f = |p: Vec2| Vec2::new(-p.x, p.y);
+            let plain = super::rigid_region(&region, f);
+            let mut events = Vec::new();
+            let mut observe = |i, n, reversed| events.push((i, n, reversed));
+            let watched = super::rigid_region_observed(&region, f, Some(&mut observe));
+            assert_eq!(watched, plain);
+            assert_eq!(events, want);
+        }
     }
 }

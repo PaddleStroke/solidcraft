@@ -2764,21 +2764,21 @@ impl SurfaceSheet {
             |s: &Seg2| crate::sheet_surface_convert::rigid_region(&Region2 { outer: Loop2 { segs: vec![*s] }, holes: Vec::new() }, f).outer.segs;
         let sources = self.panel_origin_seeds();
         let rips = self.rip_origin_seeds();
+        let mut work = crate::sheet::FlatWork::new();
         for (i, mut source) in sources.into_iter().enumerate() {
             if let Some(p) = self.sheet.panels.get_mut(i) {
-                if source.outer.len() == p.region.outer.segs.len() {
-                    source.outer.reverse();
-                } else {
-                    source.outer.clear();
-                }
-                for (tags, hole) in source.holes.iter_mut().zip(&p.region.holes) {
-                    if tags.len() == hole.segs.len() {
-                        tags.reverse();
-                    } else {
-                        tags.clear();
+                let mut observe = |loop_index: usize, count: usize, reversed: bool| {
+                    let tags = if loop_index == 0 { Some(&mut source.outer) } else { source.holes.get_mut(loop_index - 1) };
+                    if let Some(tags) = tags {
+                        let cost = count.checked_mul(std::mem::size_of::<Option<Vec<crate::sheet_surface::ConvertedEdge>>>());
+                        if tags.len() != count || !work.charge_history(cost) {
+                            tags.clear();
+                        } else if reversed {
+                            tags.reverse();
+                        }
                     }
-                }
-                p.region = r(&p.region);
+                };
+                p.region = crate::sheet_surface_convert::rigid_region_observed(&p.region, f, Some(&mut observe));
             }
             self.remember_panel_origins(i, source);
         }
@@ -4695,7 +4695,8 @@ fn to_line(
         if out.get(i) != segs.get(i)
             && let Some(source) = origins.outer.get_mut(i)
         {
-            *source = if charge_sources(&mut work, std::iter::once(&*source), 1, false) { split_sources(source) } else { None };
+            // The side itself is replaced by the requested line, not a retained piece of its old boundary.
+            *source = if i != side_at && charge_sources(&mut work, std::iter::once(&*source), 1, false) { split_sources(source) } else { None };
         }
     }
     let outer = Loop2 { segs: out };
@@ -5665,7 +5666,9 @@ mod tests {
         let origins = RegionOrigins { outer: (0..4).map(tag).collect(), holes: vec![vec![tag(4)]] };
         let anchor = Anchor { panel: 0, origin: Vec2::ZERO, dir: Vec2::new(1.0, 0.0) };
         let (cut, source, _) = to_line(&region, origins.clone(), &anchor, 1.0, 0.0, 1.0, Vec2::new(0.0, 1.0)).unwrap().unwrap();
-        assert_eq!(source, origins);
+        // The x=0 side is replaced by x=1; only the shortened bottom/top and unchanged right retain their sources.
+        assert_eq!(source.outer, vec![tag(0), tag(1), tag(2), None]);
+        assert_eq!(source.holes, origins.holes);
         assert_eq!(cut.holes, region.holes);
         assert_eq!(cut.outer.segs[0].start(), Vec2::new(1.0, 0.0));
         assert_eq!(cut.outer.segs[2].end(), Vec2::new(1.0, 10.0));
@@ -5926,5 +5929,55 @@ mod tests {
         );
         assert_eq!(multi.sheet.joints.len(), m_before_joints);
         assert_eq!(multi.sheet.panels.len(), m_before_panels);
+    }
+    fn review_source_plate() -> crate::SurfaceSheet {
+        let rule = crate::ConvertRule {
+            thickness: 2.0,
+            k_factor: 0.5,
+            bend_radius: 1.0,
+            gap: 0.1,
+            corner_relief: crate::sheet::ReliefShape::Notch,
+            corner_relief_size: 0.0,
+            relief_width: 0.0,
+            relief_depth: 0.0,
+            bend_relief: crate::sheet::BendReliefShape::Rectangular,
+        };
+        let region =
+            Region2 { outer: Loop2::polygon(&[Vec2::ZERO, Vec2::new(20.0, 0.0), Vec2::new(20.0, 10.0), Vec2::new(0.0, 10.0)]), holes: Vec::new() };
+        crate::SurfaceSheet::base("Plate", "Rule", &rule, solidcore_record::Plane::XY, region, &[], 1).unwrap().0
+    }
+
+    #[test]
+    fn mirrored_panel_origins_follow_each_loops_actual_normalization() {
+        let mut sheet = review_source_plate();
+        let outer = sheet.sheet.panels[0].region.outer.clone();
+        let hole = Loop2::polygon(&[Vec2::new(2.0, 2.0), Vec2::new(4.0, 2.0), Vec2::new(4.0, 4.0), Vec2::new(2.0, 4.0)]);
+        let tag = |edge| Some(vec![crate::sheet_surface::ConvertedEdge { edge, faces: [0, edge + 1] }]);
+        for canonical in [true, false] {
+            let region = Region2 {
+                outer: if canonical { outer.clone() } else { outer.reversed() },
+                holes: vec![if canonical { hole.reversed() } else { hole.clone() }],
+            };
+            sheet.sheet.panels[0].region = region;
+            sheet.remember_panel_origins(0, RegionOrigins { outer: (0..4).map(tag).collect(), holes: vec![(4..8).map(tag).collect()] });
+            sheet.turn_charts_over();
+            let source = sheet.panel_origins(0);
+            let want_outer = if canonical { (0..4).rev().map(tag).collect::<Vec<_>>() } else { (0..4).map(tag).collect() };
+            let want_hole = if canonical { (4..8).rev().map(tag).collect::<Vec<_>>() } else { (4..8).map(tag).collect() };
+            assert_eq!(source.outer, want_outer);
+            assert_eq!(source.holes, vec![want_hole]);
+        }
+    }
+
+    #[test]
+    fn an_unchanged_panel_side_keeps_its_original_boundary_source() {
+        let region =
+            Region2 { outer: Loop2::polygon(&[Vec2::ZERO, Vec2::new(10.0, 0.0), Vec2::new(10.0, 10.0), Vec2::new(0.0, 10.0)]), holes: Vec::new() };
+        let tag = |edge| Some(vec![crate::sheet_surface::ConvertedEdge { edge, faces: [0, edge + 1] }]);
+        let origins = RegionOrigins { outer: (0..4).map(tag).collect(), holes: Vec::new() };
+        let anchor = Anchor { panel: 0, origin: Vec2::ZERO, dir: Vec2::X };
+        let (kept, source, _) = to_line(&region, origins.clone(), &anchor, 1.0, 0.0, 0.0, Vec2::Y).unwrap().unwrap();
+        assert_eq!(kept, region);
+        assert_eq!(source, origins);
     }
 }

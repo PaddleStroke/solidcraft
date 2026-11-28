@@ -162,11 +162,6 @@ impl ProofWork {
         Arc::ptr_eq(&self.state, &other.state)
     }
 
-    /// Retains the existing cross-owner certificate ordering, never a source ID.
-    pub(crate) fn operation_key(&self) -> usize {
-        Arc::as_ptr(&self.state) as usize
-    }
-
     /// The real optional allowance is spent; caught only at its query boundary.
     pub(crate) fn stopped(&self, operation: &'static str) -> SolidError {
         let remaining = self.state.remaining.load(Ordering::Relaxed);
@@ -254,17 +249,21 @@ pub(super) enum CallbackEvent {
         [Option<object::ObjectRef>; 3],
     ),
     OwnerLink(ObjectKey, Option<object::ObjectRef>),
-    BoundaryEdit(Box<object::BoundaryEdit>),
+    BoundaryEdit(Box<object::BoundaryEdit>, [bool; 2]),
 }
 
 impl CallbackEvent {
-    fn send(&self, callback: &mut dyn NotifyCallback) {
+    fn send(&self, callback: &mut dyn NotifyCallback, observer: usize) {
         match self {
             Self::Notify(operation, caller, [a, b, c]) => {
                 let _status = callback.execute(*operation, *caller, *a, *b, *c);
             }
             Self::OwnerLink(object, owner) => callback.owner_link(*object, *owner),
-            Self::BoundaryEdit(event) => callback.boundary_edit(**event),
+            Self::BoundaryEdit(event, admitted) => {
+                if admitted.get(observer).copied().unwrap_or(false) {
+                    callback.boundary_edit(**event);
+                }
+            }
         }
     }
 }
@@ -281,6 +280,7 @@ pub(crate) struct MetadataRelay {
 struct MetadataRelayState {
     events: Vec<CallbackEvent>,
     capacity: usize,
+    rejected: bool,
 }
 
 impl MetadataRelay {
@@ -294,6 +294,15 @@ impl MetadataRelay {
 
     fn same_stream(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.state, &other.state)
+    }
+
+    fn reject(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.rejected = true;
+            state.events.clear();
+        } else {
+            self.work.disable();
+        }
     }
 
     fn disable(&self) {
@@ -312,6 +321,9 @@ impl MetadataRelay {
             self.work.disable();
             return;
         };
+        if state.rejected {
+            return;
+        }
         // A fixed event copy includes the boxed typed payload, when present.
         if !self.work.charge(Some(object::BOUNDARY_EVENT_WORK as u64)) {
             state.events.clear();
@@ -343,7 +355,10 @@ impl MetadataRelay {
                 CallbackEvent::Notify(*operation, *caller, *data)
             }
             CallbackEvent::OwnerLink(object, owner) => CallbackEvent::OwnerLink(*object, *owner),
-            CallbackEvent::BoundaryEdit(edit) => CallbackEvent::BoundaryEdit(Box::new(**edit)),
+            CallbackEvent::BoundaryEdit(edit, _) => {
+                // Original callback admission never leases destination admission.
+                CallbackEvent::BoundaryEdit(Box::new(**edit), [false; 2])
+            }
         };
         state.events.push(copied);
     }
@@ -362,6 +377,9 @@ impl MetadataRelay {
                 self.work.disable();
                 return;
             };
+            if state.rejected {
+                return;
+            }
             if !self.work.charge(
                 u64::try_from(state.events.len())
                     .ok()
@@ -391,6 +409,22 @@ impl MetadataRelay {
         // No relay/Work lock is held across callbacks. These were already recorded
         // on emission; forwarding/replay must never record them a second time.
         for event in events {
+            let event = match event {
+                CallbackEvent::BoundaryEdit(edit, _) => {
+                    let storage = object::BOUNDARY_EVENT_WORK;
+                    let user = context
+                        .user_notify_callback_mut()
+                        .is_some_and(|c| c.reserve_boundary_edit(storage));
+                    let system = context
+                        .sys_notify_callback_mut()
+                        .is_some_and(|c| c.reserve_boundary_edit(storage));
+                    if !user && !system {
+                        continue;
+                    }
+                    CallbackEvent::BoundaryEdit(edit, [user, system])
+                }
+                event => event,
+            };
             context.deliver_observers(event);
         }
     }
@@ -920,7 +954,7 @@ impl Context {
         if let Some(relay) = &self.metadata_relay {
             if !relay.work.is_disabled() {
                 // Producer storage was reserved before this temporary payload.
-                relay.record(&CallbackEvent::BoundaryEdit(Box::new(event)));
+                relay.record(&CallbackEvent::BoundaryEdit(Box::new(event), [false; 2]));
             }
         }
     }
@@ -940,7 +974,16 @@ impl Context {
             .is_some_and(|old| !old.same_stream(&relay))
         {
             // A different nested observer cannot replace the outer operation.
-            relay.disable();
+            if k.context
+                .metadata_relay
+                .as_ref()
+                .is_some_and(|old| old.work.same_operation(&relay.work))
+            {
+                // Reject only this stream: the outer stream owns the same fuel.
+                relay.reject();
+            } else {
+                relay.disable();
+            }
             return edit(k);
         }
         let previous = k.context.metadata_relay.replace(relay.clone());
@@ -1004,10 +1047,10 @@ impl Context {
             return;
         }
         if let Some(user) = self.user_notify_callback_mut() {
-            event.send(user);
+            event.send(user, 0);
         }
         if let Some(system) = self.sys_notify_callback_mut() {
-            event.send(system);
+            event.send(system, 1);
         }
     }
 
@@ -1952,7 +1995,7 @@ mod tests {
             "the old generic notification is retained unchanged"
         );
         for event in pending {
-            event.send(context.user_notify_callback_mut().unwrap());
+            event.send(context.user_notify_callback_mut().unwrap(), 0);
         }
         assert_eq!(calls.load(Ordering::Relaxed), 1);
     }
@@ -2245,7 +2288,7 @@ mod tests {
         let events = relay.state.lock().unwrap();
         assert_eq!(events.events.len(), 1);
         assert!(
-            matches!(&events.events[0], CallbackEvent::BoundaryEdit(edit)
+            matches!(&events.events[0], CallbackEvent::BoundaryEdit(edit, _)
             if matches!(**edit, object::BoundaryEdit::Copied { source, target }
                 if source.key == ObjectKey(51) && target.key == ObjectKey(52)))
         );
@@ -2253,5 +2296,156 @@ mod tests {
             old.lock().unwrap().is_empty(),
             "the original observer opted out and must receive no boundary callback"
         );
+    }
+
+    #[derive(Debug)]
+    struct AdmittedBoundaryObserver {
+        admitted: bool,
+        log: Arc<Mutex<Vec<ObjectKey>>>,
+    }
+
+    impl NotifyCallback for AdmittedBoundaryObserver {
+        fn execute(
+            &mut self,
+            _operation: object::NotifyOperation,
+            caller: object::ObjectRef,
+            _first: Option<object::ObjectRef>,
+            _second: Option<object::ObjectRef>,
+            _third: Option<object::ObjectRef>,
+        ) -> Result<()> {
+            self.log.lock().unwrap().push(caller.key);
+            Ok(())
+        }
+
+        fn reserve_boundary_edit(&mut self, _work: usize) -> bool {
+            self.admitted
+        }
+
+        fn boundary_edit(&mut self, _event: object::BoundaryEdit) {
+            self.log.lock().unwrap().push(ObjectKey(u64::MAX));
+        }
+    }
+
+    fn install_admitted_observers(
+        context: &mut Context,
+        admitted: [bool; 2],
+    ) -> [Arc<Mutex<Vec<ObjectKey>>>; 2] {
+        let logs = [
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(Mutex::new(Vec::new())),
+        ];
+        context.set_user_notify_callback(Some(Box::new(AdmittedBoundaryObserver {
+            admitted: admitted[0],
+            log: logs[0].clone(),
+        })));
+        context.set_sys_notify_callback(Some(Box::new(AdmittedBoundaryObserver {
+            admitted: admitted[1],
+            log: logs[1].clone(),
+        })));
+        logs
+    }
+
+    #[test]
+    fn typed_admission_is_per_callback_and_retained_through_nested_commit() {
+        for admitted in [[true, false], [false, true]] {
+            let mut k = Kernel::default();
+            let logs = install_admitted_observers(&mut k.context, admitted);
+            Context::with_committed_notifications(&mut k, |k| {
+                Context::with_committed_notifications(k, |k| {
+                    relay_event(&mut k.context, 71);
+                    let target = object::ObjectRef {
+                        type_code: crate::topology::edge::TYPE,
+                        key: ObjectKey(72),
+                    };
+                    object::report_boundary_edit(
+                        Some(&mut k.context),
+                        object::BoundaryEdit::FreshAllocated { target },
+                    );
+                    Ok(())
+                })
+            })
+            .unwrap();
+            for (index, log) in logs.iter().enumerate() {
+                assert_eq!(
+                    *log.lock().unwrap(),
+                    if admitted[index] {
+                        vec![ObjectKey(71), ObjectKey(u64::MAX)]
+                    } else {
+                        vec![ObjectKey(71)]
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn relayed_typed_admission_is_reserved_for_each_destination_callback() {
+        for source_admitted in [[true, false], [false, true]] {
+            let mut k = Kernel::default();
+            let original = install_admitted_observers(&mut k.context, source_admitted);
+            let work = ProofWork::new(32_000);
+            let relay = MetadataRelay::new(work.clone()).unwrap();
+            Context::with_metadata_relay(&mut k, Some(relay.clone()), |k| {
+                let target = object::ObjectRef {
+                    type_code: crate::topology::edge::TYPE,
+                    key: ObjectKey(81),
+                };
+                object::report_boundary_edit(
+                    Some(&mut k.context),
+                    object::BoundaryEdit::FreshAllocated { target },
+                );
+                Ok(())
+            })
+            .unwrap();
+            let mut destination = Context::default();
+            destination.set_proof_work(Some(work.clone()));
+            let admitted = [!source_admitted[0], !source_admitted[1]];
+            let delivered = install_admitted_observers(&mut destination, admitted);
+            destination.pending_notifications = Some(Vec::new());
+            relay.drain_into(&mut destination);
+            for event in destination.pending_notifications.take().unwrap() {
+                destination.deliver_observers(event);
+            }
+            for index in 0..2 {
+                assert_eq!(
+                    original[index].lock().unwrap().len(),
+                    usize::from(source_admitted[index])
+                );
+                assert_eq!(
+                    delivered[index].lock().unwrap().len(),
+                    usize::from(admitted[index])
+                );
+            }
+            assert!(!work.is_disabled());
+        }
+    }
+
+    #[test]
+    fn a_conflicting_relay_with_the_same_owner_does_not_disable_the_outer_stream() {
+        let mut k = Kernel::default();
+        let work = ProofWork::new(32_000);
+        let outer = MetadataRelay::new(work.clone()).unwrap();
+        let inner = MetadataRelay::new(work.clone()).unwrap();
+        Context::with_metadata_relay(&mut k, Some(outer.clone()), |k| {
+            relay_event(&mut k.context, 91);
+            Context::with_metadata_relay(k, Some(inner.clone()), |k| {
+                relay_event(&mut k.context, 92);
+                Ok(())
+            })?;
+            relay_event(&mut k.context, 93);
+            Ok(())
+        })
+        .unwrap();
+        assert!(!work.is_disabled());
+        let log = Arc::new(Mutex::new(Vec::new()));
+        outer.drain_into(&mut relay_destination(&work, &log));
+        assert_eq!(
+            *log.lock().unwrap(),
+            vec![ObjectKey(91), ObjectKey(92), ObjectKey(93)]
+        );
+        let rejected = Arc::new(Mutex::new(Vec::new()));
+        inner.drain_into(&mut relay_destination(&work, &rejected));
+        assert!(rejected.lock().unwrap().is_empty());
+        assert!(!work.is_disabled());
     }
 }

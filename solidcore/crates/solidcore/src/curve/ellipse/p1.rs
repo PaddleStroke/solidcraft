@@ -905,15 +905,22 @@ impl Ellipse {
     ///
     /// None but [`SolidError::Unported`] (never produced here).
     pub fn copy(&self, k: &Kernel) -> Result<Self> {
-        self.copy_with_source(k, None)
+        self.copy_impl(k, false).map(|(copied, _)| copied)
     }
 
     /// The same copy, witnessing its final direct source-NURB installation.
     pub(crate) fn copy_with_source(
         &self,
         k: &Kernel,
-        outcome: Option<&mut crate::nurbs::b_spline_curve_n_lib::CopySourceOutcome>,
-    ) -> Result<Self> {
+    ) -> Result<(Self, crate::nurbs::b_spline_curve_n_lib::CopySourceOutcome)> {
+        self.copy_impl(k, true)
+    }
+
+    fn copy_impl(
+        &self,
+        k: &Kernel,
+        collect_source: bool,
+    ) -> Result<(Self, crate::nurbs::b_spline_curve_n_lib::CopySourceOutcome)> {
         const OP_COPY: &str = "curve::ellipse::p1::Ellipse::copy";
         if k.context.proof_work().is_some() {
             charge_query(k, self.base.proof_base_copy_work(), OP_COPY)?;
@@ -938,14 +945,12 @@ impl Ellipse {
         let source_installed = installed.is_ok();
         ignore_status(installed)?;
         charge_query(k, Some(0), OP_COPY)?;
-        if let Some(outcome) = outcome {
-            *outcome = if source_installed {
-                crate::nurbs::b_spline_curve_n_lib::CopySourceOutcome::Preserved
-            } else {
-                crate::nurbs::b_spline_curve_n_lib::CopySourceOutcome::Uncertified
-            };
-        }
-        Ok(c)
+        let outcome = if collect_source && source_installed {
+            crate::nurbs::b_spline_curve_n_lib::CopySourceOutcome::Preserved
+        } else {
+            crate::nurbs::b_spline_curve_n_lib::CopySourceOutcome::Uncertified
+        };
+        Ok((c, outcome))
     }
 
     /// The ellipse with placement `origin`, radii `radius1` (X) and `radius2` (Y)
@@ -2628,7 +2633,8 @@ impl Ellipse {
         mode: TrimMode,
         zone_tol_3d: f64,
     ) -> Result<()> {
-        self.trim_with_zone_tol_observed(k, trim_interval, mode, zone_tol_3d, None)
+        self.trim_with_zone_tol_impl(k, trim_interval, mode, zone_tol_3d, false)
+            .map(|_| ())
     }
 
     /// The same physical trim, forwarding only its actual base-trim outcome.
@@ -2638,21 +2644,26 @@ impl Ellipse {
         trim_interval: &mut Extent1d,
         mode: TrimMode,
         zone_tol_3d: f64,
-        mut outcome: Option<&mut crate::nurbs::b_spline_curve_n_lib::TrimSourceOutcome>,
-    ) -> Result<()> {
-        if let Some(outcome) = outcome.as_deref_mut() {
-            *outcome = crate::nurbs::b_spline_curve_n_lib::TrimSourceOutcome::Uncertified;
-        }
+    ) -> Result<crate::nurbs::b_spline_curve_n_lib::TrimSourceOutcome> {
+        self.trim_with_zone_tol_impl(k, trim_interval, mode, zone_tol_3d, true)
+    }
+
+    fn trim_with_zone_tol_impl(
+        &mut self,
+        k: &Kernel,
+        trim_interval: &mut Extent1d,
+        mode: TrimMode,
+        zone_tol_3d: f64,
+        collect_source: bool,
+    ) -> Result<crate::nurbs::b_spline_curve_n_lib::TrimSourceOutcome> {
+        let mut outcome = crate::nurbs::b_spline_curve_n_lib::TrimSourceOutcome::Uncertified;
         // no work - current natural interval is a subSet of targetInterval
         let nat_ivl = self.base.natural_interval();
         if nat_ivl.is_contained_by(trim_interval, EFF_ZERO) {
-            if mode != TrimMode::IntervalOnly {
-                if let Some(outcome) = outcome.as_deref_mut() {
-                    *outcome =
-                        crate::nurbs::b_spline_curve_n_lib::TrimSourceOutcome::Retained(nat_ivl);
-                }
+            if mode != TrimMode::IntervalOnly && collect_source {
+                outcome = crate::nurbs::b_spline_curve_n_lib::TrimSourceOutcome::Retained(nat_ivl);
             }
-            return Ok(());
+            return Ok(outcome);
         }
 
         // First ask SmBSplineCurve::Trim to compute the actual trim interval.
@@ -2661,7 +2672,7 @@ impl Ellipse {
 
         // all done when asked to stop here
         if mode == TrimMode::IntervalOnly {
-            return Ok(());
+            return Ok(outcome);
         }
 
         // Convert Nurb Parameters into STEP parameters (statuses ignored)
@@ -2683,14 +2694,14 @@ impl Ellipse {
         let max_step = to_step(self, trim_interval.max())?;
 
         // pass the call to Trim the BSpline - skip its Notify call
-        let mut physical = crate::nurbs::b_spline_curve_n_lib::TrimSourceOutcome::Uncertified;
-        let record = outcome.is_some();
-        self.base.trim_with_zone_tol_observed(
-            trim_interval,
-            TrimMode::Silent,
-            zone_tol_3d,
-            record.then_some(&mut physical),
-        )?;
+        let physical = if collect_source {
+            self.base
+                .trim_with_zone_tol_observed(trim_interval, TrimMode::Silent, zone_tol_3d)?
+        } else {
+            self.base
+                .trim_with_zone_tol(trim_interval, TrimMode::Silent, zone_tol_3d)?;
+            crate::nurbs::b_spline_curve_n_lib::TrimSourceOutcome::Uncertified
+        };
 
         // store the angular interval paying attention to m_bInsideOut
         let domain_status = if self.inside_out {
@@ -2708,18 +2719,16 @@ impl Ellipse {
         if mode == TrimMode::Notify {
             self.notify(k, NotifyOperation::PostEdit)?;
         }
-        if let Some(outcome) = outcome {
-            if domain_status.is_ok() && polar_ok {
-                if let crate::nurbs::b_spline_curve_n_lib::TrimSourceOutcome::Retained(source) =
-                    physical
-                {
-                    if self.base.natural_interval() == source {
-                        *outcome = physical;
-                    }
+        if collect_source && domain_status.is_ok() && polar_ok {
+            if let crate::nurbs::b_spline_curve_n_lib::TrimSourceOutcome::Retained(source) =
+                physical
+            {
+                if self.base.natural_interval() == source {
+                    outcome = physical;
                 }
             }
         }
-        Ok(())
+        Ok(outcome)
     }
 }
 
@@ -3562,17 +3571,13 @@ mod tests {
         let mut query = kernel();
         let work = ProofWork::new(100);
         query.context.set_proof_work(Some(work.clone()));
-        let mut outcome = CopySourceOutcome::Uncertified;
         assert!(matches!(
-            source.copy_with_source(&query, Some(&mut outcome)),
+            source.copy_with_source(&query),
             Err(SolidError::OutOfFuel { .. })
         ));
         assert!(work.is_disabled());
-        assert_eq!(outcome, CopySourceOutcome::Uncertified);
         // Same source, actual Boolean Kernel: a frame witness is not a quota.
-        let copied = source
-            .copy_with_source(&actual, Some(&mut outcome))
-            .unwrap();
+        let (copied, outcome) = source.copy_with_source(&actual).unwrap();
         assert_eq!(outcome, CopySourceOutcome::Preserved);
         assert!(source
             .base()

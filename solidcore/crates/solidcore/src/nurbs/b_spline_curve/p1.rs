@@ -737,43 +737,47 @@ impl BSplineCurve {
     /// up; the copy owns its NURB.
     #[must_use]
     pub fn copy(&self) -> Self {
-        self.copy_with_source(None)
+        self.copy_impl(false).0
     }
 
-    /// The same copy, with optional source-frame evidence from its actual fix-up.
+    /// The same copy, returning source-frame evidence from its actual fix-up.
     pub(crate) fn copy_with_source(
         &self,
-        outcome: Option<&mut crate::nurbs::b_spline_curve_n_lib::CopySourceOutcome>,
-    ) -> Self {
+    ) -> (Self, crate::nurbs::b_spline_curve_n_lib::CopySourceOutcome) {
+        self.copy_impl(true)
+    }
+
+    fn copy_impl(
+        &self,
+        collect_source: bool,
+    ) -> (Self, crate::nurbs::b_spline_curve_n_lib::CopySourceOutcome) {
         let mut unchanged = true;
         let nurb = self.nurb.as_ref().map(|src| {
             let mut nurb = copy_nurb_curve(src);
-            if outcome.is_some() {
-                crate::nurbs::nurbs_crv::fixup_knot_vector_observed(
-                    nurb.knots_mut(),
-                    EFF_ZERO,
-                    Some(&mut unchanged),
-                );
+            if collect_source {
+                unchanged =
+                    crate::nurbs::nurbs_crv::fixup_knot_vector_observed(nurb.knots_mut(), EFF_ZERO);
             } else {
                 fixup_knot_vector(nurb.knots_mut(), EFF_ZERO);
             }
             nurb
         });
-        if let Some(outcome) = outcome {
-            *outcome = if unchanged {
-                crate::nurbs::b_spline_curve_n_lib::CopySourceOutcome::Preserved
-            } else {
-                crate::nurbs::b_spline_curve_n_lib::CopySourceOutcome::Uncertified
-            };
-        }
-        Self {
-            dim: self.dim,
-            nurb,
-            nurb_is_borrowed: false,
-            out_of_bounds_enabled: self.out_of_bounds_enabled,
-            knot_type: self.knot_type,
-            form: self.form,
-        }
+        let outcome = if collect_source && unchanged {
+            crate::nurbs::b_spline_curve_n_lib::CopySourceOutcome::Preserved
+        } else {
+            crate::nurbs::b_spline_curve_n_lib::CopySourceOutcome::Uncertified
+        };
+        (
+            Self {
+                dim: self.dim,
+                nurb,
+                nurb_is_borrowed: false,
+                out_of_bounds_enabled: self.out_of_bounds_enabled,
+                knot_type: self.knot_type,
+                form: self.form,
+            },
+            outcome,
+        )
     }
 
     /// Not upstream: the same curve by definition. The dimension, the out-of-bounds

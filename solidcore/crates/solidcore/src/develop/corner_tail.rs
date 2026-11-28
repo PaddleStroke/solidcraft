@@ -459,18 +459,20 @@ fn replace_setback(
             };
             segments.splice(0..3, [side]);
             if trace {
+                // The bridge is removed and the displaced side is replaced.
+                // Only the side already on the restored line survives whole.
                 let consumed = Some([
                     Some(CornerTailParent {
                         segment: 0,
-                        whole: true,
+                        whole: forward,
                     }),
                     Some(CornerTailParent {
                         segment: 1,
-                        whole: true,
+                        whole: false,
                     }),
                     Some(CornerTailParent {
                         segment: 2,
-                        whole: true,
+                        whole: !forward,
                     }),
                 ]);
                 let replacement = compose(&origins, consumed);
@@ -655,11 +657,11 @@ mod tests {
             Some([
                 Some(CornerTailParent {
                     segment: 3,
-                    whole: true
+                    whole: false
                 }),
                 Some(CornerTailParent {
                     segment: 4,
-                    whole: true
+                    whole: false
                 }),
                 Some(CornerTailParent {
                     segment: 5,
@@ -719,5 +721,81 @@ mod tests {
             reverse.outer,
             vec![Some(identity(0)), child(1), None, child(2)]
         );
+    }
+
+    #[test]
+    fn restored_parent_extent_flags_follow_both_contour_directions() {
+        let input = region(&[[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]]);
+        let stepped = set_back_past(
+            &input,
+            Vec2::new(0.0, 0.0),
+            Vec2::new(0.0, 1.0),
+            10.0,
+            4.0,
+            Vec2::new(1.0, 0.0),
+            1.0,
+        )
+        .unwrap();
+        for (reverse, indices, whole) in [
+            (false, [3, 4, 5], [false, false, true]),
+            (true, [0, 1, 2], [true, false, false]),
+        ] {
+            let source = if reverse {
+                Region2 {
+                    outer: stepped.outer.reversed(),
+                    holes: stepped.holes.clone(),
+                }
+            } else {
+                stepped.clone()
+            };
+            let out = retarget_corner_tail_with_history(
+                &source,
+                [Vec2::new(0.0, 0.0), Vec2::new(0.0, 4.0)],
+                Vec2::new(0.0, 0.0),
+                Vec2::new(1.0, 0.0),
+                10.0,
+                1.0,
+                0.0,
+            )
+            .unwrap();
+            let ordinary = retarget_corner_tail(
+                &source,
+                [Vec2::new(0.0, 0.0), Vec2::new(0.0, 4.0)],
+                Vec2::new(0.0, 0.0),
+                Vec2::new(1.0, 0.0),
+                10.0,
+                1.0,
+                0.0,
+            )
+            .unwrap();
+            assert_eq!(out.region, ordinary);
+            let parents = out
+                .outer
+                .iter()
+                .flatten()
+                .find(|parents| parents.iter().flatten().count() == 3)
+                .unwrap();
+            assert_eq!(
+                *parents,
+                std::array::from_fn(|i| Some(CornerTailParent {
+                    segment: indices[i],
+                    whole: whole[i],
+                }))
+            );
+            let retained = if reverse { 0 } else { 5 };
+            let original_side = source.outer.segs[retained];
+            assert!(
+                original_side
+                    == Seg2::Line {
+                        a: Vec2::new(0.0, 4.0),
+                        b: Vec2::new(0.0, 0.0)
+                    }
+                    || original_side
+                        == Seg2::Line {
+                            a: Vec2::new(0.0, 0.0),
+                            b: Vec2::new(0.0, 4.0)
+                        }
+            );
+        }
     }
 }
